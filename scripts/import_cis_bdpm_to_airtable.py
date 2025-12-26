@@ -1,3 +1,9 @@
+
+---
+
+## `scripts/import_cis_bdpm_to_airtable.py`
+
+```python
 import os
 import time
 import json
@@ -18,7 +24,7 @@ CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/fi
 
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
+AIRTABLE_CIS_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
 
 CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
 DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "data/CIS_bdpm.txt").strip()
@@ -34,20 +40,22 @@ def require_env():
         missing.append("AIRTABLE_API_TOKEN")
     if not AIRTABLE_BASE_ID:
         missing.append("AIRTABLE_BASE_ID")
-    if not AIRTABLE_TABLE_NAME:
-        missing.append("AIRTABLE_TABLE_NAME")
+    if not AIRTABLE_CIS_TABLE_NAME:
+        missing.append("AIRTABLE_CIS_TABLE_NAME")
+
     if missing:
         raise SystemExit(
             f"❌ Variables d'environnement manquantes: {', '.join(missing)}\n"
             f"➡️  Exemple:\n"
             f"   AIRTABLE_API_TOKEN=pat_xxx\n"
             f"   AIRTABLE_BASE_ID=appXXXXXXXXXXXXXX\n"
-            f"   AIRTABLE_TABLE_NAME=\"Liste médicaments\"\n"
+            f"   AIRTABLE_CIS_TABLE_NAME=\"Liste médicaments\"\n"
         )
 
 
 def airtable_url() -> str:
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    # Table name can contain spaces/accents; OK in URL path.
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_CIS_TABLE_NAME}"
 
 
 def airtable_headers() -> Dict[str, str]:
@@ -133,6 +141,7 @@ def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.R
         try:
             r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
 
+            # Airtable rate limit / transient errors
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = (2 ** attempt) * 0.5
                 time.sleep(wait)
@@ -148,6 +157,10 @@ def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.R
 
 
 def upsert_batch(batch_fields: List[Dict[str, str]]) -> None:
+    """
+    Uses Airtable 'performUpsert' to merge on Code cis.
+    If your Airtable base doesn't support it, we fallback to create.
+    """
     url = airtable_url()
     payload = {
         "performUpsert": {"fieldsToMergeOn": ["Code cis"]},
@@ -177,7 +190,7 @@ def main():
     records = list(iter_records_from_file(DOWNLOAD_PATH))
     print(f"✅ Lignes parsées: {len(records)}")
 
-    # 3) De-dup by Code cis (keep last)
+    # 3) De-dup by Code cis (keep last occurrence)
     dedup = {}
     for r in records:
         dedup[r["Code cis"]] = r
@@ -191,6 +204,7 @@ def main():
             upsert_batch(batch)
         except RuntimeError as e:
             msg = str(e)
+            # Fallback if performUpsert rejected/not supported
             if "performUpsert" in msg or "Invalid request" in msg:
                 print("⚠️ Upsert non supporté / rejeté → fallback création simple (doublons possibles).")
                 create_batch(batch)
