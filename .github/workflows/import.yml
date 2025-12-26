@@ -3,7 +3,7 @@ name: Import CIS BDPM to Airtable
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * 1"  # lundi 03:00 (modifiable)
+    - cron: "0 3 * * 1"  # Lundi 03:00
 
 jobs:
   run-import:
