@@ -1,0 +1,30 @@
+name: Import CIS BDPM to Airtable
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"  # lundi 03:00 (modifiable)
+
+jobs:
+  run-import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run import (download + upload)
+        env:
+          AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+          CIS_URL: "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+          DOWNLOAD_PATH: "data/CIS_bdpm.txt"
+        run: python scripts/import_cis_bdpm_to_airtable.py
