@@ -1,8 +1,3 @@
-
----
-
-## `scripts/import_cis_bdpm_to_airtable.py`
-
 ```python
 import os
 import time
