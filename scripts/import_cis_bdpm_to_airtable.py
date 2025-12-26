@@ -5,28 +5,28 @@ from typing import List, Dict, Optional
 
 import requests
 
-# Optional .env support
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
+CIS_URL_DEFAULT = (
+    "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+)
 
-# ========= CONFIG =========
-CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT)
+DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "data/CIS_bdpm.txt")
 
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_CIS_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
 
-CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
-DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "data/CIS_bdpm.txt").strip()
-
-# Airtable API limits
 BATCH_SIZE = 10
-REQUEST_SLEEP_SECONDS = 0.25  # gentle pacing
+REQUEST_SLEEP_SECONDS = 0.25
 
+
+# --------------------------------------------------
+# Sécurité / vérification des variables
+# --------------------------------------------------
 
 def require_env():
     missing = []
@@ -39,16 +39,16 @@ def require_env():
 
     if missing:
         raise SystemExit(
-            f"❌ Variables d'environnement manquantes: {', '.join(missing)}\n"
-            f"➡️  Exemple:\n"
-            f"   AIRTABLE_API_TOKEN=pat_xxx\n"
-            f"   AIRTABLE_BASE_ID=appXXXXXXXXXXXXXX\n"
-            f"   AIRTABLE_CIS_TABLE_NAME=\"Liste médicaments\"\n"
+            "❌ Variables d'environnement manquantes : "
+            + ", ".join(missing)
         )
 
 
+# --------------------------------------------------
+# Airtable helpers
+# --------------------------------------------------
+
 def airtable_url() -> str:
-    # Table name can contain spaces/accents; OK in URL path.
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_CIS_TABLE_NAME}"
 
 
@@ -59,6 +59,33 @@ def airtable_headers() -> Dict[str, str]:
     }
 
 
+def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.Response:
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                url,
+                headers=airtable_headers(),
+                data=json.dumps(payload),
+                timeout=60,
+            )
+
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep((2 ** attempt) * 0.5)
+                continue
+
+            return r
+        except Exception as e:
+            last_exc = e
+            time.sleep((2 ** attempt) * 0.5)
+
+    raise RuntimeError(f"Échec API après retries : {last_exc}")
+
+
+# --------------------------------------------------
+# Download
+# --------------------------------------------------
+
 def ensure_parent_dir(path: str):
     parent = os.path.dirname(path)
     if parent:
@@ -66,13 +93,9 @@ def ensure_parent_dir(path: str):
 
 
 def download_file(url: str, dest_path: str) -> None:
-    """
-    Download CIS_bdpm.txt from official URL.
-    Uses streaming to handle large files.
-    """
     ensure_parent_dir(dest_path)
 
-    with requests.get(url, stream=True, timeout=120) as r:
+    with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
@@ -81,21 +104,16 @@ def download_file(url: str, dest_path: str) -> None:
 
     size = os.path.getsize(dest_path)
     if size < 1000:
-        raise RuntimeError(f"❌ Fichier téléchargé trop petit ({size} octets). Vérifier l'URL: {url}")
+        raise RuntimeError("Fichier téléchargé trop petit – échec probable")
 
-    print(f"✅ Téléchargement OK: {dest_path} ({size} octets)")
+    print(f"✅ Fichier téléchargé : {dest_path} ({size} octets)")
 
+
+# --------------------------------------------------
+# Parsing CIS_bdpm.txt (gestion accents robuste)
+# --------------------------------------------------
 
 def parse_tsv_line(line: str) -> Optional[Dict[str, str]]:
-    """
-    Mapping (1-indexed):
-      1 -> Code cis
-      2 -> Spécialité
-      3 -> Forme
-      4 -> Voie d'administration
-      last-1 -> Laboratoire (avant-dernière colonne)
-    """
-    line = line.rstrip("\n")
     if not line.strip():
         return None
 
@@ -117,99 +135,89 @@ def parse_tsv_line(line: str) -> Optional[Dict[str, str]]:
 
 
 def iter_records_from_file(filepath: str):
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            rec = parse_tsv_line(line)
-            if rec:
-                yield rec
+    # Lecture binaire puis décodage avec fallback
+    with open(filepath, "rb") as f:
+        raw = f.read()
 
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            print(f"✅ Décodage réussi avec : {enc}")
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if text is None:
+        text = raw.decode("latin-1")
+        print("⚠️ Décodage forcé en latin-1")
+
+    for line in text.splitlines():
+        rec = parse_tsv_line(line)
+        if rec:
+            yield rec
+
+
+# --------------------------------------------------
+# Upload Airtable
+# --------------------------------------------------
 
 def chunked(items: List[Dict], size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
 
 
-def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.Response:
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-
-            # Airtable rate limit / transient errors
-            if r.status_code in (429, 500, 502, 503, 504):
-                wait = (2 ** attempt) * 0.5
-                time.sleep(wait)
-                continue
-
-            return r
-        except Exception as e:
-            last_exc = e
-            wait = (2 ** attempt) * 0.5
-            time.sleep(wait)
-
-    raise RuntimeError(f"Échec API après retries. Dernière erreur: {last_exc}")
-
-
 def upsert_batch(batch_fields: List[Dict[str, str]]) -> None:
-    """
-    Uses Airtable 'performUpsert' to merge on Code cis.
-    If your Airtable base doesn't support it, we fallback to create.
-    """
-    url = airtable_url()
     payload = {
         "performUpsert": {"fieldsToMergeOn": ["Code cis"]},
         "records": [{"fields": fields} for fields in batch_fields],
     }
-    r = post_with_retry(url, payload)
+
+    r = post_with_retry(airtable_url(), payload)
     if r.status_code >= 300:
-        raise RuntimeError(f"❌ Airtable error {r.status_code}: {r.text}")
+        raise RuntimeError(r.text)
 
 
 def create_batch(batch_fields: List[Dict[str, str]]) -> None:
-    url = airtable_url()
     payload = {"records": [{"fields": fields} for fields in batch_fields]}
-    r = post_with_retry(url, payload)
+    r = post_with_retry(airtable_url(), payload)
     if r.status_code >= 300:
-        raise RuntimeError(f"❌ Airtable error {r.status_code}: {r.text}")
+        raise RuntimeError(r.text)
 
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 
 def main():
     require_env()
 
-    # 1) Download
-    print(f"⬇️  Téléchargement depuis: {CIS_URL}")
+    print("⬇️ Téléchargement du fichier CIS BDPM…")
     download_file(CIS_URL, DOWNLOAD_PATH)
 
-    # 2) Parse
     records = list(iter_records_from_file(DOWNLOAD_PATH))
-    print(f"✅ Lignes parsées: {len(records)}")
+    print(f"📄 Lignes parsées : {len(records)}")
 
-    # 3) De-dup by Code cis (keep last occurrence)
+    # Dédoublonnage par Code cis
     dedup = {}
     for r in records:
         dedup[r["Code cis"]] = r
     records = list(dedup.values())
-    print(f"✅ Après dédoublonnage (Code cis): {len(records)}")
+    print(f"🧬 Après dédoublonnage : {len(records)}")
 
-    # 4) Upload
     total = 0
     for batch in chunked(records, BATCH_SIZE):
         try:
             upsert_batch(batch)
-        except RuntimeError as e:
-            msg = str(e)
-            # Fallback if performUpsert rejected/not supported
-            if "performUpsert" in msg or "Invalid request" in msg:
-                print("⚠️ Upsert non supporté / rejeté → fallback création simple (doublons possibles).")
-                create_batch(batch)
-            else:
-                raise
+        except Exception:
+            # fallback si performUpsert non supporté
+            create_batch(batch)
 
         total += len(batch)
-        print(f"➡️  Importés: {total}")
+        print(f"➡️ Importés : {total}")
         time.sleep(REQUEST_SLEEP_SECONDS)
 
-    print("🎉 Import terminé.")
+    print("🎉 Import CIS BDPM terminé avec succès")
 
 
 if __name__ == "__main__":
