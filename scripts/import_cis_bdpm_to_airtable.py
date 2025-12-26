@@ -14,16 +14,25 @@ from bs4 import BeautifulSoup
 # CONFIGURATION
 # ==================================================
 
-CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
-CIS_CPD_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
-CIS_CIP_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
+CIS_URL = os.getenv(
+    "CIS_URL",
+    "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+).strip()
 
-ANSM_PAGE_DEFAULT = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
+CIS_CPD_URL = os.getenv(
+    "CIS_CPD_URL",
+    "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
+).strip()
 
-CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
-CIS_CPD_URL = os.getenv("CIS_CPD_URL", CIS_CPD_URL_DEFAULT).strip()
-CIS_CIP_URL = os.getenv("CIS_CIP_URL", CIS_CIP_URL_DEFAULT).strip()
-ANSM_PAGE = os.getenv("ANSM_RETRO_PAGE", ANSM_PAGE_DEFAULT).strip()
+CIS_CIP_URL = os.getenv(
+    "CIS_CIP_URL",
+    "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
+).strip()
+
+ANSM_PAGE = os.getenv(
+    "ANSM_RETRO_PAGE",
+    "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
+).strip()
 
 DOWNLOAD_CIS_PATH = os.getenv("DOWNLOAD_CIS_PATH", "data/CIS_bdpm.txt").strip()
 DOWNLOAD_CPD_PATH = os.getenv("DOWNLOAD_CPD_PATH", "data/CIS_CPD_bdpm.txt").strip()
@@ -44,7 +53,7 @@ FIELD_RCP = "Lien vers RCP"
 FIELD_AGREMENT = "Agrément aux collectivités"
 FIELD_CIP13 = "CIP 13"
 FIELD_RETRO = "Rétrocession"
-FIELD_RH = "Réserve hospitalière"
+FIELD_DISPO = "Disponibilité du traitement"
 
 RETRO_LABEL = "Médicament rétrocédable"
 RH_LABEL = "Réservé à l'usage hospitalier"
@@ -87,14 +96,12 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 def read_text_with_fallback(filepath: str) -> str:
-    with open(filepath, "rb") as f:
-        raw = f.read()
-
+    raw = open(filepath, "rb").read()
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
-            continue
+            pass
     return raw.decode("latin-1")
 
 
@@ -107,10 +114,6 @@ def build_rcp_link(code_cis: str) -> str:
 # ==================================================
 
 def find_ansm_retro_excel_url() -> str:
-    """
-    Finds the monthly retrocession Excel link on the ANSM page.
-    We look for href ending in .xls or .xlsx containing 'retrocession'.
-    """
     r = requests.get(ANSM_PAGE, timeout=60)
     r.raise_for_status()
     html = r.text
@@ -124,7 +127,6 @@ def find_ansm_retro_excel_url() -> str:
             links.append(href)
 
     if not links:
-        # fallback regex
         candidates = re.findall(r'href="([^"]+\.xls[x]?)"', html, flags=re.IGNORECASE)
         links = [c for c in candidates if "retrocession" in c.lower()]
 
@@ -146,15 +148,14 @@ def download_ansm_retro_excel(dest_path: str) -> str:
 
 def load_ansm_retro_cis_set(xls_path: str) -> Set[str]:
     """
-    User requirement: 3rd column of the ANSM file contains Code CIS.
+    Règle utilisateur : la 3ème colonne du fichier ANSM = Code CIS.
     """
     df = pd.read_excel(xls_path, sheet_name=0, header=0, dtype=str)
     if df.shape[1] < 3:
-        raise RuntimeError("❌ Fichier ANSM rétrocession: moins de 3 colonnes, impossible de lire la 3ème colonne.")
-
-    cis_series = df.iloc[:, 2].dropna().astype(str).str.strip()
-    cis_series = cis_series[cis_series.str.len() > 0]
-    return set(cis_series.tolist())
+        raise RuntimeError("❌ Fichier ANSM rétrocession: moins de 3 colonnes.")
+    cis = df.iloc[:, 2].dropna().astype(str).str.strip()
+    cis = cis[cis.str.len() > 0]
+    return set(cis.tolist())
 
 
 # ==================================================
@@ -213,14 +214,14 @@ def load_cpd_map(filepath: str) -> Dict[str, str]:
 
 def load_cis_cip_maps_and_rh(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]], Set[str]]:
     """
-    For CIS_CIP_bdpm.txt:
+    CIS_CIP_bdpm.txt:
       - CIS = col1 (idx 0)
       - CIP13 = col7 (idx 6)
       - Agrément collectivités = col8 (idx 7)
 
-    + Your rule for "Réserve hospitalière":
-      If columns 8, 9, 10 are ALL blank (1-based),
-      i.e. idx 7, 8, 9 (0-based) are blank -> mark as RH.
+    Règle RH demandée:
+      Si colonnes 8, 9, 10 (1-based) sont toutes vides => RH candidate
+      => idx 7,8,9 (0-based) vides
     """
     text = read_text_with_fallback(filepath)
 
@@ -232,34 +233,30 @@ def load_cis_cip_maps_and_rh(filepath: str) -> Tuple[Dict[str, str], Dict[str, S
         if not line.strip():
             continue
         parts = line.split("\t")
-
-        # Need at least up to col10 (idx 9) to evaluate rule safely
         if len(parts) < 10:
+            # pas assez de colonnes pour appliquer la règle 8/9/10 => on ignore pour RH
             continue
 
         cis = parts[0].strip()
-        cip13 = parts[6].strip()    # col7
-        agrement = parts[7].strip() # col8
+        cip13 = parts[6].strip()        # col7
+        agrement = parts[7].strip()     # col8
 
-        col8 = parts[7].strip()     # 8th column
-        col9 = parts[8].strip()     # 9th column
-        col10 = parts[9].strip()    # 10th column
+        col8 = parts[7].strip()
+        col9 = parts[8].strip()
+        col10 = parts[9].strip()
 
         if not cis:
             continue
 
-        # CIP map (can be multiple)
         if cip13:
             cip_map.setdefault(cis, set()).add(cip13)
 
-        # Agrément: keep "oui" if any presentation says oui
         if cis not in agrement_map:
             agrement_map[cis] = agrement
         else:
             if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
                 agrement_map[cis] = "oui"
 
-        # RH rule: if col8/9/10 are all blank -> RH candidate
         if (col8 == "") and (col9 == "") and (col10 == ""):
             rh_candidates.add(cis)
 
@@ -315,7 +312,13 @@ def airtable_create_batch(records_fields: List[Dict[str, str]]) -> Dict[str, str
 def airtable_update_batch(updates: List[Tuple[str, Dict[str, str]]]) -> None:
     payload = {"records": [{"id": rid, "fields": fields} for rid, fields in updates]}
     r = requests.patch(airtable_table_url(), headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # log Airtable error details
+        try:
+            print("❌ Airtable error payload:", r.json())
+        except Exception:
+            print("❌ Airtable raw response:", r.text)
+        r.raise_for_status()
 
 
 def clear_airtable_table() -> None:
@@ -381,7 +384,6 @@ def main():
     print("✅ Tous les fichiers sont téléchargés. On peut maintenant mettre à jour Airtable.")
     print("🔎 Étape 2/2 — Mise à jour Airtable (reset + import + enrichissements)…")
 
-    # Parse everything BEFORE deletion (safety)
     try:
         cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
         cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
@@ -393,7 +395,6 @@ def main():
             f"Détail: {e}"
         )
 
-    # Final RH set: RH candidates EXCEPT retrocedable
     rh_set = set(rh_candidates) - set(retro_cis_set)
 
     print(f"📄 CIS: {len(cis_records)} lignes")
@@ -401,12 +402,11 @@ def main():
     print(f"🏷️ Agrément: {len(agrement_map)} codes")
     print(f"💊 CIP13: {len(cip_map)} CIS avec CIP13")
     print(f"🏥 ANSM rétrocession: {len(retro_cis_set)} codes CIS")
-    print(f"🏥 RH (règle col8/9/10 vides, hors rétrocession): {len(rh_set)} codes CIS")
+    print(f"🏥 RH (col8/9/10 vides, hors rétrocession): {len(rh_set)} codes CIS")
 
-    # Now safe: clear and rewrite
+    # Safe: clear and rewrite
     clear_airtable_table()
 
-    # Create base rows
     print("✍️ Réécriture complète de la table (CIS)…")
     code_to_record_id: Dict[str, str] = {}
 
@@ -414,13 +414,12 @@ def main():
         batch = cis_records[i:i + BATCH_SIZE]
         created_map = airtable_create_batch(batch)
         code_to_record_id.update(created_map)
-
         print(f"➡️ Importées (CIS): {min(i + BATCH_SIZE, len(cis_records))}/{len(cis_records)}")
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     print(f"✅ Import CIS terminé. Records créés: {len(code_to_record_id)}")
 
-    # Apply enrichments
+    # Enrich updates
     updates: List[Tuple[str, Dict[str, str]]] = []
     matched_retro = 0
     matched_rh = 0
@@ -428,34 +427,29 @@ def main():
     for code_cis, record_id in code_to_record_id.items():
         fields: Dict[str, str] = {}
 
-        # CPD
         if code_cis in cpd_map:
             fields[FIELD_CPD] = cpd_map[code_cis]
 
-        # Agrément
         if code_cis in agrement_map and agrement_map[code_cis] != "":
             fields[FIELD_AGREMENT] = agrement_map[code_cis]
 
-        # CIP13 multi
         if code_cis in cip_map and len(cip_map[code_cis]) > 0:
             fields[FIELD_CIP13] = ";".join(sorted(cip_map[code_cis]))
 
-        # RCP always
         fields[FIELD_RCP] = build_rcp_link(code_cis)
 
-        # Retrocession always computed
+        # --- KEY LOGIC: Retro > RH
         if code_cis in retro_cis_set:
             fields[FIELD_RETRO] = RETRO_LABEL
+            fields[FIELD_DISPO] = ""
             matched_retro += 1
         else:
             fields[FIELD_RETRO] = ""
-
-        # RH logic: only if NOT retrocedable
-        if code_cis in rh_set:
-            fields[FIELD_RH] = RH_LABEL
-            matched_rh += 1
-        else:
-            fields[FIELD_RH] = ""
+            if code_cis in rh_set:
+                fields[FIELD_DISPO] = RH_LABEL
+                matched_rh += 1
+            else:
+                fields[FIELD_DISPO] = ""
 
         updates.append((record_id, fields))
 
@@ -470,7 +464,7 @@ def main():
 
     print("🎉 Mise à jour terminée:")
     print(f"   - Rétrocession (ANSM): {matched_retro} marqués '{RETRO_LABEL}'")
-    print(f"   - Réserve hospitalière (règle col8/9/10 vides, hors rétrocession): {matched_rh} marqués '{RH_LABEL}'")
+    print(f"   - Disponibilité du traitement (RH): {matched_rh} marqués '{RH_LABEL}'")
     print("✅ OK")
 
 
