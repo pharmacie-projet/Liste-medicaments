@@ -43,7 +43,6 @@ AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_CIS_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
 
-# Airtable limits
 BATCH_SIZE = 10
 REQUEST_SLEEP_SECONDS = 0.25
 
@@ -53,10 +52,10 @@ FIELD_RCP = "Lien vers RCP"
 FIELD_AGREMENT = "Agrément aux collectivités"
 FIELD_CIP13 = "CIP 13"
 FIELD_RETRO = "Rétrocession"
-FIELD_DISPO = "Disponibilité du traitement"
 
-RETRO_LABEL = "Médicament rétrocédable"
-RH_LABEL = "Réservé à l'usage hospitalier"
+LABEL_RETRO = "Disponible en rétrocession hospitalière"
+LABEL_RH = "Réservé à l'usage hospitalier"
+LABEL_CITY = "Disponible en pharmacie de ville"
 
 
 # ==================================================
@@ -110,7 +109,7 @@ def build_rcp_link(code_cis: str) -> str:
 
 
 # ==================================================
-# ANSM: FIND EXCEL LINK (CHANGES EACH MONTH)
+# ANSM
 # ==================================================
 
 def find_ansm_retro_excel_url() -> str:
@@ -147,9 +146,6 @@ def download_ansm_retro_excel(dest_path: str) -> str:
 
 
 def load_ansm_retro_cis_set(xls_path: str) -> Set[str]:
-    """
-    Règle utilisateur : la 3ème colonne du fichier ANSM = Code CIS.
-    """
     df = pd.read_excel(xls_path, sheet_name=0, header=0, dtype=str)
     if df.shape[1] < 3:
         raise RuntimeError("❌ Fichier ANSM rétrocession: moins de 3 colonnes.")
@@ -159,7 +155,7 @@ def load_ansm_retro_cis_set(xls_path: str) -> Set[str]:
 
 
 # ==================================================
-# PARSERS BDPM
+# PARSE BDPM
 # ==================================================
 
 def parse_cis_line(line: str) -> Optional[Dict[str, str]]:
@@ -189,10 +185,7 @@ def load_cis_records(filepath: str) -> List[Dict[str, str]]:
         rec = parse_cis_line(line)
         if rec:
             records.append(rec)
-
-    dedup = {}
-    for r in records:
-        dedup[r["Code cis"]] = r
+    dedup = {r["Code cis"]: r for r in records}
     return list(dedup.values())
 
 
@@ -212,41 +205,41 @@ def load_cpd_map(filepath: str) -> Dict[str, str]:
     return mapping
 
 
-def load_cis_cip_maps_and_rh(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]], Set[str]]:
+def load_cis_cip_maps_and_city_status(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]], Set[str]]:
     """
     CIS_CIP_bdpm.txt:
       - CIS = col1 (idx 0)
       - CIP13 = col7 (idx 6)
-      - Agrément collectivités = col8 (idx 7)
+      - Agrément = col8 (idx 7)
 
-    Règle RH demandée:
-      Si colonnes 8, 9, 10 (1-based) sont toutes vides => RH candidate
-      => idx 7,8,9 (0-based) vides
+    Règle utilisateur:
+      Si colonnes 8/9/10 (idx 7,8,9) sont TOUTES vides => RH (réservé)
+      Sinon => "ville"
+    Ici on renvoie la liste des CIS "VILLE" (qui ont au moins une valeur en 8/9/10).
     """
     text = read_text_with_fallback(filepath)
 
     agrement_map: Dict[str, str] = {}
     cip_map: Dict[str, Set[str]] = {}
-    rh_candidates: Set[str] = set()
+    cis_ville: Set[str] = set()
 
     for line in text.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
         if len(parts) < 10:
-            # pas assez de colonnes pour appliquer la règle 8/9/10 => on ignore pour RH
             continue
 
         cis = parts[0].strip()
-        cip13 = parts[6].strip()        # col7
-        agrement = parts[7].strip()     # col8
+        if not cis:
+            continue
+
+        cip13 = parts[6].strip()
+        agrement = parts[7].strip()
 
         col8 = parts[7].strip()
         col9 = parts[8].strip()
         col10 = parts[9].strip()
-
-        if not cis:
-            continue
 
         if cip13:
             cip_map.setdefault(cis, set()).add(cip13)
@@ -257,10 +250,11 @@ def load_cis_cip_maps_and_rh(filepath: str) -> Tuple[Dict[str, str], Dict[str, S
             if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
                 agrement_map[cis] = "oui"
 
-        if (col8 == "") and (col9 == "") and (col10 == ""):
-            rh_candidates.add(cis)
+        # Si une des colonnes 8/9/10 a quelque chose => "ville"
+        if (col8 != "") or (col9 != "") or (col10 != ""):
+            cis_ville.add(cis)
 
-    return agrement_map, cip_map, rh_candidates
+    return agrement_map, cip_map, cis_ville
 
 
 # ==================================================
@@ -313,7 +307,6 @@ def airtable_update_batch(updates: List[Tuple[str, Dict[str, str]]]) -> None:
     payload = {"records": [{"id": rid, "fields": fields} for rid, fields in updates]}
     r = requests.patch(airtable_table_url(), headers=airtable_headers(), data=json.dumps(payload), timeout=60)
     if r.status_code >= 400:
-        # log Airtable error details
         try:
             print("❌ Airtable error payload:", r.json())
         except Exception:
@@ -355,76 +348,54 @@ def clear_airtable_table() -> None:
 def main():
     require_env()
 
-    print("🔎 Étape 1/2 — Téléchargement de TOUS les fichiers (AVANT tout effacement Airtable)…")
+    print("🔎 Étape 1/2 — Télécharger TOUS les fichiers (AVANT tout effacement Airtable)…")
 
     try:
-        print(f"⬇️ BDPM CIS: {CIS_URL}")
         download_file(CIS_URL, DOWNLOAD_CIS_PATH)
-        print(f"✅ OK: {DOWNLOAD_CIS_PATH}")
-
-        print(f"⬇️ BDPM CIS_CPD: {CIS_CPD_URL}")
         download_file(CIS_CPD_URL, DOWNLOAD_CPD_PATH)
-        print(f"✅ OK: {DOWNLOAD_CPD_PATH}")
-
-        print(f"⬇️ BDPM CIS_CIP: {CIS_CIP_URL}")
         download_file(CIS_CIP_URL, DOWNLOAD_CIS_CIP_PATH)
-        print(f"✅ OK: {DOWNLOAD_CIS_CIP_PATH}")
 
-        print("⬇️ ANSM Rétrocession: recherche du lien dynamique…")
         ansm_url = download_ansm_retro_excel(DOWNLOAD_ANSM_RETRO_PATH)
-        print(f"✅ OK: {DOWNLOAD_ANSM_RETRO_PATH}")
         print(f"🔗 Lien ANSM détecté: {ansm_url}")
 
     except Exception as e:
         raise SystemExit(
-            "❌ ÉCHEC téléchargement / détection fichier. Mise à jour stoppée. Airtable NON modifiée.\n"
+            "❌ Échec téléchargement : arrêt immédiat, Airtable NON modifiée.\n"
             f"Détail: {e}"
         )
 
-    print("✅ Tous les fichiers sont téléchargés. On peut maintenant mettre à jour Airtable.")
-    print("🔎 Étape 2/2 — Mise à jour Airtable (reset + import + enrichissements)…")
+    print("✅ Tous les fichiers OK → on met à jour Airtable.")
 
-    try:
-        cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
-        cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
-        agrement_map, cip_map, rh_candidates = load_cis_cip_maps_and_rh(DOWNLOAD_CIS_CIP_PATH)
-        retro_cis_set = load_ansm_retro_cis_set(DOWNLOAD_ANSM_RETRO_PATH)
-    except Exception as e:
-        raise SystemExit(
-            "❌ Erreur parsing fichiers. Mise à jour stoppée. Airtable NON modifiée.\n"
-            f"Détail: {e}"
-        )
+    # Parse first (safety)
+    cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
+    cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
+    agrement_map, cip_map, cis_ville = load_cis_cip_maps_and_city_status(DOWNLOAD_CIS_CIP_PATH)
+    retro_cis_set = load_ansm_retro_cis_set(DOWNLOAD_ANSM_RETRO_PATH)
 
-    rh_set = set(rh_candidates) - set(retro_cis_set)
+    print(f"📄 CIS records: {len(cis_records)}")
+    print(f"🏥 Retro ANSM: {len(retro_cis_set)}")
+    print(f"🏙️ Ville (col8/9/10 non vides): {len(cis_ville)}")
 
-    print(f"📄 CIS: {len(cis_records)} lignes")
-    print(f"📌 CPD: {len(cpd_map)} codes")
-    print(f"🏷️ Agrément: {len(agrement_map)} codes")
-    print(f"💊 CIP13: {len(cip_map)} CIS avec CIP13")
-    print(f"🏥 ANSM rétrocession: {len(retro_cis_set)} codes CIS")
-    print(f"🏥 RH (col8/9/10 vides, hors rétrocession): {len(rh_set)} codes CIS")
-
-    # Safe: clear and rewrite
+    # Now clear and rewrite
     clear_airtable_table()
 
-    print("✍️ Réécriture complète de la table (CIS)…")
+    print("✍️ Import CIS…")
     code_to_record_id: Dict[str, str] = {}
-
     for i in range(0, len(cis_records), BATCH_SIZE):
-        batch = cis_records[i:i + BATCH_SIZE]
-        created_map = airtable_create_batch(batch)
+        created_map = airtable_create_batch(cis_records[i:i + BATCH_SIZE])
         code_to_record_id.update(created_map)
         print(f"➡️ Importées (CIS): {min(i + BATCH_SIZE, len(cis_records))}/{len(cis_records)}")
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     print(f"✅ Import CIS terminé. Records créés: {len(code_to_record_id)}")
 
-    # Enrich updates
+    # Enrich
     updates: List[Tuple[str, Dict[str, str]]] = []
-    matched_retro = 0
-    matched_rh = 0
+    count_retro = 0
+    count_rh = 0
+    count_ville = 0
 
-    for code_cis, record_id in code_to_record_id.items():
+    for code_cis, rid in code_to_record_id.items():
         fields: Dict[str, str] = {}
 
         if code_cis in cpd_map:
@@ -433,26 +404,24 @@ def main():
         if code_cis in agrement_map and agrement_map[code_cis] != "":
             fields[FIELD_AGREMENT] = agrement_map[code_cis]
 
-        if code_cis in cip_map and len(cip_map[code_cis]) > 0:
+        if code_cis in cip_map and cip_map[code_cis]:
             fields[FIELD_CIP13] = ";".join(sorted(cip_map[code_cis]))
 
         fields[FIELD_RCP] = build_rcp_link(code_cis)
 
-        # --- KEY LOGIC: Retro > RH
+        # --- Availability stored INSIDE "Rétrocession"
         if code_cis in retro_cis_set:
-            fields[FIELD_RETRO] = RETRO_LABEL
-            fields[FIELD_DISPO] = ""
-            matched_retro += 1
+            fields[FIELD_RETRO] = LABEL_RETRO
+            count_retro += 1
         else:
-            fields[FIELD_RETRO] = ""
-            if code_cis in rh_set:
-                fields[FIELD_DISPO] = RH_LABEL
-                matched_rh += 1
+            if code_cis in cis_ville:
+                fields[FIELD_RETRO] = LABEL_CITY
+                count_ville += 1
             else:
-                fields[FIELD_DISPO] = ""
+                fields[FIELD_RETRO] = LABEL_RH
+                count_rh += 1
 
-        updates.append((record_id, fields))
-
+        updates.append((rid, fields))
         if len(updates) >= BATCH_SIZE:
             airtable_update_batch(updates)
             updates.clear()
@@ -460,12 +429,11 @@ def main():
 
     if updates:
         airtable_update_batch(updates)
-        updates.clear()
 
-    print("🎉 Mise à jour terminée:")
-    print(f"   - Rétrocession (ANSM): {matched_retro} marqués '{RETRO_LABEL}'")
-    print(f"   - Disponibilité du traitement (RH): {matched_rh} marqués '{RH_LABEL}'")
-    print("✅ OK")
+    print("🎉 Terminé :")
+    print(f" - {count_retro} : {LABEL_RETRO}")
+    print(f" - {count_rh} : {LABEL_RH}")
+    print(f" - {count_ville} : {LABEL_CITY}")
 
 
 if __name__ == "__main__":
