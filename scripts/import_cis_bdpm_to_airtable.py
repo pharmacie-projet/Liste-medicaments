@@ -44,8 +44,10 @@ FIELD_RCP = "Lien vers RCP"
 FIELD_AGREMENT = "Agrément aux collectivités"
 FIELD_CIP13 = "CIP 13"
 FIELD_RETRO = "Rétrocession"
+FIELD_RH = "Réserve hospitalière"
 
 RETRO_LABEL = "Médicament rétrocédable"
+RH_LABEL = "Réservé à l'usage hospitalier"
 
 
 # ==================================================
@@ -107,7 +109,7 @@ def build_rcp_link(code_cis: str) -> str:
 def find_ansm_retro_excel_url() -> str:
     """
     Finds the monthly retrocession Excel link on the ANSM page.
-    We look for href ending in .xls or .xlsx containing 'retrocession' (case-insensitive).
+    We look for href ending in .xls or .xlsx containing 'retrocession'.
     """
     r = requests.get(ANSM_PAGE, timeout=60)
     r.raise_for_status()
@@ -121,8 +123,8 @@ def find_ansm_retro_excel_url() -> str:
         if re.search(r"\.xls[x]?$", href, flags=re.IGNORECASE) and "retrocession" in href.lower():
             links.append(href)
 
-    # fallback: regex scan if DOM changes
     if not links:
+        # fallback regex
         candidates = re.findall(r'href="([^"]+\.xls[x]?)"', html, flags=re.IGNORECASE)
         links = [c for c in candidates if "retrocession" in c.lower()]
 
@@ -145,14 +147,12 @@ def download_ansm_retro_excel(dest_path: str) -> str:
 def load_ansm_retro_cis_set(xls_path: str) -> Set[str]:
     """
     User requirement: 3rd column of the ANSM file contains Code CIS.
-    We'll read first sheet, take column index 2 (0-based), normalize, return set of CIS.
     """
     df = pd.read_excel(xls_path, sheet_name=0, header=0, dtype=str)
     if df.shape[1] < 3:
         raise RuntimeError("❌ Fichier ANSM rétrocession: moins de 3 colonnes, impossible de lire la 3ème colonne.")
 
     cis_series = df.iloc[:, 2].dropna().astype(str).str.strip()
-    # keep only numeric-ish CIS
     cis_series = cis_series[cis_series.str.len() > 0]
     return set(cis_series.tolist())
 
@@ -189,7 +189,6 @@ def load_cis_records(filepath: str) -> List[Dict[str, str]]:
         if rec:
             records.append(rec)
 
-    # dedup by CIS
     dedup = {}
     for r in records:
         dedup[r["Code cis"]] = r
@@ -212,41 +211,59 @@ def load_cpd_map(filepath: str) -> Dict[str, str]:
     return mapping
 
 
-def load_cis_cip_maps(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
+def load_cis_cip_maps_and_rh(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]], Set[str]]:
     """
-    Common mapping:
-      col1 (idx 0) = CIS
-      col7 (idx 6) = CIP13
-      col8 (idx 7) = Agrément collectivités (oui/non)
+    For CIS_CIP_bdpm.txt:
+      - CIS = col1 (idx 0)
+      - CIP13 = col7 (idx 6)
+      - Agrément collectivités = col8 (idx 7)
+
+    + Your rule for "Réserve hospitalière":
+      If columns 8, 9, 10 are ALL blank (1-based),
+      i.e. idx 7, 8, 9 (0-based) are blank -> mark as RH.
     """
     text = read_text_with_fallback(filepath)
+
     agrement_map: Dict[str, str] = {}
     cip_map: Dict[str, Set[str]] = {}
+    rh_candidates: Set[str] = set()
 
     for line in text.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 8:
+
+        # Need at least up to col10 (idx 9) to evaluate rule safely
+        if len(parts) < 10:
             continue
 
         cis = parts[0].strip()
-        cip13 = parts[6].strip()
-        agrement = parts[7].strip()
+        cip13 = parts[6].strip()    # col7
+        agrement = parts[7].strip() # col8
+
+        col8 = parts[7].strip()     # 8th column
+        col9 = parts[8].strip()     # 9th column
+        col10 = parts[9].strip()    # 10th column
 
         if not cis:
             continue
 
+        # CIP map (can be multiple)
         if cip13:
             cip_map.setdefault(cis, set()).add(cip13)
 
+        # Agrément: keep "oui" if any presentation says oui
         if cis not in agrement_map:
             agrement_map[cis] = agrement
         else:
             if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
                 agrement_map[cis] = "oui"
 
-    return agrement_map, cip_map
+        # RH rule: if col8/9/10 are all blank -> RH candidate
+        if (col8 == "") and (col9 == "") and (col10 == ""):
+            rh_candidates.add(cis)
+
+    return agrement_map, cip_map, rh_candidates
 
 
 # ==================================================
@@ -337,7 +354,6 @@ def main():
 
     print("🔎 Étape 1/2 — Téléchargement de TOUS les fichiers (AVANT tout effacement Airtable)…")
 
-    # --- Download everything first. If any fails -> STOP, no deletion ---
     try:
         print(f"⬇️ BDPM CIS: {CIS_URL}")
         download_file(CIS_URL, DOWNLOAD_CIS_PATH)
@@ -357,26 +373,35 @@ def main():
         print(f"🔗 Lien ANSM détecté: {ansm_url}")
 
     except Exception as e:
-        # stop without touching Airtable
-        raise SystemExit(f"❌ ÉCHEC téléchargement / détection fichier. Mise à jour stoppée. Airtable NON modifiée.\nDétail: {e}")
+        raise SystemExit(
+            "❌ ÉCHEC téléchargement / détection fichier. Mise à jour stoppée. Airtable NON modifiée.\n"
+            f"Détail: {e}"
+        )
 
     print("✅ Tous les fichiers sont téléchargés. On peut maintenant mettre à jour Airtable.")
     print("🔎 Étape 2/2 — Mise à jour Airtable (reset + import + enrichissements)…")
 
-    # Load all datasets in memory before deletion for safety
+    # Parse everything BEFORE deletion (safety)
     try:
         cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
         cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
-        agrement_map, cip_map = load_cis_cip_maps(DOWNLOAD_CIS_CIP_PATH)
+        agrement_map, cip_map, rh_candidates = load_cis_cip_maps_and_rh(DOWNLOAD_CIS_CIP_PATH)
         retro_cis_set = load_ansm_retro_cis_set(DOWNLOAD_ANSM_RETRO_PATH)
     except Exception as e:
-        raise SystemExit(f"❌ Erreur parsing fichiers. Mise à jour stoppée. Airtable NON modifiée.\nDétail: {e}")
+        raise SystemExit(
+            "❌ Erreur parsing fichiers. Mise à jour stoppée. Airtable NON modifiée.\n"
+            f"Détail: {e}"
+        )
+
+    # Final RH set: RH candidates EXCEPT retrocedable
+    rh_set = set(rh_candidates) - set(retro_cis_set)
 
     print(f"📄 CIS: {len(cis_records)} lignes")
     print(f"📌 CPD: {len(cpd_map)} codes")
     print(f"🏷️ Agrément: {len(agrement_map)} codes")
     print(f"💊 CIP13: {len(cip_map)} CIS avec CIP13")
-    print(f"🏥 ANSM rétrocession: {len(retro_cis_set)} codes CIS détectés (colonne 3)")
+    print(f"🏥 ANSM rétrocession: {len(retro_cis_set)} codes CIS")
+    print(f"🏥 RH (règle col8/9/10 vides, hors rétrocession): {len(rh_set)} codes CIS")
 
     # Now safe: clear and rewrite
     clear_airtable_table()
@@ -395,12 +420,10 @@ def main():
 
     print(f"✅ Import CIS terminé. Records créés: {len(code_to_record_id)}")
 
-    # Apply enrichments (including retrocession)
+    # Apply enrichments
     updates: List[Tuple[str, Dict[str, str]]] = []
-    matched_cpd = 0
-    matched_agrement = 0
-    matched_cip = 0
     matched_retro = 0
+    matched_rh = 0
 
     for code_cis, record_id in code_to_record_id.items():
         fields: Dict[str, str] = {}
@@ -408,27 +431,31 @@ def main():
         # CPD
         if code_cis in cpd_map:
             fields[FIELD_CPD] = cpd_map[code_cis]
-            matched_cpd += 1
 
         # Agrément
         if code_cis in agrement_map and agrement_map[code_cis] != "":
             fields[FIELD_AGREMENT] = agrement_map[code_cis]
-            matched_agrement += 1
 
-        # CIP13 multi -> join
+        # CIP13 multi
         if code_cis in cip_map and len(cip_map[code_cis]) > 0:
             fields[FIELD_CIP13] = ";".join(sorted(cip_map[code_cis]))
-            matched_cip += 1
 
-        # RCP link (always)
+        # RCP always
         fields[FIELD_RCP] = build_rcp_link(code_cis)
 
-        # Retrocession ANSM: set label if CIS in ANSM list, else clear
+        # Retrocession always computed
         if code_cis in retro_cis_set:
             fields[FIELD_RETRO] = RETRO_LABEL
             matched_retro += 1
         else:
             fields[FIELD_RETRO] = ""
+
+        # RH logic: only if NOT retrocedable
+        if code_cis in rh_set:
+            fields[FIELD_RH] = RH_LABEL
+            matched_rh += 1
+        else:
+            fields[FIELD_RH] = ""
 
         updates.append((record_id, fields))
 
@@ -442,10 +469,8 @@ def main():
         updates.clear()
 
     print("🎉 Mise à jour terminée:")
-    print(f"   - CPD: {matched_cpd}")
-    print(f"   - Agrément: {matched_agrement}")
-    print(f"   - CIP13: {matched_cip}")
     print(f"   - Rétrocession (ANSM): {matched_retro} marqués '{RETRO_LABEL}'")
+    print(f"   - Réserve hospitalière (règle col8/9/10 vides, hors rétrocession): {matched_rh} marqués '{RH_LABEL}'")
     print("✅ OK")
 
 
