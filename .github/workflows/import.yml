@@ -1,197 +1,30 @@
-import os
-import time
-import json
-from typing import List, Dict, Optional
+name: Import CIS BDPM to Airtable
 
-import requests
+on:
+  workflow_dispatch:   # permet toujours un lancement manuel
+  schedule:
+    - cron: "0 1 1 * *"   # Tous les 01 du mois à 01:00 UTC
 
-# Optional .env support (utile en local, ignoré en CI si pas de .env)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+jobs:
+  run-import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
-DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "data/CIS_bdpm.txt").strip()
-
-AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_CIS_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
-
-BATCH_SIZE = 10
-REQUEST_SLEEP_SECONDS = 0.25
-
-
-def env_status(name: str) -> str:
-    return "SET" if os.getenv(name) else "NOT SET"
-
-
-def require_env():
-    # Diagnostic (sans fuite)
-    print("🔎 Env status:")
-    print(f"  - AIRTABLE_API_TOKEN: {env_status('AIRTABLE_API_TOKEN')}")
-    print(f"  - AIRTABLE_BASE_ID: {env_status('AIRTABLE_BASE_ID')}")
-    print(f"  - AIRTABLE_CIS_TABLE_NAME: {env_status('AIRTABLE_CIS_TABLE_NAME')}")
-    print(f"  - CIS_URL: {env_status('CIS_URL')} (default ok)")
-    print(f"  - DOWNLOAD_PATH: {env_status('DOWNLOAD_PATH')} (default ok)")
-
-    missing = []
-    if not AIRTABLE_API_TOKEN:
-        missing.append("AIRTABLE_API_TOKEN")
-    if not AIRTABLE_BASE_ID:
-        missing.append("AIRTABLE_BASE_ID")
-    if not AIRTABLE_CIS_TABLE_NAME:
-        missing.append("AIRTABLE_CIS_TABLE_NAME")
-
-    if missing:
-        raise SystemExit(
-            "❌ Variables d'environnement manquantes: " + ", ".join(missing) + "\n"
-            "➡️ Vérifie les *Repository secrets* et que le workflow les passe bien dans env:\n"
-            "   - AIRTABLE_API_TOKEN\n"
-            "   - AIRTABLE_BASE_ID\n"
-            "   - AIRTABLE_CIS_TABLE_NAME\n"
-        )
-
-
-def airtable_url() -> str:
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_CIS_TABLE_NAME}"
-
-
-def airtable_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {AIRTABLE_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-
-def ensure_parent_dir(path: str):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-
-def download_file(url: str, dest_path: str) -> None:
-    ensure_parent_dir(dest_path)
-
-    with requests.get(url, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-
-    size = os.path.getsize(dest_path)
-    if size < 1000:
-        raise RuntimeError(f"❌ Fichier téléchargé trop petit ({size} octets). Vérifier l'URL: {url}")
-
-    print(f"✅ Téléchargement OK: {dest_path} ({size} octets)")
-
-
-def parse_tsv_line(line: str) -> Optional[Dict[str, str]]:
-    line = line.rstrip("\n")
-    if not line.strip():
-        return None
-
-    parts = line.split("\t")
-    if len(parts) < 6:
-        return None
-
-    code_cis = parts[0].strip()
-    if not code_cis:
-        return None
-
-    return {
-        "Code cis": code_cis,
-        "Spécialité": parts[1].strip(),
-        "Forme": parts[2].strip(),
-        "Voie d'administration": parts[3].strip(),
-        "Laboratoire": parts[-2].strip(),  # avant-dernière colonne
-    }
-
-
-def iter_records_from_file(filepath: str):
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            rec = parse_tsv_line(line)
-            if rec:
-                yield rec
-
-
-def chunked(items: List[Dict], size: int):
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.Response:
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep((2 ** attempt) * 0.5)
-                continue
-            return r
-        except Exception as e:
-            last_exc = e
-            time.sleep((2 ** attempt) * 0.5)
-    raise RuntimeError(f"Échec API après retries. Dernière erreur: {last_exc}")
-
-
-def upsert_batch(batch_fields: List[Dict[str, str]]) -> None:
-    payload = {
-        "performUpsert": {"fieldsToMergeOn": ["Code cis"]},
-        "records": [{"fields": fields} for fields in batch_fields],
-    }
-    r = post_with_retry(airtable_url(), payload)
-    if r.status_code >= 300:
-        raise RuntimeError(f"❌ Airtable error {r.status_code}: {r.text}")
-
-
-def create_batch(batch_fields: List[Dict[str, str]]) -> None:
-    payload = {"records": [{"fields": fields} for fields in batch_fields]}
-    r = post_with_retry(airtable_url(), payload)
-    if r.status_code >= 300:
-        raise RuntimeError(f"❌ Airtable error {r.status_code}: {r.text}")
-
-
-def main():
-    require_env()
-
-    print(f"⬇️  Téléchargement depuis: {CIS_URL}")
-    download_file(CIS_URL, DOWNLOAD_PATH)
-
-    records = list(iter_records_from_file(DOWNLOAD_PATH))
-    print(f"✅ Lignes parsées: {len(records)}")
-
-    # Dédoublonnage sur Code cis (garde la dernière occurrence)
-    dedup = {}
-    for r in records:
-        dedup[r["Code cis"]] = r
-    records = list(dedup.values())
-    print(f"✅ Après dédoublonnage (Code cis): {len(records)}")
-
-    total = 0
-    for batch in chunked(records, BATCH_SIZE):
-        try:
-            upsert_batch(batch)
-        except RuntimeError as e:
-            msg = str(e)
-            if "performUpsert" in msg or "Invalid request" in msg:
-                print("⚠️ Upsert rejeté → fallback création simple (doublons possibles).")
-                create_batch(batch)
-            else:
-                raise
-
-        total += len(batch)
-        print(f"➡️  Importés: {total}")
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    print("🎉 Import terminé.")
-
-
-if __name__ == "__main__":
-    main()
+      - name: Run CIS import (download + upload)
+        env:
+          AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
+          CIS_URL: "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+          DOWNLOAD_PATH: "data/CIS_bdpm.txt"
+        run: python scripts/import_cis_bdpm_to_airtable.py
