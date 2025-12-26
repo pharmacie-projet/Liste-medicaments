@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 
 import requests
 
@@ -11,12 +11,15 @@ import requests
 
 CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 CIS_CPD_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
+CIS_CIP_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 
 CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
 CIS_CPD_URL = os.getenv("CIS_CPD_URL", CIS_CPD_URL_DEFAULT).strip()
+CIS_CIP_URL = os.getenv("CIS_CIP_URL", CIS_CIP_URL_DEFAULT).strip()
 
 DOWNLOAD_CIS_PATH = os.getenv("DOWNLOAD_CIS_PATH", "data/CIS_bdpm.txt").strip()
 DOWNLOAD_CPD_PATH = os.getenv("DOWNLOAD_CPD_PATH", "data/CIS_CPD_bdpm.txt").strip()
+DOWNLOAD_CIS_CIP_PATH = os.getenv("DOWNLOAD_CIS_CIP_PATH", "data/CIS_CIP_bdpm.txt").strip()
 
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
@@ -29,6 +32,8 @@ REQUEST_SLEEP_SECONDS = 0.25
 # Airtable field names (must match EXACTLY)
 FIELD_CPD = "Conditions de prescription et délivrance"
 FIELD_RCP = "Lien vers RCP"
+FIELD_AGREMENT = "Agrément aux collectivités"
+FIELD_CIP13 = "CIP 13"
 
 
 # ==================================================
@@ -69,7 +74,6 @@ def airtable_get(params=None) -> dict:
 
 
 def airtable_delete(record_ids: List[str]) -> None:
-    # Airtable allows up to 10 record IDs per delete request
     for i in range(0, len(record_ids), 10):
         batch = record_ids[i:i + 10]
         params = [("records[]", rid) for rid in batch]
@@ -79,10 +83,6 @@ def airtable_delete(record_ids: List[str]) -> None:
 
 
 def airtable_create_batch(records_fields: List[Dict[str, str]]) -> Dict[str, str]:
-    """
-    Create records and return mapping Code cis -> Airtable record_id for created rows.
-    Assumes each record_fields has "Code cis".
-    """
     payload = {"records": [{"fields": rf} for rf in records_fields]}
     r = requests.post(airtable_table_url(), headers=airtable_headers(), data=json.dumps(payload), timeout=60)
     r.raise_for_status()
@@ -99,9 +99,6 @@ def airtable_create_batch(records_fields: List[Dict[str, str]]) -> Dict[str, str
 
 
 def airtable_update_batch(updates: List[Tuple[str, Dict[str, str]]]) -> None:
-    """
-    updates: list of (record_id, fields_dict)
-    """
     payload = {"records": [{"id": rid, "fields": fields} for rid, fields in updates]}
     r = requests.patch(airtable_table_url(), headers=airtable_headers(), data=json.dumps(payload), timeout=60)
     r.raise_for_status()
@@ -160,10 +157,6 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 def read_text_with_fallback(filepath: str) -> str:
-    """
-    BDPM files are often cp1252/latin-1.
-    We'll decode with fallback to preserve accents.
-    """
     with open(filepath, "rb") as f:
         raw = f.read()
 
@@ -200,7 +193,7 @@ def parse_cis_line(line: str) -> Optional[Dict[str, str]]:
         "Spécialité": parts[1].strip(),
         "Forme": parts[2].strip(),
         "Voie d'administration": parts[3].strip(),
-        "Laboratoire": parts[-2].strip(),  # avant-dernière colonne
+        "Laboratoire": parts[-2].strip(),
     }
 
 
@@ -212,7 +205,6 @@ def load_cis_records(filepath: str) -> List[Dict[str, str]]:
         if rec:
             records.append(rec)
 
-    # De-dup by Code cis (keep last occurrence)
     dedup = {}
     for r in records:
         dedup[r["Code cis"]] = r
@@ -220,49 +212,75 @@ def load_cis_records(filepath: str) -> List[Dict[str, str]]:
 
 
 # ==================================================
-# PARSING CIS_CPD_bdpm.txt (enrichissement CPD)
+# PARSING CIS_CPD_bdpm.txt (CPD)
 # ==================================================
-
-def parse_cpd_line(line: str) -> Optional[Tuple[str, str]]:
-    """
-    CIS_CPD_bdpm.txt:
-      col 1 = Code CIS
-      col 2 = Conditions de prescription et délivrance
-    """
-    if not line.strip():
-        return None
-
-    parts = line.split("\t")
-    if len(parts) < 2:
-        return None
-
-    code_cis = parts[0].strip()
-    cpd = parts[1].strip()
-    if not code_cis:
-        return None
-
-    return code_cis, cpd
-
 
 def load_cpd_map(filepath: str) -> Dict[str, str]:
     text = read_text_with_fallback(filepath)
     mapping: Dict[str, str] = {}
     for line in text.splitlines():
-        parsed = parse_cpd_line(line)
-        if parsed:
-            code, cpd = parsed
-            mapping[code] = cpd
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        cis = parts[0].strip()
+        cpd = parts[1].strip()
+        if cis:
+            mapping[cis] = cpd
     return mapping
 
 
 # ==================================================
-# RCP LINK BUILDER
+# PARSING CIS_CIP_bdpm.txt (Agrément + CIP13)
+# ==================================================
+
+def load_cis_cip_maps(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
+    """
+    Expected (common) mapping:
+      col1 (idx 0) = CIS
+      col7 (idx 6) = CIP13
+      col8 (idx 7) = Agrément collectivités (oui/non)
+
+    Returns:
+      agrement_map: CIS -> "oui"/"non" (keeps "oui" if any row is oui)
+      cip_map:      CIS -> set(CIP13)
+    """
+    text = read_text_with_fallback(filepath)
+    agrement_map: Dict[str, str] = {}
+    cip_map: Dict[str, Set[str]] = {}
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+
+        cis = parts[0].strip()
+        cip13 = parts[6].strip()   # COLONNE 7
+        agrement = parts[7].strip()  # COLONNE 8
+
+        if not cis:
+            continue
+
+        if cip13:
+            cip_map.setdefault(cis, set()).add(cip13)
+
+        if cis not in agrement_map:
+            agrement_map[cis] = agrement
+        else:
+            if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
+                agrement_map[cis] = "oui"
+
+    return agrement_map, cip_map
+
+
+# ==================================================
+# RCP LINK
 # ==================================================
 
 def build_rcp_link(code_cis: str) -> str:
-    # Model requested by user:
-    # https://base-donnees-publique.medicaments.gouv.fr/medicament/Code CIS/extrait#tab-rcp
-    # We must insert the code cis as-is (string)
     return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{code_cis}/extrait#tab-rcp"
 
 
@@ -273,17 +291,20 @@ def build_rcp_link(code_cis: str) -> str:
 def main():
     require_env()
 
-    # 1) Nettoyage total de la table
+    # 1) Reset table
     clear_airtable_table()
 
-    # 2) Téléchargements
+    # 2) Download sources
     print("⬇️ Téléchargement CIS_bdpm.txt…")
     download_file(CIS_URL, DOWNLOAD_CIS_PATH)
 
     print("⬇️ Téléchargement CIS_CPD_bdpm.txt…")
     download_file(CIS_CPD_URL, DOWNLOAD_CPD_PATH)
 
-    # 3) Charger CIS et réécrire table
+    print("⬇️ Téléchargement CIS_CIP_bdpm.txt…")
+    download_file(CIS_CIP_URL, DOWNLOAD_CIS_CIP_PATH)
+
+    # 3) Import CIS
     cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
     print(f"📄 CIS: {len(cis_records)} lignes après dédoublonnage")
 
@@ -294,18 +315,24 @@ def main():
         batch = cis_records[i:i + BATCH_SIZE]
         created_map = airtable_create_batch(batch)
         code_to_record_id.update(created_map)
-
         print(f"➡️ Importées (CIS): {min(i + BATCH_SIZE, len(cis_records))}/{len(cis_records)}")
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     print(f"✅ Import CIS terminé. Records créés: {len(code_to_record_id)}")
 
-    # 4) Enrichissement CPD par correspondance Code CIS
+    # 4) Enrichments sources
     cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
     print(f"📌 CPD: {len(cpd_map)} codes CIS trouvés")
 
+    agrement_map, cip_map = load_cis_cip_maps(DOWNLOAD_CIS_CIP_PATH)
+    print(f"🏷️ Agrément: {len(agrement_map)} codes CIS trouvés")
+    print(f"💊 CIP13: {len(cip_map)} codes CIS avec au moins 1 CIP13")
+
+    # 5) Apply updates (CPD + RCP + Agrément + CIP13)
     updates: List[Tuple[str, Dict[str, str]]] = []
     matched_cpd = 0
+    matched_agrement = 0
+    matched_cip = 0
 
     for code_cis, record_id in code_to_record_id.items():
         fields_to_update: Dict[str, str] = {}
@@ -315,8 +342,19 @@ def main():
             fields_to_update[FIELD_CPD] = cpd_map[code_cis]
             matched_cpd += 1
 
-        # RCP link (always fill, because it's deterministic)
+        # RCP link (always)
         fields_to_update[FIELD_RCP] = build_rcp_link(code_cis)
+
+        # Agrément collectivités
+        if code_cis in agrement_map and agrement_map[code_cis] != "":
+            fields_to_update[FIELD_AGREMENT] = agrement_map[code_cis]
+            matched_agrement += 1
+
+        # CIP13 (can be multiple -> join with ;)
+        if code_cis in cip_map and len(cip_map[code_cis]) > 0:
+            cip_list = sorted(cip_map[code_cis])
+            fields_to_update[FIELD_CIP13] = ";".join(cip_list)
+            matched_cip += 1
 
         if fields_to_update:
             updates.append((record_id, fields_to_update))
@@ -326,13 +364,14 @@ def main():
             updates.clear()
             time.sleep(REQUEST_SLEEP_SECONDS)
 
-    # flush remaining
     if updates:
         airtable_update_batch(updates)
         updates.clear()
 
-    print(f"🎉 Enrichissement terminé:")
+    print("🎉 Enrichissement terminé:")
     print(f"   - CPD mises à jour: {matched_cpd}")
+    print(f"   - Agrément mis à jour: {matched_agrement}")
+    print(f"   - CIP 13 renseigné: {matched_cip}")
     print(f"   - Lien RCP renseigné pour: {len(code_to_record_id)} lignes (champ '{FIELD_RCP}').")
 
 
