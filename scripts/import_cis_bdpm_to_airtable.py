@@ -1,8 +1,9 @@
 import os
 import time
 import json
-import requests
 from typing import List, Dict, Optional
+
+import requests
 
 # Optional .env support
 try:
@@ -12,12 +13,15 @@ except Exception:
     pass
 
 
+# ========= CONFIG =========
+CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
 
-# Path to CIS_bdpm.txt
-INPUT_FILE = os.getenv("INPUT_FILE", "CIS_bdpm.txt")
+CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
+DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "data/CIS_bdpm.txt").strip()
 
 # Airtable API limits
 BATCH_SIZE = 10
@@ -43,7 +47,6 @@ def require_env():
 
 
 def airtable_url() -> str:
-    # Table name can contain spaces; requests will handle quoting if we pass it as part of URL
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
 
 
@@ -54,14 +57,41 @@ def airtable_headers() -> Dict[str, str]:
     }
 
 
+def ensure_parent_dir(path: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def download_file(url: str, dest_path: str) -> None:
+    """
+    Download CIS_bdpm.txt from official URL.
+    Uses streaming to handle large files.
+    """
+    ensure_parent_dir(dest_path)
+
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+
+    size = os.path.getsize(dest_path)
+    if size < 1000:
+        raise RuntimeError(f"❌ Fichier téléchargé trop petit ({size} octets). Vérifier l'URL: {url}")
+
+    print(f"✅ Téléchargement OK: {dest_path} ({size} octets)")
+
+
 def parse_tsv_line(line: str) -> Optional[Dict[str, str]]:
     """
-    Expected mapping (1-indexed):
+    Mapping (1-indexed):
       1 -> Code cis
       2 -> Spécialité
       3 -> Forme
       4 -> Voie d'administration
-      last-1 -> Laboratoire  (avant-dernière colonne)
+      last-1 -> Laboratoire (avant-dernière colonne)
     """
     line = line.rstrip("\n")
     if not line.strip():
@@ -69,24 +99,18 @@ def parse_tsv_line(line: str) -> Optional[Dict[str, str]]:
 
     parts = line.split("\t")
     if len(parts) < 6:
-        # Too short to contain the required fields
         return None
 
     code_cis = parts[0].strip()
-    specialite = parts[1].strip()
-    forme = parts[2].strip()
-    voie = parts[3].strip()
-    laboratoire = parts[-2].strip()  # avant-dernière
-
     if not code_cis:
         return None
 
     return {
         "Code cis": code_cis,
-        "Spécialité": specialite,
-        "Forme": forme,
-        "Voie d'administration": voie,
-        "Laboratoire": laboratoire,
+        "Spécialité": parts[1].strip(),
+        "Forme": parts[2].strip(),
+        "Voie d'administration": parts[3].strip(),
+        "Laboratoire": parts[-2].strip(),  # avant-dernière colonne
     }
 
 
@@ -109,7 +133,6 @@ def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.R
         try:
             r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
 
-            # Airtable rate limit / transient errors
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = (2 ** attempt) * 0.5
                 time.sleep(wait)
@@ -125,18 +148,11 @@ def post_with_retry(url: str, payload: dict, max_retries: int = 6) -> requests.R
 
 
 def upsert_batch(batch_fields: List[Dict[str, str]]) -> None:
-    """
-    Uses Airtable 'performUpsert' (if enabled for your base) to merge on Code cis.
-    If your Airtable plan/base does not support upsert in API, you can switch to simple create.
-    """
     url = airtable_url()
     payload = {
-        "performUpsert": {
-            "fieldsToMergeOn": ["Code cis"]
-        },
+        "performUpsert": {"fieldsToMergeOn": ["Code cis"]},
         "records": [{"fields": fields} for fields in batch_fields],
     }
-
     r = post_with_retry(url, payload)
     if r.status_code >= 300:
         raise RuntimeError(f"❌ Airtable error {r.status_code}: {r.text}")
@@ -153,29 +169,30 @@ def create_batch(batch_fields: List[Dict[str, str]]) -> None:
 def main():
     require_env()
 
-    if not os.path.exists(INPUT_FILE):
-        raise SystemExit(f"❌ Fichier introuvable: {INPUT_FILE}")
+    # 1) Download
+    print(f"⬇️  Téléchargement depuis: {CIS_URL}")
+    download_file(CIS_URL, DOWNLOAD_PATH)
 
-    records = list(iter_records_from_file(INPUT_FILE))
+    # 2) Parse
+    records = list(iter_records_from_file(DOWNLOAD_PATH))
     print(f"✅ Lignes parsées: {len(records)}")
 
-    # De-dup by Code cis (keep last occurrence)
+    # 3) De-dup by Code cis (keep last)
     dedup = {}
     for r in records:
         dedup[r["Code cis"]] = r
     records = list(dedup.values())
     print(f"✅ Après dédoublonnage (Code cis): {len(records)}")
 
+    # 4) Upload
     total = 0
     for batch in chunked(records, BATCH_SIZE):
-        # Try UPSERT first; if Airtable rejects, fallback to CREATE
         try:
             upsert_batch(batch)
         except RuntimeError as e:
             msg = str(e)
-            # Some bases may not support performUpsert; fallback to create
-            if "performUpsert" in msg or "UNKNOWN_FIELD_NAME" in msg or "Invalid request" in msg:
-                print("⚠️ Upsert non supporté / rejeté, fallback en création simple (doublons possibles).")
+            if "performUpsert" in msg or "Invalid request" in msg:
+                print("⚠️ Upsert non supporté / rejeté → fallback création simple (doublons possibles).")
                 create_batch(batch)
             else:
                 raise
