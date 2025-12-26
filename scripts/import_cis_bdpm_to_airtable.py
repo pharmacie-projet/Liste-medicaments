@@ -1,9 +1,14 @@
 import os
 import time
 import json
+import re
 from typing import List, Dict, Optional, Tuple, Set
+from urllib.parse import urljoin
 
 import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
 
 # ==================================================
 # CONFIGURATION
@@ -13,13 +18,17 @@ CIS_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/fi
 CIS_CPD_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
 CIS_CIP_URL_DEFAULT = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 
+ANSM_PAGE_DEFAULT = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
+
 CIS_URL = os.getenv("CIS_URL", CIS_URL_DEFAULT).strip()
 CIS_CPD_URL = os.getenv("CIS_CPD_URL", CIS_CPD_URL_DEFAULT).strip()
 CIS_CIP_URL = os.getenv("CIS_CIP_URL", CIS_CIP_URL_DEFAULT).strip()
+ANSM_PAGE = os.getenv("ANSM_RETRO_PAGE", ANSM_PAGE_DEFAULT).strip()
 
 DOWNLOAD_CIS_PATH = os.getenv("DOWNLOAD_CIS_PATH", "data/CIS_bdpm.txt").strip()
 DOWNLOAD_CPD_PATH = os.getenv("DOWNLOAD_CPD_PATH", "data/CIS_CPD_bdpm.txt").strip()
 DOWNLOAD_CIS_CIP_PATH = os.getenv("DOWNLOAD_CIS_CIP_PATH", "data/CIS_CIP_bdpm.txt").strip()
+DOWNLOAD_ANSM_RETRO_PATH = os.getenv("DOWNLOAD_ANSM_RETRO_PATH", "data/ANSM_retrocession.xls").strip()
 
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
@@ -34,6 +43,9 @@ FIELD_CPD = "Conditions de prescription et délivrance"
 FIELD_RCP = "Lien vers RCP"
 FIELD_AGREMENT = "Agrément aux collectivités"
 FIELD_CIP13 = "CIP 13"
+FIELD_RETRO = "Rétrocession"
+
+RETRO_LABEL = "Médicament rétrocédable"
 
 
 # ==================================================
@@ -53,7 +65,192 @@ def require_env():
 
 
 # ==================================================
-# AIRTABLE HELPERS
+# UTILS
+# ==================================================
+
+def ensure_parent_dir(path: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def download_file(url: str, dest_path: str) -> None:
+    ensure_parent_dir(dest_path)
+    with requests.get(url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+
+
+def read_text_with_fallback(filepath: str) -> str:
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def build_rcp_link(code_cis: str) -> str:
+    return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{code_cis}/extrait#tab-rcp"
+
+
+# ==================================================
+# ANSM: FIND EXCEL LINK (CHANGES EACH MONTH)
+# ==================================================
+
+def find_ansm_retro_excel_url() -> str:
+    """
+    Finds the monthly retrocession Excel link on the ANSM page.
+    We look for href ending in .xls or .xlsx containing 'retrocession' (case-insensitive).
+    """
+    r = requests.get(ANSM_PAGE, timeout=60)
+    r.raise_for_status()
+    html = r.text
+
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if re.search(r"\.xls[x]?$", href, flags=re.IGNORECASE) and "retrocession" in href.lower():
+            links.append(href)
+
+    # fallback: regex scan if DOM changes
+    if not links:
+        candidates = re.findall(r'href="([^"]+\.xls[x]?)"', html, flags=re.IGNORECASE)
+        links = [c for c in candidates if "retrocession" in c.lower()]
+
+    if not links:
+        raise RuntimeError("❌ Impossible de trouver le fichier Excel de rétrocession sur la page ANSM.")
+
+    return urljoin(ANSM_PAGE, links[0])
+
+
+def download_ansm_retro_excel(dest_path: str) -> str:
+    url = find_ansm_retro_excel_url()
+    ensure_parent_dir(dest_path)
+    resp = requests.get(url, timeout=180)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+    return url
+
+
+def load_ansm_retro_cis_set(xls_path: str) -> Set[str]:
+    """
+    User requirement: 3rd column of the ANSM file contains Code CIS.
+    We'll read first sheet, take column index 2 (0-based), normalize, return set of CIS.
+    """
+    df = pd.read_excel(xls_path, sheet_name=0, header=0, dtype=str)
+    if df.shape[1] < 3:
+        raise RuntimeError("❌ Fichier ANSM rétrocession: moins de 3 colonnes, impossible de lire la 3ème colonne.")
+
+    cis_series = df.iloc[:, 2].dropna().astype(str).str.strip()
+    # keep only numeric-ish CIS
+    cis_series = cis_series[cis_series.str.len() > 0]
+    return set(cis_series.tolist())
+
+
+# ==================================================
+# PARSERS BDPM
+# ==================================================
+
+def parse_cis_line(line: str) -> Optional[Dict[str, str]]:
+    if not line.strip():
+        return None
+    parts = line.split("\t")
+    if len(parts) < 6:
+        return None
+
+    code_cis = parts[0].strip()
+    if not code_cis:
+        return None
+
+    return {
+        "Code cis": code_cis,
+        "Spécialité": parts[1].strip(),
+        "Forme": parts[2].strip(),
+        "Voie d'administration": parts[3].strip(),
+        "Laboratoire": parts[-2].strip(),
+    }
+
+
+def load_cis_records(filepath: str) -> List[Dict[str, str]]:
+    text = read_text_with_fallback(filepath)
+    records: List[Dict[str, str]] = []
+    for line in text.splitlines():
+        rec = parse_cis_line(line)
+        if rec:
+            records.append(rec)
+
+    # dedup by CIS
+    dedup = {}
+    for r in records:
+        dedup[r["Code cis"]] = r
+    return list(dedup.values())
+
+
+def load_cpd_map(filepath: str) -> Dict[str, str]:
+    text = read_text_with_fallback(filepath)
+    mapping: Dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        cis = parts[0].strip()
+        cpd = parts[1].strip()
+        if cis:
+            mapping[cis] = cpd
+    return mapping
+
+
+def load_cis_cip_maps(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
+    """
+    Common mapping:
+      col1 (idx 0) = CIS
+      col7 (idx 6) = CIP13
+      col8 (idx 7) = Agrément collectivités (oui/non)
+    """
+    text = read_text_with_fallback(filepath)
+    agrement_map: Dict[str, str] = {}
+    cip_map: Dict[str, Set[str]] = {}
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+
+        cis = parts[0].strip()
+        cip13 = parts[6].strip()
+        agrement = parts[7].strip()
+
+        if not cis:
+            continue
+
+        if cip13:
+            cip_map.setdefault(cis, set()).add(cip13)
+
+        if cis not in agrement_map:
+            agrement_map[cis] = agrement
+        else:
+            if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
+                agrement_map[cis] = "oui"
+
+    return agrement_map, cip_map
+
+
+# ==================================================
+# AIRTABLE API
 # ==================================================
 
 def airtable_table_url() -> str:
@@ -104,10 +301,6 @@ def airtable_update_batch(updates: List[Tuple[str, Dict[str, str]]]) -> None:
     r.raise_for_status()
 
 
-# ==================================================
-# CLEAR TABLE
-# ==================================================
-
 def clear_airtable_table() -> None:
     print("🧹 Suppression complète de la table Airtable…")
     total_deleted = 0
@@ -136,178 +329,59 @@ def clear_airtable_table() -> None:
 
 
 # ==================================================
-# DOWNLOAD + DECODE HELPERS (ACCENTS OK)
-# ==================================================
-
-def ensure_parent_dir(path: str):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-
-def download_file(url: str, dest_path: str) -> None:
-    ensure_parent_dir(dest_path)
-    with requests.get(url, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-    print(f"⬇️ Téléchargé: {dest_path} ({os.path.getsize(dest_path)} octets)")
-
-
-def read_text_with_fallback(filepath: str) -> str:
-    with open(filepath, "rb") as f:
-        raw = f.read()
-
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            text = raw.decode(enc)
-            print(f"✅ Décodage {os.path.basename(filepath)} : {enc}")
-            return text
-        except UnicodeDecodeError:
-            continue
-
-    print(f"⚠️ Décodage forcé latin-1 pour {os.path.basename(filepath)}")
-    return raw.decode("latin-1")
-
-
-# ==================================================
-# PARSING CIS_bdpm.txt
-# ==================================================
-
-def parse_cis_line(line: str) -> Optional[Dict[str, str]]:
-    if not line.strip():
-        return None
-
-    parts = line.split("\t")
-    if len(parts) < 6:
-        return None
-
-    code_cis = parts[0].strip()
-    if not code_cis:
-        return None
-
-    return {
-        "Code cis": code_cis,
-        "Spécialité": parts[1].strip(),
-        "Forme": parts[2].strip(),
-        "Voie d'administration": parts[3].strip(),
-        "Laboratoire": parts[-2].strip(),
-    }
-
-
-def load_cis_records(filepath: str) -> List[Dict[str, str]]:
-    text = read_text_with_fallback(filepath)
-    records: List[Dict[str, str]] = []
-    for line in text.splitlines():
-        rec = parse_cis_line(line)
-        if rec:
-            records.append(rec)
-
-    dedup = {}
-    for r in records:
-        dedup[r["Code cis"]] = r
-    return list(dedup.values())
-
-
-# ==================================================
-# PARSING CIS_CPD_bdpm.txt (CPD)
-# ==================================================
-
-def load_cpd_map(filepath: str) -> Dict[str, str]:
-    text = read_text_with_fallback(filepath)
-    mapping: Dict[str, str] = {}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        cis = parts[0].strip()
-        cpd = parts[1].strip()
-        if cis:
-            mapping[cis] = cpd
-    return mapping
-
-
-# ==================================================
-# PARSING CIS_CIP_bdpm.txt (Agrément + CIP13)
-# ==================================================
-
-def load_cis_cip_maps(filepath: str) -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
-    """
-    Expected (common) mapping:
-      col1 (idx 0) = CIS
-      col7 (idx 6) = CIP13
-      col8 (idx 7) = Agrément collectivités (oui/non)
-
-    Returns:
-      agrement_map: CIS -> "oui"/"non" (keeps "oui" if any row is oui)
-      cip_map:      CIS -> set(CIP13)
-    """
-    text = read_text_with_fallback(filepath)
-    agrement_map: Dict[str, str] = {}
-    cip_map: Dict[str, Set[str]] = {}
-
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 8:
-            continue
-
-        cis = parts[0].strip()
-        cip13 = parts[6].strip()   # COLONNE 7
-        agrement = parts[7].strip()  # COLONNE 8
-
-        if not cis:
-            continue
-
-        if cip13:
-            cip_map.setdefault(cis, set()).add(cip13)
-
-        if cis not in agrement_map:
-            agrement_map[cis] = agrement
-        else:
-            if agrement_map[cis].lower() != "oui" and agrement.lower() == "oui":
-                agrement_map[cis] = "oui"
-
-    return agrement_map, cip_map
-
-
-# ==================================================
-# RCP LINK
-# ==================================================
-
-def build_rcp_link(code_cis: str) -> str:
-    return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{code_cis}/extrait#tab-rcp"
-
-
-# ==================================================
 # MAIN
 # ==================================================
 
 def main():
     require_env()
 
-    # 1) Reset table
+    print("🔎 Étape 1/2 — Téléchargement de TOUS les fichiers (AVANT tout effacement Airtable)…")
+
+    # --- Download everything first. If any fails -> STOP, no deletion ---
+    try:
+        print(f"⬇️ BDPM CIS: {CIS_URL}")
+        download_file(CIS_URL, DOWNLOAD_CIS_PATH)
+        print(f"✅ OK: {DOWNLOAD_CIS_PATH}")
+
+        print(f"⬇️ BDPM CIS_CPD: {CIS_CPD_URL}")
+        download_file(CIS_CPD_URL, DOWNLOAD_CPD_PATH)
+        print(f"✅ OK: {DOWNLOAD_CPD_PATH}")
+
+        print(f"⬇️ BDPM CIS_CIP: {CIS_CIP_URL}")
+        download_file(CIS_CIP_URL, DOWNLOAD_CIS_CIP_PATH)
+        print(f"✅ OK: {DOWNLOAD_CIS_CIP_PATH}")
+
+        print("⬇️ ANSM Rétrocession: recherche du lien dynamique…")
+        ansm_url = download_ansm_retro_excel(DOWNLOAD_ANSM_RETRO_PATH)
+        print(f"✅ OK: {DOWNLOAD_ANSM_RETRO_PATH}")
+        print(f"🔗 Lien ANSM détecté: {ansm_url}")
+
+    except Exception as e:
+        # stop without touching Airtable
+        raise SystemExit(f"❌ ÉCHEC téléchargement / détection fichier. Mise à jour stoppée. Airtable NON modifiée.\nDétail: {e}")
+
+    print("✅ Tous les fichiers sont téléchargés. On peut maintenant mettre à jour Airtable.")
+    print("🔎 Étape 2/2 — Mise à jour Airtable (reset + import + enrichissements)…")
+
+    # Load all datasets in memory before deletion for safety
+    try:
+        cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
+        cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
+        agrement_map, cip_map = load_cis_cip_maps(DOWNLOAD_CIS_CIP_PATH)
+        retro_cis_set = load_ansm_retro_cis_set(DOWNLOAD_ANSM_RETRO_PATH)
+    except Exception as e:
+        raise SystemExit(f"❌ Erreur parsing fichiers. Mise à jour stoppée. Airtable NON modifiée.\nDétail: {e}")
+
+    print(f"📄 CIS: {len(cis_records)} lignes")
+    print(f"📌 CPD: {len(cpd_map)} codes")
+    print(f"🏷️ Agrément: {len(agrement_map)} codes")
+    print(f"💊 CIP13: {len(cip_map)} CIS avec CIP13")
+    print(f"🏥 ANSM rétrocession: {len(retro_cis_set)} codes CIS détectés (colonne 3)")
+
+    # Now safe: clear and rewrite
     clear_airtable_table()
 
-    # 2) Download sources
-    print("⬇️ Téléchargement CIS_bdpm.txt…")
-    download_file(CIS_URL, DOWNLOAD_CIS_PATH)
-
-    print("⬇️ Téléchargement CIS_CPD_bdpm.txt…")
-    download_file(CIS_CPD_URL, DOWNLOAD_CPD_PATH)
-
-    print("⬇️ Téléchargement CIS_CIP_bdpm.txt…")
-    download_file(CIS_CIP_URL, DOWNLOAD_CIS_CIP_PATH)
-
-    # 3) Import CIS
-    cis_records = load_cis_records(DOWNLOAD_CIS_PATH)
-    print(f"📄 CIS: {len(cis_records)} lignes après dédoublonnage")
-
+    # Create base rows
     print("✍️ Réécriture complète de la table (CIS)…")
     code_to_record_id: Dict[str, str] = {}
 
@@ -315,49 +389,48 @@ def main():
         batch = cis_records[i:i + BATCH_SIZE]
         created_map = airtable_create_batch(batch)
         code_to_record_id.update(created_map)
+
         print(f"➡️ Importées (CIS): {min(i + BATCH_SIZE, len(cis_records))}/{len(cis_records)}")
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     print(f"✅ Import CIS terminé. Records créés: {len(code_to_record_id)}")
 
-    # 4) Enrichments sources
-    cpd_map = load_cpd_map(DOWNLOAD_CPD_PATH)
-    print(f"📌 CPD: {len(cpd_map)} codes CIS trouvés")
-
-    agrement_map, cip_map = load_cis_cip_maps(DOWNLOAD_CIS_CIP_PATH)
-    print(f"🏷️ Agrément: {len(agrement_map)} codes CIS trouvés")
-    print(f"💊 CIP13: {len(cip_map)} codes CIS avec au moins 1 CIP13")
-
-    # 5) Apply updates (CPD + RCP + Agrément + CIP13)
+    # Apply enrichments (including retrocession)
     updates: List[Tuple[str, Dict[str, str]]] = []
     matched_cpd = 0
     matched_agrement = 0
     matched_cip = 0
+    matched_retro = 0
 
     for code_cis, record_id in code_to_record_id.items():
-        fields_to_update: Dict[str, str] = {}
+        fields: Dict[str, str] = {}
 
         # CPD
         if code_cis in cpd_map:
-            fields_to_update[FIELD_CPD] = cpd_map[code_cis]
+            fields[FIELD_CPD] = cpd_map[code_cis]
             matched_cpd += 1
 
-        # RCP link (always)
-        fields_to_update[FIELD_RCP] = build_rcp_link(code_cis)
-
-        # Agrément collectivités
+        # Agrément
         if code_cis in agrement_map and agrement_map[code_cis] != "":
-            fields_to_update[FIELD_AGREMENT] = agrement_map[code_cis]
+            fields[FIELD_AGREMENT] = agrement_map[code_cis]
             matched_agrement += 1
 
-        # CIP13 (can be multiple -> join with ;)
+        # CIP13 multi -> join
         if code_cis in cip_map and len(cip_map[code_cis]) > 0:
-            cip_list = sorted(cip_map[code_cis])
-            fields_to_update[FIELD_CIP13] = ";".join(cip_list)
+            fields[FIELD_CIP13] = ";".join(sorted(cip_map[code_cis]))
             matched_cip += 1
 
-        if fields_to_update:
-            updates.append((record_id, fields_to_update))
+        # RCP link (always)
+        fields[FIELD_RCP] = build_rcp_link(code_cis)
+
+        # Retrocession ANSM: set label if CIS in ANSM list, else clear
+        if code_cis in retro_cis_set:
+            fields[FIELD_RETRO] = RETRO_LABEL
+            matched_retro += 1
+        else:
+            fields[FIELD_RETRO] = ""
+
+        updates.append((record_id, fields))
 
         if len(updates) >= BATCH_SIZE:
             airtable_update_batch(updates)
@@ -368,11 +441,12 @@ def main():
         airtable_update_batch(updates)
         updates.clear()
 
-    print("🎉 Enrichissement terminé:")
-    print(f"   - CPD mises à jour: {matched_cpd}")
-    print(f"   - Agrément mis à jour: {matched_agrement}")
-    print(f"   - CIP 13 renseigné: {matched_cip}")
-    print(f"   - Lien RCP renseigné pour: {len(code_to_record_id)} lignes (champ '{FIELD_RCP}').")
+    print("🎉 Mise à jour terminée:")
+    print(f"   - CPD: {matched_cpd}")
+    print(f"   - Agrément: {matched_agrement}")
+    print(f"   - CIP13: {matched_cip}")
+    print(f"   - Rétrocession (ANSM): {matched_retro} marqués '{RETRO_LABEL}'")
+    print("✅ OK")
 
 
 if __name__ == "__main__":
