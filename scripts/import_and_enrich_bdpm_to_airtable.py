@@ -29,8 +29,13 @@ HEADERS_WEB = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 
-AIRTABLE_MIN_DELAY_S = 0.25
-AIRTABLE_BATCH_SIZE = 10
+# Airtable
+AIRTABLE_MIN_DELAY_S = 0.25          # throttle global (≈4 req/s)
+AIRTABLE_BATCH_SIZE = 10             # limite Airtable / request
+
+# Flush logique (dans le script) : on envoie les updates par paquets de 1000 records
+UPDATE_FLUSH_THRESHOLD = 1000
+
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 4
 
@@ -110,13 +115,8 @@ def base_extrait_url_from_cis(cis: str) -> str:
     return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
 def normalize_to_fiche_info(url: str, cis_fallback: str) -> str:
-    """
-    On force la lecture sur fiche-info (CPD + badge usage hosp + ATC).
-    On ignore le fragment #tab-xxx.
-    """
     if not url or not url.startswith("http"):
         return f"{base_extrait_url_from_cis(cis_fallback)}?tab=fiche-info"
-
     parts = urllib.parse.urlsplit(url)
     qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
     qs["tab"] = ["fiche-info"]
@@ -232,7 +232,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
     return cis_set
 
 # ============================================================
-# BDPM PARSE (CIS + CIP)
+# BDPM PARSE
 # ============================================================
 
 @dataclass
@@ -336,16 +336,12 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# RULES
+# RULES / SCRAPING (fiche-info)
 # ============================================================
 
-# homéopathie (avec ou sans accent)
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
 HOMEOPATHY_CLASS_PAT = re.compile(r"m[ée]dicament\s+hom[ée]opathique", flags=re.IGNORECASE)
 
-# "usage hospitalier" uniquement autorisé dans:
-# - badge (mais on ignore les modales "Fermer / Usage hospitalier ..." )
-# - CPD bloc
 RESERVED_HOSP_PAT = re.compile(r"réserv[ée]?\s+à\s+l['’]usage\s+hospitalier", flags=re.IGNORECASE)
 USAGE_HOSP_PAT = re.compile(r"\busage\s+hospitalier\b", flags=re.IGNORECASE)
 NEGATION_PAT = re.compile(
@@ -354,7 +350,6 @@ NEGATION_PAT = re.compile(
 )
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
-
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
 
 def clean_cpd_text_keep_useful(text: str) -> str:
@@ -370,37 +365,6 @@ def clean_cpd_text_keep_useful(text: str) -> str:
             continue
         kept.append(ln)
     return normalize_ws_keep_lines("\n".join(kept))
-
-# ============================================================
-# DISPONIBILITE
-# ============================================================
-
-def compute_disponibilite(has_taux_ville: bool, is_ansm_retro: bool, is_homeo: bool,
-                          reserved_hospital: bool, usage_hospital: bool) -> str:
-    # homéopathie => ville
-    ville = bool(has_taux_ville or is_homeo)
-
-    if is_ansm_retro and ville:
-        return "Disponible en ville et en rétrocession hospitalière"
-    if is_ansm_retro and not ville:
-        return "Disponible en rétrocession hospitalière"
-
-    # hospitalier strict
-    if reserved_hospital:
-        return "Réservé à l'usage hospitalier"
-
-    # usage hospitalier simple seulement si pas ville
-    if usage_hospital and not ville:
-        return "Réservé à l'usage hospitalier"
-
-    if ville:
-        return "Disponible en pharmacie de ville"
-
-    return "Pas d'informations mentionnées"
-
-# ============================================================
-# SCRAPING: FICHE INFO ONLY
-# ============================================================
 
 def fetch_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
     last_err = None
@@ -418,12 +382,6 @@ def fetch_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
     raise RuntimeError(f"Page inaccessible: {url}. Détail: {last_err}")
 
 def extract_badge_usage_hospitalier_only(soup: BeautifulSoup) -> bool:
-    """
-    On détecte le badge "usage hospitalier" en haut,
-    mais on IGNORE les zones modales/footers qui contiennent 'Fermer' / 'Cela signifie que...'
-    """
-    # Heuristique robuste: on cherche les "pills" courtes,
-    # et on ignore les textes longs explicatifs ("Cela signifie que ...").
     for el in soup.find_all(["span", "div", "a", "p", "li"]):
         t = (el.get_text(" ", strip=True) or "")
         if not t:
@@ -437,14 +395,6 @@ def extract_badge_usage_hospitalier_only(soup: BeautifulSoup) -> bool:
     return False
 
 def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
-    """
-    Extrait uniquement:
-    Autres informations -> Conditions de prescription et de délivrance
-    Gère:
-      - 'Conditions ... : Aucune' sur une même ligne
-      - stop à 'Statut de l'autorisation'
-    Nettoie 'Aller au glossaire'
-    """
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n")]
 
     autres_pat = re.compile(r"^Autres\s+informations$", re.IGNORECASE)
@@ -468,17 +418,13 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
         ln = lines[i]
         if cpd_pat.match(ln):
             start_cpd = i
-            # cas inline: "... : Aucune"
             if ":" in ln:
-                # on prend tout après le premier ':'
                 inline_value = ln.split(":", 1)[1].strip()
             break
     if start_cpd is None:
         return ""
 
     collected: List[str] = []
-
-    # Si valeur inline exploitable (Aucune / etc) on la met en 1er
     if inline_value:
         collected.append(inline_value)
 
@@ -487,21 +433,14 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
             break
         collected.append(ln)
 
-    bloc = normalize_ws_keep_lines("\n".join(collected))
-    bloc = clean_cpd_text_keep_useful(bloc)
+    bloc = clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
     return bloc
 
 def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
-    """
-    Extrait le code ATC quand présent dans Fiche info.
-    Ex: 'Classe pharmacothérapeutique - code ATC : N02AX02'
-    """
     text = soup.get_text("\n", strip=True)
-    # priorité: motif explicite "code ATC"
     m = re.search(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", text, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # fallback: premier pattern ATC trouvé
     m2 = ATC_PAT.search(text or "")
     return m2.group(0).strip() if m2 else ""
 
@@ -510,11 +449,6 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
 def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
-    """
-    Retourne:
-      cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code
-    Hospitalier: UNIQUEMENT badge + CPD bloc (fiche-info).
-    """
     html = fetch_html(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -524,7 +458,6 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     badge_usage = extract_badge_usage_hospitalier_only(soup)
 
     zone_text = cpd_text or ""
-
     if NEGATION_PAT.search(zone_text):
         reserved = False
         usage = False
@@ -533,6 +466,25 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
     return cpd_text, is_homeo, reserved, usage, atc_code
+
+def compute_disponibilite(has_taux_ville: bool, is_ansm_retro: bool, is_homeo: bool,
+                          reserved_hospital: bool, usage_hospital: bool) -> str:
+    ville = bool(has_taux_ville or is_homeo)
+
+    if is_ansm_retro and ville:
+        return "Disponible en ville et en rétrocession hospitalière"
+    if is_ansm_retro and not ville:
+        return "Disponible en rétrocession hospitalière"
+
+    if reserved_hospital:
+        return "Réservé à l'usage hospitalier"
+    if usage_hospital and not ville:
+        return "Réservé à l'usage hospitalier"
+
+    if ville:
+        return "Disponible en pharmacie de ville"
+
+    return "Pas d'informations mentionnées"
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -674,7 +626,6 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
-    # CREATE missing
     if to_create:
         info("Création des enregistrements manquants ...")
         new_recs = []
@@ -700,7 +651,6 @@ def main():
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
 
-        # refresh map
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
@@ -709,7 +659,6 @@ def main():
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
 
-    # DELETE
     if to_delete:
         info("Suppression des enregistrements Airtable absents de BDPM ...")
         ids = [airtable_by_cis[c]["id"] for c in to_delete if c in airtable_by_cis]
@@ -717,7 +666,6 @@ def main():
             at.delete_records(ids)
             ok(f"Supprimés: {len(ids)}")
 
-        # refresh
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
@@ -726,14 +674,12 @@ def main():
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
 
-    # ENRICH
     all_cis = sorted(list(set(cis_map.keys()) & set(airtable_by_cis.keys())))
     if max_cis > 0:
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info: CPD + ATC + homeo + hospitalier) ...")
-
+    info("Enrichissement (fiche-info) ...")
     updates = []
     failures = 0
     start = time.time()
@@ -795,35 +741,22 @@ def main():
                     reserved_hospital=reserved_hosp,
                     usage_hospital=usage_hosp,
                 )
-
                 if dispo != cur_dispo:
                     upd_fields["Disponibilité du traitement"] = dispo
 
             except Exception as e:
                 failures += 1
                 warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
-        else:
-            # sans fetch: conservateur
-            has_taux = cip.has_taux if cip else False
-            dispo = compute_disponibilite(
-                has_taux_ville=has_taux,
-                is_ansm_retro=is_retro,
-                is_homeo=False,
-                reserved_hospital=False,
-                usage_hospital=False,
-            )
-            if dispo != cur_dispo:
-                upd_fields["Disponibilité du traitement"] = dispo
 
         if upd_fields:
             updates.append({"id": rec["id"], "fields": upd_fields})
 
-        if len(updates) >= 200:
+        if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
             ok(f"Batch updates: {len(updates)}")
             updates = []
 
-        if idx % 200 == 0:
+        if idx % 1000 == 0:
             elapsed = time.time() - start
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
