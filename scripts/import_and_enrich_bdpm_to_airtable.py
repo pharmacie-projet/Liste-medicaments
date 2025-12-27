@@ -3,654 +3,488 @@
 
 import os
 import re
+import csv
 import time
 import json
-import math
 import random
-from dataclasses import dataclass
+import logging
+from io import BytesIO
 from typing import Dict, List, Tuple, Optional, Set
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+import xlrd  # lit les .xls (pas xlsx)
 
-# Excel readers
-import xlrd
-from openpyxl import load_workbook
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+LOG = logging.getLogger("bdpm")
 
-# -----------------------------
-# Config
-# -----------------------------
-BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
-BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
-BDPM_CIS_CPD_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
+# ---------------------------
+# ENV
+# ---------------------------
+AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
 
-ANSM_PAGE_URL = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
+STOP_ON_RCP_ERROR = os.getenv("STOP_ON_RCP_ERROR", "true").lower() in ("1", "true", "yes", "y")
+MAX_RCP_PER_RUN = int(os.getenv("MAX_RCP_PER_RUN", "300"))
+RCP_SLEEP_MIN = float(os.getenv("RCP_SLEEP_MIN", "0.2"))
+RCP_SLEEP_MAX = float(os.getenv("RCP_SLEEP_MAX", "0.6"))
 
-RCP_URL_TEMPLATE = "https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait#tab-rcp"
+# ---------------------------
+# SOURCES OFFICIELLES
+# ---------------------------
+URL_CIS_BDPM = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
+URL_CIS_CIP_BDPM = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
+URL_CIS_CPD_BDPM = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
 
-# Airtable field names (doivent exister)
-FIELD_CIS = "Code cis"
-FIELD_SPECIALITE = "Spécialité"
-FIELD_FORME = "Forme"
-FIELD_VOIE_ADMIN = "Voie d'administration"
-FIELD_LABO = "Laboratoire"
-FIELD_CPD = "Conditions de prescription et délivrance"
-FIELD_RCP_LINK = "Lien vers RCP"
-FIELD_AGREMENT = "Agrément aux collectivités"
-FIELD_CIP13 = "CIP 13"
-FIELD_DISPO = "Disponibilité du traitement"
+ANSM_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
-# Airtable batch sizes
-AIRTABLE_BATCH = 10
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 (compatible; BDPM-AirtableSync/1.0)",
+        "Accept": "*/*",
+    }
+)
 
-# Requests
-DEFAULT_TIMEOUT = 60
-USER_AGENT = "Mozilla/5.0 (compatible; BDPM-Airtable-Bot/1.0; +https://github.com/)"
+# ---------------------------
+# Airtable helpers
+# ---------------------------
+def airtable_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {AIRTABLE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-# Stop on ANSM failure BEFORE touching Airtable
-STOP_IF_ANSM_FAIL = True
+def require_env():
+    missing = []
+    if not AIRTABLE_API_TOKEN:
+        missing.append("AIRTABLE_API_TOKEN")
+    if not AIRTABLE_BASE_ID:
+        missing.append("AIRTABLE_BASE_ID")
+    if not AIRTABLE_TABLE_NAME:
+        missing.append("AIRTABLE_CIS_TABLE_NAME")
+    if missing:
+        raise SystemExit(f"❌ Variables manquantes: {', '.join(missing)}")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def airtable_url() -> str:
+    # table name peut contenir des espaces -> quote
+    from urllib.parse import quote
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE_NAME)}"
 
-def env_required(name: str) -> str:
-    v = os.environ.get(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Variable manquante: {name}")
-    return v
+def airtable_list_records() -> Dict[str, str]:
+    """Map CIS -> record_id"""
+    url = airtable_url()
+    params = {"pageSize": 100}
+    out: Dict[str, str] = {}
+    offset = None
+    while True:
+        if offset:
+            params["offset"] = offset
+        r = SESSION.get(url, headers=airtable_headers(), params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        for rec in data.get("records", []):
+            fields = rec.get("fields", {})
+            cis = str(fields.get("Code cis", "")).strip()
+            if cis:
+                out[cis] = rec["id"]
+        offset = data.get("offset")
+        if not offset:
+            break
+    return out
 
-def safe_sleep(base: float = 0.3) -> None:
-    time.sleep(base + random.random() * base)
+def airtable_batch_create(records: List[Dict], max_batch=10):
+    url = airtable_url()
+    for i in range(0, len(records), max_batch):
+        batch = {"records": records[i : i + max_batch]}
+        r = SESSION.post(url, headers=airtable_headers(), data=json.dumps(batch), timeout=120)
+        if r.status_code >= 400:
+            LOG.error("❌ Airtable create error: %s", r.text[:5000])
+            r.raise_for_status()
 
-def normalize_ws(s: str) -> str:
-    s = s.replace("\r", "")
-    # keep newlines but normalize spaces
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+def airtable_batch_update(updates: List[Dict], max_batch=10):
+    url = airtable_url()
+    for i in range(0, len(updates), max_batch):
+        batch = {"records": updates[i : i + max_batch]}
+        r = SESSION.patch(url, headers=airtable_headers(), data=json.dumps(batch), timeout=120)
+        if r.status_code >= 400:
+            LOG.error("❌ Airtable update error: %s", r.text[:5000])
+            r.raise_for_status()
 
-def decode_bytes(b: bytes) -> str:
-    """
-    BDPM peut varier. On essaie utf-8 strict, sinon latin-1 (évite les '�').
-    """
-    try:
-        return b.decode("utf-8")
-    except UnicodeDecodeError:
-        return b.decode("latin-1", errors="replace")
+def airtable_batch_delete(record_ids: List[str], max_batch=10):
+    url = airtable_url()
+    for i in range(0, len(record_ids), max_batch):
+        params = [("records[]", rid) for rid in record_ids[i : i + max_batch]]
+        r = SESSION.delete(url, headers=airtable_headers(), params=params, timeout=120)
+        if r.status_code >= 400:
+            LOG.error("❌ Airtable delete error: %s", r.text[:5000])
+            r.raise_for_status()
 
-def download_text(session: requests.Session, url: str) -> str:
-    r = session.get(url, timeout=DEFAULT_TIMEOUT)
+# ---------------------------
+# Download helpers
+# ---------------------------
+def download_text(url: str) -> str:
+    r = SESSION.get(url, timeout=180)
     r.raise_for_status()
-    return decode_bytes(r.content)
+    # fichiers BDPM souvent latin-1
+    return r.content.decode("latin-1", errors="replace")
 
-def download_binary(session: requests.Session, url: str) -> bytes:
-    r = session.get(url, timeout=120)
-    r.raise_for_status()
-    # protection contre HTML au lieu du fichier
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "text/html" in ctype or (len(r.content) < 4000 and b"<html" in r.content[:2000].lower()):
-        raise RuntimeError(f"Le lien ne renvoie pas un fichier binaire attendu (probable HTML). URL: {url}")
-    return r.content
+# ---------------------------
+# Parse BDPM
+# ---------------------------
+def parse_cis_bdpm(text: str) -> Dict[str, Dict]:
+    d: Dict[str, Dict] = {}
+    reader = csv.reader(text.splitlines(), delimiter="\t")
+    for row in reader:
+        if not row:
+            continue
+        cis = row[0].strip()
+        if not cis:
+            continue
+        titulaire = row[10].strip() if len(row) > 10 else ""
+        d[cis] = {
+            "Code cis": cis,
+            "Spécialité": row[1].strip() if len(row) > 1 else "",
+            "Forme": row[2].strip() if len(row) > 2 else "",
+            "Voie d'administration": row[3].strip() if len(row) > 3 else "",
+            # tu veux des noms type "Arrow" -> c’est le Titulaire dans CIS_bdpm
+            "Laboratoire": titulaire,
+        }
+    return d
 
-# -----------------------------
-# ANSM - find Excel link (robuste)
-# -----------------------------
-
-def find_ansm_excel_url(session: requests.Session) -> str:
-    r = session.get(ANSM_PAGE_URL, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    hrefs = []
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if href:
-            hrefs.append(href)
-
-    urls = [urljoin(ANSM_PAGE_URL, h) for h in hrefs]
-
-    candidates: List[str] = []
-    for u in urls:
-        low = u.lower()
-        if (low.endswith(".xls") or low.endswith(".xlsx")) and ("retrocession" in low or "uploads" in low):
-            candidates.append(u)
-
-    if not candidates:
-        raw = re.findall(r'https?://[^\s"<>]+?\.(?:xls|xlsx)', r.text, flags=re.IGNORECASE)
-        candidates.extend(raw)
-
-    # de-dup
-    seen = set()
-    cand = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            cand.append(c)
-
-    print(f"ANSM: {len(cand)} candidat(s) .xls/.xlsx")
-    for i, c in enumerate(cand[:10], start=1):
-        print(f"  - {i}: {c}")
-
-    if not cand:
-        raise RuntimeError("Impossible de trouver le fichier ANSM (.xls/.xlsx) sur la page.")
-
-    def score(u: str) -> int:
-        s = 0
-        if re.search(r"\b20\d{2}/\d{2}/\d{2}\b", u):
-            s += 10
-        if re.search(r"\b20\d{2}\d{2}\d{2}\b", u):
-            s += 8
-        if "retrocession" in u.lower():
-            s += 5
-        return s
-
-    cand.sort(key=score, reverse=True)
-    return cand[0]
-
-def parse_ansm_excel_cis(excel_bytes: bytes, is_xls: bool) -> Set[str]:
+def parse_cis_cip_bdpm(text: str) -> Tuple[Dict[str, str], Set[str]]:
     """
-    La 3e colonne (index 2) = Code CIS.
-    Utilise xlrd (xls) ou openpyxl (xlsx) sans pandas (évite les soucis numpy).
+    CIP13 + présence taux remboursement (ville).
+    Méthode plus robuste: on parcourt toutes les colonnes:
+      - CIP13 = 13 chiffres
+      - taux rembours. = motif "xx%" ou valeurs usuelles
     """
+    cis_to_cip13: Dict[str, str] = {}
+    cis_with_reimb: Set[str] = set()
+
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if not parts:
+            continue
+        cis = parts[0].strip()
+        if not cis.isdigit():
+            continue
+
+        cip13 = ""
+        for p in parts[1:]:
+            digits = re.sub(r"\D", "", p)
+            if len(digits) == 13:
+                cip13 = digits
+                break
+        if cip13:
+            cis_to_cip13[cis] = cip13
+
+        joined = " ".join(parts)
+        if re.search(r"\b\d{1,3}\s?%\b", joined) or re.search(r"\b(15|30|35|40|50|55|60|65|70|80|90|100)\b", joined):
+            cis_with_reimb.add(cis)
+
+    return cis_to_cip13, cis_with_reimb
+
+def parse_cis_cpd_bdpm(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    reader = csv.reader(text.splitlines(), delimiter="\t")
+    for row in reader:
+        if not row:
+            continue
+        cis = row[0].strip()
+        if not cis:
+            continue
+        txt = "\n".join([c.strip() for c in row[1:] if c.strip()])
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        if txt:
+            out[cis] = txt
+    return out
+
+# ---------------------------
+# ANSM rétrocession
+# ---------------------------
+def find_ansm_xls_url() -> str:
+    r = SESSION.get(ANSM_PAGE, timeout=60)
+    r.raise_for_status()
+    html = r.text
+    m = re.findall(r'https?://ansm\.sante\.fr/[^"\s]+?\.(?:xls|xlsx)', html, flags=re.I)
+    if m:
+        return m[0]
+    m2 = re.findall(r'(/uploads/[^"\s]+?\.(?:xls|xlsx))', html, flags=re.I)
+    if m2:
+        return "https://ansm.sante.fr" + m2[0]
+    raise RuntimeError("Impossible de trouver le fichier ANSM (.xls/.xlsx).")
+
+def parse_ansm_retro_cis(xls_url: str) -> Set[str]:
+    r = SESSION.get(xls_url, timeout=180)
+    r.raise_for_status()
+
+    if xls_url.lower().endswith(".xlsx"):
+        raise RuntimeError("Le fichier ANSM est en .xlsx (xlrd ne le lit pas).")
+
+    book = xlrd.open_workbook(file_contents=r.content)
+    sh = book.sheet_by_index(0)
+
     cis_set: Set[str] = set()
-
-    if is_xls:
-        book = xlrd.open_workbook(file_contents=excel_bytes)
-        sheet = book.sheet_by_index(0)
-        for r in range(sheet.nrows):
-            val = sheet.cell_value(r, 2)  # 3e colonne
-            s = str(val).strip()
-            # xlrd peut retourner float -> "61234567.0"
-            s = s.replace(".0", "")
-            if s.isdigit():
-                cis_set.add(s)
-    else:
-        # xlsx
-        from io import BytesIO
-        wb = load_workbook(filename=BytesIO(excel_bytes), read_only=True, data_only=True)
-        ws = wb.worksheets[0]
-        for row in ws.iter_rows(values_only=True):
-            if not row or len(row) < 3:
-                continue
-            val = row[2]
-            if val is None:
-                continue
-            s = str(val).strip()
-            s = s.replace(".0", "")
-            if s.isdigit():
-                cis_set.add(s)
-
+    for rx in range(sh.nrows):
+        row = sh.row_values(rx)
+        if len(row) < 3:
+            continue
+        v = re.sub(r"\D", "", str(row[2]).strip())
+        if len(v) >= 6:
+            cis_set.add(v)
     return cis_set
 
-def load_ansm_retrocession_cis(session: requests.Session) -> Set[str]:
-    print("Recherche lien Excel ANSM ...")
-    url = find_ansm_excel_url(session)
-    print(f"Lien ANSM trouvé : {url}")
-
-    data = download_binary(session, url)
-    is_xls = url.lower().endswith(".xls") and not url.lower().endswith(".xlsx")
-    cis = parse_ansm_excel_cis(data, is_xls=is_xls)
-    if not cis:
-        raise RuntimeError("Fichier ANSM lu mais aucun CIS détecté.")
-    print(f"CIS ANSM rétrocession: {len(cis)}")
-    return cis
-
-# -----------------------------
-# BDPM Parsers
-# -----------------------------
-
-@dataclass
-class CisRow:
-    cis: str
-    specialite: str
-    forme: str
-    voie_admin: str
-    laboratoire: str  # titulaire
-
-@dataclass
-class CipInfo:
-    cis: str
-    cip13: str
-    agrement: str
-    remboursement_present: bool
-
-def parse_bdpm_cis(text: str) -> Dict[str, CisRow]:
+# ---------------------------
+# RCP scraping (corrigé)
+# ---------------------------
+def normalize_rcp_url(url: str) -> str:
     """
-    CIS_bdpm.txt : séparateur TAB, latin-1/utf-8 selon source.
-    Colonnes importantes:
-    0 CIS
-    1 Dénomination
-    2 Forme pharmaceutique
-    3 Voies d'administration
-    10 Titulaire
+    Convertit:
+      .../extrait#tab-rcp  -> .../extrait?tab=rcp
+      .../extrait#tab-rcp -> .../extrait?tab=rcp
     """
-    out: Dict[str, CisRow] = {}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 11:
-            continue
-        cis = parts[0].strip()
-        if not cis.isdigit():
-            continue
-
-        denom = parts[1].strip()
-        forme = parts[2].strip()
-        voie = parts[3].strip()
-        titulaire = parts[10].strip()
-
-        out[cis] = CisRow(
-            cis=cis,
-            specialite=denom,
-            forme=forme,
-            voie_admin=voie,
-            laboratoire=titulaire
-        )
-    return out
-
-def extract_first_cip13(parts: List[str]) -> str:
-    # cherche un bloc de 13 chiffres dans toute la ligne
-    joined = "\t".join(parts)
-    m = re.search(r"\b(\d{13})\b", joined)
-    return m.group(1) if m else ""
-
-def parse_bdpm_cis_cip(text: str) -> Dict[str, CipInfo]:
-    """
-    CIS_CIP_bdpm.txt (TAB).
-    Besoins:
-    - Agrément aux collectivités = 7e colonne (index 6) selon ta consigne
-    - présence taux remboursement = colonnes 8/9/10 (positions 8-9-10) => index 7/8/9
-    - CIP 13: extraction robuste (13 digits)
-    """
-    out: Dict[str, CipInfo] = {}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        cis = parts[0].strip()
-        if not cis.isdigit():
-            continue
-
-        agrement = parts[6].strip() if len(parts) > 6 else ""
-        # colonnes 8/9/10 => index 7/8/9
-        col8 = parts[7].strip() if len(parts) > 7 else ""
-        col9 = parts[8].strip() if len(parts) > 8 else ""
-        col10 = parts[9].strip() if len(parts) > 9 else ""
-        remboursement_present = any([col8, col9, col10])
-
-        cip13 = extract_first_cip13(parts)
-
-        # On garde une seule entrée par CIS (si multiples lignes, on privilégie:
-        # - remboursement_present True
-        # - cip13 non vide
-        # - agrement non vide)
-        prev = out.get(cis)
-        if prev is None:
-            out[cis] = CipInfo(cis=cis, cip13=cip13, agrement=agrement, remboursement_present=remboursement_present)
+    if not url:
+        return url
+    u = url.strip()
+    # si ancre tab-rcp
+    u = re.sub(r"#tab-rcp.*$", "", u)
+    if "extrait" in u and "tab=rcp" not in u:
+        if "?" in u:
+            u = u + "&tab=rcp"
         else:
-            best = prev
-            def score(ci: CipInfo) -> int:
-                return (2 if ci.remboursement_present else 0) + (1 if ci.cip13 else 0) + (1 if ci.agrement else 0)
-            cand = CipInfo(cis=cis, cip13=cip13, agrement=agrement, remboursement_present=remboursement_present)
-            if score(cand) > score(best):
-                out[cis] = cand
-    return out
+            u = u + "?tab=rcp"
+    return u
 
-def parse_bdpm_cis_cpd(text: str) -> Dict[str, str]:
-    """
-    CIS_CPD_bdpm.txt : colonnes TAB
-    col0 CIS
-    col1 Conditions
-    (fallback uniquement si RCP inaccessible/indisponible pour le CPD)
-    """
-    out: Dict[str, str] = {}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        cis = parts[0].strip()
-        if not cis.isdigit():
-            continue
-        cpd = parts[1].strip()
-        if cpd:
-            out[cis] = cpd
-    return out
+def fetch_rcp_html(url: str) -> str:
+    r = SESSION.get(url, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"RCP HTTP {r.status_code}")
+    return r.text
 
-# -----------------------------
-# RCP parsing for CPD + signals
-# -----------------------------
-
-@dataclass
-class RcpSignals:
-    cpd_text: str
-    has_hospital_usage: bool
-    has_homeopathy: bool
-
-def fetch_rcp_and_extract(session: requests.Session, cis: str) -> RcpSignals:
-    url = RCP_URL_TEMPLATE.format(cis=cis)
-    r = session.get(url, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-
-    html = r.text
-    soup = BeautifulSoup(html, "html.parser")
-
-    full_text = normalize_ws(soup.get_text("\n"))
-    low = full_text.lower()
-
-    has_homeopathy = ("homéopathi" in low) or ("homeopathi" in low)
-    has_hospital_usage = ("usage hospitalier" in low) or ("réservé à l’usage hospitalier" in low) or ("reserve a l'usage hospitalier" in low)
-
-    # Trouver le bloc "CONDITIONS DE PRESCRIPTION ET DE DELIVRANCE"
-    # On cherche un élément contenant cette chaîne puis on prend le texte après.
-    target_re = re.compile(r"conditions\s+de\s+prescription\s+et\s+de\s+d[ée]livrance", re.IGNORECASE)
-
-    cpd_text = ""
-    # 1) Chercher dans les headings/strong
-    candidates = soup.find_all(string=target_re)
-    if candidates:
-        node = candidates[0]
-        # Remonter au conteneur visuel
-        container = node.parent
-        # On essaye d'aller au parent supérieur si c'est juste <span> etc.
-        for _ in range(3):
-            if container and container.parent:
-                container = container.parent
-
-        # Extraire les paragraphes suivants dans ce conteneur, jusqu’au prochain titre en majuscules
-        # Méthode simple: récupérer tout le texte du conteneur puis couper après le header
-        container_text = normalize_ws(container.get_text("\n"))
-        m = target_re.search(container_text)
-        if m:
-            after = container_text[m.end():].strip()
-            # couper si on retombe sur un gros titre probable (ex: "13." ou "ANNEXE" etc.)
-            after = re.split(r"\n\s*(?:\d+\.\s+[A-ZÉÈÀÙÂÊÎÔÛÇ]|ANNEXE|CONDITIONS\s+D[’']UTILISATION)\b", after)[0]
-            cpd_text = normalize_ws(after)
-
-    # Fallback: regex dans tout le texte
-    if not cpd_text:
-        m = re.search(r"CONDITIONS DE PRESCRIPTION ET DE DELIVRANCE\s*(.+)$", full_text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            after = m.group(1)
-            # couper à la fin si un nouveau titre apparaît
-            after = re.split(r"\n\s*\d+\.\s+", after)[0]
-            cpd_text = normalize_ws(after)
-
-    return RcpSignals(
-        cpd_text=cpd_text,
-        has_hospital_usage=has_hospital_usage,
-        has_homeopathy=has_homeopathy
+def strip_accents_lower(s: str) -> str:
+    s = s.lower()
+    return (
+        s.replace("é", "e")
+         .replace("è", "e")
+         .replace("ê", "e")
+         .replace("à", "a")
+         .replace("ù", "u")
+         .replace("î", "i")
+         .replace("ï", "i")
+         .replace("ô", "o")
+         .replace("ç", "c")
     )
 
-def compute_disponibilite(
-    remboursement_present: bool,
-    is_retro_ansm: bool,
-    has_hospital_usage: bool,
-    has_homeopathy: bool
-) -> str:
-    ville = remboursement_present or has_homeopathy
+def extract_cpd_from_rcp(html: str) -> str:
+    """
+    Extraction robuste "par lignes" à partir du texte rendu.
+    On récupère tout ce qui suit le titre CPD jusqu'à un stop.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    lines = [re.sub(r"\s+", " ", l).strip() for l in text.split("\n") if l.strip()]
 
-    if ville and is_retro_ansm:
+    # repère la ligne titre
+    idx = -1
+    for i, l in enumerate(lines):
+        if strip_accents_lower(l) == "conditions de prescription et de delivrance":
+            idx = i
+            break
+        # parfois sans "de"
+        if "conditions de prescription" in strip_accents_lower(l) and "delivrance" in strip_accents_lower(l):
+            idx = i
+            break
+
+    if idx == -1:
+        return ""
+
+    # collecte après le titre
+    out = []
+    for l in lines[idx + 1 :]:
+        ll = strip_accents_lower(l)
+        # stops fréquents en bas de page
+        if ll in ("haut de page",):
+            break
+        if "ministere du travail" in ll or "ministere de la sante" in ll:
+            break
+        if ll.startswith("legifrance") or ll.startswith("gouvernement") or ll.startswith("service-public"):
+            break
+        # si on retombe sur un gros titre numéroté (10., 11., 12., etc.) on peut stopper
+        if re.match(r"^\d+\.\s", l):
+            break
+        out.append(l)
+
+    cpd = "\n".join(out).strip()
+    # nettoyage sauts de ligne
+    cpd = re.sub(r"\n{3,}", "\n\n", cpd).strip()
+    return cpd
+
+def is_homeopathy(html: str) -> bool:
+    t = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    t = strip_accents_lower(t)
+    return "homeopathi" in t  # couvre "homéopathique", "homéopathie", etc.
+
+def has_hospital_only_mention(html: str) -> bool:
+    t = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    t = strip_accents_lower(t)
+    keywords = [
+        "reserve a l usage hospitalier",
+        "reserve a l'usage hospitalier",
+        "usage hospitalier",
+        "prescription hospitaliere",
+        "medicament soumis a prescription hospitaliere",
+    ]
+    return any(k in t for k in keywords)
+
+# ---------------------------
+# Disponibilité (règles finales)
+# ---------------------------
+def compute_availability(
+    cis_in_retro_ansm: bool,
+    cis_has_reimb: bool,
+    rcp_html: Optional[str],
+) -> str:
+    in_ville = cis_has_reimb
+
+    if rcp_html and is_homeopathy(rcp_html):
+        in_ville = True
+
+    if cis_in_retro_ansm and in_ville:
         return "Disponible en ville et en rétrocession hospitalière"
-    if is_retro_ansm:
+    if cis_in_retro_ansm:
         return "Disponible en rétrocession hospitalière"
-    if has_hospital_usage:
+
+    if rcp_html and has_hospital_only_mention(rcp_html):
         return "Réservé à l'usage hospitalier"
-    if ville:
+
+    if in_ville:
         return "Disponible en pharmacie de ville"
+
     return "Pas d'informations mentionnées"
 
-# -----------------------------
-# Airtable client (retry / batch)
-# -----------------------------
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    require_env()
 
-class AirtableClient:
-    def __init__(self, api_token: str, base_id: str, table_name: str):
-        self.api_token = api_token
-        self.base_id = base_id
-        self.table_name = table_name
-        self.base_url = f"https://api.airtable.com/v0/{base_id}/{requests.utils.quote(table_name, safe='')}"
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT
-        })
+    LOG.info("1) Téléchargements BDPM ...")
+    cis_bdpm_txt = download_text(URL_CIS_BDPM)
+    LOG.info("✅ BDPM CIS OK")
+    cis_cip_txt = download_text(URL_CIS_CIP_BDPM)
+    LOG.info("✅ BDPM CIS_CIP OK")
+    cis_cpd_txt = download_text(URL_CIS_CPD_BDPM)
+    LOG.info("✅ BDPM CIS_CPD OK")
 
-    def _request(self, method: str, url: str, **kwargs) -> dict:
-        for attempt in range(1, 8):
-            resp = self.session.request(method, url, timeout=DEFAULT_TIMEOUT, **kwargs)
-            if resp.status_code in (429, 500, 502, 503, 504):
-                wait = min(30, (2 ** attempt) * 0.5) + random.random()
-                print(f"Airtable {resp.status_code} -> retry dans {wait:.1f}s")
-                time.sleep(wait)
-                continue
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Airtable error {resp.status_code}: {resp.text[:800]}")
-            return resp.json()
-        raise RuntimeError("Airtable: trop de retries")
+    LOG.info("2) ANSM rétrocession ...")
+    ansm_xls_url = find_ansm_xls_url()
+    LOG.info(f"✅ Lien ANSM trouvé : {ansm_xls_url}")
+    retro_cis = parse_ansm_retro_cis(ansm_xls_url)
+    LOG.info(f"✅ CIS ANSM rétrocession : {len(retro_cis)}")
 
-    def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
-        records = []
-        offset = None
-        params = {}
-        if fields:
-            for f in fields:
-                params.setdefault("fields[]", []).append(f)
+    LOG.info("3) Parsing ...")
+    cis_rows = parse_cis_bdpm(cis_bdpm_txt)
+    cis_to_cip13, cis_has_reimb = parse_cis_cip_bdpm(cis_cip_txt)
+    cis_to_cpd_fallback = parse_cis_cpd_bdpm(cis_cpd_txt)
 
-        while True:
-            p = dict(params)
-            if offset:
-                p["offset"] = offset
-            data = self._request("GET", self.base_url, params=p)
-            records.extend(data.get("records", []))
-            offset = data.get("offset")
-            if not offset:
-                break
-            safe_sleep(0.2)
-        return records
+    bdpm_cis_set = set(cis_rows.keys())
+    LOG.info(f"✅ CIS BDPM: {len(bdpm_cis_set)}")
 
-    def batch_create(self, rows: List[dict]) -> None:
-        for i in range(0, len(rows), AIRTABLE_BATCH):
-            chunk = rows[i:i + AIRTABLE_BATCH]
-            payload = {"records": [{"fields": r} for r in chunk]}
-            self._request("POST", self.base_url, data=json.dumps(payload))
-            safe_sleep(0.35)
+    LOG.info("4) Inventaire Airtable ...")
+    airtable_map = airtable_list_records()
+    airtable_cis_set = set(airtable_map.keys())
+    LOG.info(f"✅ CIS Airtable: {len(airtable_cis_set)}")
 
-    def batch_update(self, updates: List[Tuple[str, dict]]) -> None:
-        for i in range(0, len(updates), AIRTABLE_BATCH):
-            chunk = updates[i:i + AIRTABLE_BATCH]
-            payload = {"records": [{"id": rid, "fields": fields} for rid, fields in chunk]}
-            self._request("PATCH", self.base_url, data=json.dumps(payload))
-            safe_sleep(0.35)
+    to_delete = sorted(list(airtable_cis_set - bdpm_cis_set))
+    to_create = sorted(list(bdpm_cis_set - airtable_cis_set))
+    to_update = sorted(list(bdpm_cis_set & airtable_cis_set))
 
-    def batch_delete(self, record_ids: List[str]) -> None:
-        for i in range(0, len(record_ids), AIRTABLE_BATCH):
-            chunk = record_ids[i:i + AIRTABLE_BATCH]
-            # delete uses query params records[]=id
-            params = [("records[]", rid) for rid in chunk]
-            self._request("DELETE", self.base_url, params=params)
-            safe_sleep(0.35)
+    LOG.info(f"→ À créer: {len(to_create)} | À supprimer: {len(to_delete)} | À mettre à jour: {len(to_update)}")
 
-# -----------------------------
-# Main sync logic
-# -----------------------------
+    if to_delete:
+        LOG.info("5) Suppression Airtable (absents BDPM) ...")
+        delete_ids = [airtable_map[cis] for cis in to_delete if cis in airtable_map]
+        airtable_batch_delete(delete_ids)
+        LOG.info(f"✅ Supprimés: {len(delete_ids)}")
 
-def main() -> None:
-    # Env
-    api_token = env_required("AIRTABLE_API_TOKEN")
-    base_id = env_required("AIRTABLE_BASE_ID")
-    table_name = env_required("AIRTABLE_CIS_TABLE_NAME")  # tu veux garder ce nom
+    if to_create:
+        LOG.info("6) Création Airtable ...")
+        payload = []
+        for cis in to_create:
+            base = cis_rows[cis]
+            fields = {
+                "Code cis": base.get("Code cis", ""),
+                "Spécialité": base.get("Spécialité", ""),
+                "Forme": base.get("Forme", ""),
+                "Voie d'administration": base.get("Voie d'administration", ""),
+                "Laboratoire": base.get("Laboratoire", ""),
+                "Lien vers RCP": f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait?tab=rcp",
+                "CIP 13": cis_to_cip13.get(cis, ""),
+            }
+            fields = {k: v for k, v in fields.items() if str(v).strip() != ""}
+            payload.append({"fields": fields})
+        airtable_batch_create(payload)
+        LOG.info(f"✅ Créés: {len(payload)}")
+        airtable_map = airtable_list_records()
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    LOG.info("7) Enrichissement (CPD + CIP13 + Disponibilité) ...")
+    updates = []
+    scraped = 0
 
-    print("1) Téléchargements BDPM ...")
-    cis_txt = download_text(session, BDPM_CIS_URL)
-    print(f"BDPM CIS OK ({len(cis_txt)} chars)")
+    random.shuffle(to_update)
 
-    cis_cip_txt = download_text(session, BDPM_CIS_CIP_URL)
-    print(f"BDPM CIS_CIP OK ({len(cis_cip_txt)} chars)")
-
-    cis_cpd_txt = download_text(session, BDPM_CIS_CPD_URL)
-    print(f"BDPM CIS_CPD OK ({len(cis_cpd_txt)} chars)")
-
-    print("2) Recherche + téléchargement ANSM ...")
-    try:
-        cis_ansm_retro = load_ansm_retrocession_cis(session)
-    except Exception as e:
-        print(f"❌ Impossible de trouver/lire le fichier ANSM. Aucune action Airtable. Détail: {e}")
-        if STOP_IF_ANSM_FAIL:
-            raise
-        cis_ansm_retro = set()
-
-    print("3) Parsing fichiers BDPM ...")
-    cis_map = parse_bdpm_cis(cis_txt)
-    cip_map = parse_bdpm_cis_cip(cis_cip_txt)
-    cpd_file_map = parse_bdpm_cis_cpd(cis_cpd_txt)
-
-    print(f"CIS BDPM: {len(cis_map)}")
-    print(f"CIS_CIP infos: {len(cip_map)}")
-    print(f"CIS_CPD infos: {len(cpd_file_map)}")
-
-    # Airtable client
-    at = AirtableClient(api_token, base_id, table_name)
-
-    print("4) Lecture inventaire Airtable ...")
-    existing = at.list_all_records(fields=[FIELD_CIS])
-    cis_to_id: Dict[str, str] = {}
-    for rec in existing:
-        fields = rec.get("fields", {})
-        cis = str(fields.get(FIELD_CIS, "")).strip()
-        if cis:
-            cis_to_id[cis] = rec["id"]
-
-    existing_set = set(cis_to_id.keys())
-    bdpm_set = set(cis_map.keys())
-
-    to_delete_cis = sorted(existing_set - bdpm_set)
-    to_create_cis = sorted(bdpm_set - existing_set)
-    to_keep_cis = sorted(existing_set & bdpm_set)
-
-    print(f"Airtable existants: {len(existing_set)}")
-    print(f"A créer: {len(to_create_cis)}")
-    print(f"A supprimer: {len(to_delete_cis)}")
-    print(f"A conserver: {len(to_keep_cis)}")
-
-    # 5) Suppressions (seulement si ANSM OK, sinon on ne touche pas Airtable)
-    if to_delete_cis:
-        print("5) Suppression des CIS absents BDPM ...")
-        ids = [cis_to_id[cis] for cis in to_delete_cis if cis in cis_to_id]
-        at.batch_delete(ids)
-        print(f"Supprimés: {len(ids)}")
-
-        # mettre à jour cis_to_id si besoin (optionnel)
-        for cis in to_delete_cis:
-            cis_to_id.pop(cis, None)
-
-    # 6) Créations
-    if to_create_cis:
-        print("6) Création des CIS manquants ...")
-        new_rows = []
-        for cis in to_create_cis:
-            row = cis_map[cis]
-            new_rows.append({
-                FIELD_CIS: row.cis,
-                FIELD_SPECIALITE: row.specialite,
-                FIELD_FORME: row.forme,
-                FIELD_VOIE_ADMIN: row.voie_admin,
-                FIELD_LABO: row.laboratoire,
-                FIELD_RCP_LINK: RCP_URL_TEMPLATE.format(cis=row.cis),
-            })
-        at.batch_create(new_rows)
-        print(f"Créés: {len(new_rows)}")
-
-        # Recharger ids (obligatoire pour updater ensuite)
-        existing = at.list_all_records(fields=[FIELD_CIS])
-        cis_to_id = {}
-        for rec in existing:
-            fields = rec.get("fields", {})
-            cis = str(fields.get(FIELD_CIS, "")).strip()
-            if cis:
-                cis_to_id[cis] = rec["id"]
-
-    # 7) Enrichissements / updates
-    print("7) Enrichissement des champs (CIP13 / agrément / dispo / CPD depuis RCP) ...")
-
-    updates: List[Tuple[str, dict]] = []
-    total = len(cis_map)
-
-    # On peut limiter la charge RCP si besoin, mais tu as demandé "totalité"
-    for idx, cis in enumerate(sorted(cis_map.keys()), start=1):
-        rid = cis_to_id.get(cis)
+    for cis in to_update:
+        rid = airtable_map.get(cis)
         if not rid:
             continue
 
-        base = cis_map[cis]
-        cip = cip_map.get(cis)
-        remboursement_present = cip.remboursement_present if cip else False
-        agrement = cip.agrement if cip else ""
-        cip13 = cip.cip13 if cip else ""
+        rcp_url = normalize_rcp_url(f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait#tab-rcp")
+        rcp_html = None
+        cpd_text = ""
 
-        is_retro = cis in cis_ansm_retro
+        if scraped < MAX_RCP_PER_RUN:
+            try:
+                rcp_html = fetch_rcp_html(rcp_url)
+                scraped += 1
+                cpd_text = extract_cpd_from_rcp(rcp_html)
+            except Exception as e:
+                if STOP_ON_RCP_ERROR:
+                    raise SystemExit(f"❌ RCP inaccessible pour CIS={cis} ({rcp_url}) -> STOP. Détail: {e}")
+                cpd_text = cis_to_cpd_fallback.get(cis, "")
+        else:
+            cpd_text = cis_to_cpd_fallback.get(cis, "")
 
-        # RCP extraction
-        try:
-            sig = fetch_rcp_and_extract(session, cis)
-            cpd_text = sig.cpd_text
-            has_hosp = sig.has_hospital_usage
-            has_homeo = sig.has_homeopathy
-        except Exception as e:
-            # On ne stoppe pas tout l’import BDPM si un RCP est inaccessible.
-            # MAIS tu peux choisir de stopper : mets "raise" ici si tu veux.
-            print(f"⚠️ RCP inaccessible pour CIS={cis}: {e}")
-            cpd_text = ""
-            has_hosp = False
-            has_homeo = False
-
-        # fallback CPD file si RCP vide
-        if not cpd_text:
-            cpd_text = cpd_file_map.get(cis, "")
-
-        dispo = compute_disponibilite(
-            remboursement_present=remboursement_present,
-            is_retro_ansm=is_retro,
-            has_hospital_usage=has_hosp,
-            has_homeopathy=has_homeo
+        dispo = compute_availability(
+            cis_in_retro_ansm=(cis in retro_cis),
+            cis_has_reimb=(cis in cis_has_reimb),
+            rcp_html=rcp_html,
         )
 
-        fields_update = {
-            # toujours remettre à jour ces champs (corrige encodage et erreurs)
-            FIELD_SPECIALITE: base.specialite,
-            FIELD_FORME: base.forme,
-            FIELD_VOIE_ADMIN: base.voie_admin,
-            FIELD_LABO: base.laboratoire,
-            FIELD_RCP_LINK: RCP_URL_TEMPLATE.format(cis=cis),
-            FIELD_DISPO: dispo,
+        fields = {
+            "CIP 13": cis_to_cip13.get(cis, ""),
+            "Disponibilité du traitement": dispo,
+            "Conditions de prescription et délivrance": cpd_text,
         }
 
-        if agrement:
-            fields_update[FIELD_AGREMENT] = agrement
-        if cip13:
-            fields_update[FIELD_CIP13] = cip13
-        if cpd_text:
-            fields_update[FIELD_CPD] = cpd_text
+        fields = {k: v for k, v in fields.items() if str(v).strip() != ""}
 
-        updates.append((rid, fields_update))
+        # si tout est vide (rare), on évite un patch inutile
+        if fields:
+            updates.append({"id": rid, "fields": fields})
 
-        if idx % 200 == 0:
-            print(f"  - préparé {idx}/{total} updates")
+        if rcp_html is not None:
+            time.sleep(random.uniform(RCP_SLEEP_MIN, RCP_SLEEP_MAX))
+
+        if len(updates) >= 50:
+            airtable_batch_update(updates)
+            updates = []
 
     if updates:
-        print(f"Envoi updates Airtable: {len(updates)}")
-        at.batch_update(updates)
-    print("✅ Terminé.")
+        airtable_batch_update(updates)
+
+    LOG.info(f"✅ Terminé. RCP scrapés ce run: {scraped}")
 
 if __name__ == "__main__":
     main()
