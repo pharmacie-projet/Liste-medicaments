@@ -34,7 +34,7 @@ HEADERS_WEB = {
 AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))  # throttle global (≈4 req/s)
 AIRTABLE_BATCH_SIZE = 10                                                # limite Airtable / request
 
-# Flush logique (debug par défaut: 200). Tu peux remonter à 1000 ensuite.
+# Flush logique (tu peux mettre 1000 via env UPDATE_FLUSH_THRESHOLD)
 UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
 
 # Timeouts requests (connect, read)
@@ -143,10 +143,6 @@ def normalize_ws_keep_lines(s: str) -> str:
     return "\n".join(out).strip()
 
 def capitalize_each_line(text: str) -> str:
-    """
-    Met une majuscule à la première lettre de chaque ligne non vide
-    (en conservant d'éventuelles indentations).
-    """
     if not text:
         return text
     out_lines: List[str] = []
@@ -345,11 +341,6 @@ def looks_like_taux(val: str) -> bool:
     return x in {0, 15, 30, 35, 65, 100}
 
 def parse_bdpm_cis_cip(txt: str) -> Dict[str, CipInfo]:
-    """
-    Parse CIS_CIP_bdpm.txt pour extraire :
-    - CIP 13 (premier 13 chiffres trouvé sur la ligne)
-    - has_taux (détection d'un taux de remboursement typique)
-    """
     out: Dict[str, CipInfo] = {}
     for line in txt.splitlines():
         if not line.strip():
@@ -413,6 +404,10 @@ NEGATION_PAT = re.compile(
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
+
+# Classe pharmacothérapeutique (ligne fiche-info)
+PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
+CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", re.IGNORECASE)
 
 class PageUnavailable(Exception):
     def __init__(self, url: str, status: Optional[int], detail: str):
@@ -516,20 +511,63 @@ def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     m2 = ATC_PAT.search(text or "")
     return m2.group(0).strip() if m2 else ""
 
+def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
+    """
+    Extrait la ligne "Classe pharmacothérapeutique ..." dans fiche-info.
+    Exemples observés :
+      - "Classe pharmacothérapeutique : XXX – code ATC : L01BA01."
+      - "Classe pharmacothérapeutique - code ATC : N02AX02"
+      - "Classe pharmacothérapeutique : Médicament homéopathique"
+    Retourne (classe_pharm, atc_code_si_trouvé)
+    """
+    lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
+    for ln in lines:
+        if not PHARM_CLASS_LINE_PAT.search(ln):
+            continue
+
+        atc = ""
+        m_atc = CODE_ATC_INLINE_PAT.search(ln)
+        if m_atc:
+            atc = m_atc.group(1).strip()
+
+        # Nettoyage : retirer "Classe pharmacothérapeutique" + séparateurs
+        s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
+        s = s.lstrip(":").strip()
+
+        # Si format "... - code ATC : XXX", on retire cette partie
+        s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
+
+        # Si encore "code ATC ..." seul, c'est qu'il n'y a pas de libellé
+        if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?", s, flags=re.IGNORECASE):
+            s = ""
+
+        return s, atc
+
+    return "", ""
+
 def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
-def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
+def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]:
+    """
+    Retour:
+      cpd_text, is_homeo, reserved, usage, atc_code, pharm_class
+    """
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
     is_homeo = detect_homeopathy_from_fiche_info(soup)
 
     cpd_text = extract_cpd_from_fiche_info(soup)
-    cpd_text = capitalize_each_line(cpd_text)  # ✅ majuscule à chaque ligne
+    cpd_text = capitalize_each_line(cpd_text)
 
-    atc_code = extract_atc_from_fiche_info(soup)
+    # 🔹 Classe pharmacothérapeutique + ATC (prioritaire)
+    pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
+
+    # 🔹 ATC fallback
+    atc_code = atc_from_class_line.strip() or extract_atc_from_fiche_info(soup)
+
     badge_usage = extract_badge_usage_hospitalier_only(soup)
 
     zone_text = cpd_text or ""
@@ -540,7 +578,7 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
         reserved = bool(RESERVED_HOSP_PAT.search(zone_text))
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
-    return cpd_text, is_homeo, reserved, usage, atc_code
+    return cpd_text, is_homeo, reserved, usage, atc_code, pharm_class
 
 def compute_disponibilite(
     has_taux_ville: bool,
@@ -551,7 +589,6 @@ def compute_disponibilite(
 ) -> str:
     ville = bool(has_taux_ville or is_homeo)
 
-    # ✅ libellé modifié
     if is_ansm_retro and ville:
         return "Disponible en pharmacie de ville et en rétrocession hospitalière"
     if is_ansm_retro and not ville:
@@ -565,7 +602,6 @@ def compute_disponibilite(
     if ville:
         return "Disponible en pharmacie de ville"
 
-    # ✅ libellé modifié
     return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
@@ -686,6 +722,7 @@ def main():
         "Forme",
         "Voie d'administration",
         "Code ATC",
+        "Classe pharmacothérapeutique",  # ✅ NEW
     ]
 
     info("Inventaire Airtable ...")
@@ -767,7 +804,6 @@ def main():
     start = time.time()
 
     for idx, cis in enumerate(all_cis, start=1):
-        # Heartbeat: prouve que ça avance
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis})")
 
@@ -805,19 +841,25 @@ def main():
         cur_cpd = str(fields_cur.get("Conditions de prescription et délivrance", "")).strip()
         cur_dispo = str(fields_cur.get("Disponibilité du traitement", "")).strip()
         cur_atc = str(fields_cur.get("Code ATC", "")).strip()
+        cur_class = str(fields_cur.get("Classe pharmacothérapeutique", "")).strip()
 
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_class)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
             try:
-                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
+                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code, pharm_class = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields["Conditions de prescription et délivrance"] = cpd_text
 
                 if atc_code and atc_code != cur_atc:
                     upd_fields["Code ATC"] = atc_code
+
+                if pharm_class:
+                    pharm_class_clean = safe_text(pharm_class)
+                    if pharm_class_clean and pharm_class_clean != cur_class:
+                        upd_fields["Classe pharmacothérapeutique"] = pharm_class_clean
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
@@ -828,16 +870,12 @@ def main():
                     usage_hospital=usage_hosp,
                 )
 
-                # ✅ au cas où (phrase unique, mais on garde la cohérence)
-                dispo = capitalize_each_line(dispo)
-
                 if dispo != cur_dispo:
                     upd_fields["Disponibilité du traitement"] = dispo
 
             except PageUnavailable as e:
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
 
-                # flush updates avant delete
                 if updates:
                     at.update_records(updates)
                     ok(f"Batch updates (flush before delete): {len(updates)}")
