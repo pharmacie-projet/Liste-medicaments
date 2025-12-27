@@ -375,12 +375,12 @@ def airtable_batch_delete(token: str, base_id: str, table: str, record_ids: List
 def main():
     token = os.getenv("AIRTABLE_API_TOKEN", "").strip()
     base_id = os.getenv("AIRTABLE_BASE_ID", "").strip()
-    table = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
+    table = os.getenv("AIRTABLE_CIS_TABLE_NAME", "").strip()
     view = os.getenv("AIRTABLE_VIEW", "").strip() or None
     max_rcp_fetch = int(os.getenv("MAX_RCP_FETCH", "300"))
 
     if not token or not base_id or not table:
-        die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_TABLE_NAME")
+        die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
     # 1) Téléchargements (STOP si un seul fichier échoue)
     try:
