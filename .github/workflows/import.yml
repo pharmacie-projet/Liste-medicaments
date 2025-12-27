@@ -1,17 +1,15 @@
-name: run-import
+name: Import BDPM -> Airtable (mensuel)
 
 on:
   workflow_dispatch:
   schedule:
-    # 4 du mois à 01h Paris (00h UTC en hiver)
-    - cron: "0 0 4 * *"
+    - cron: "0 1 4 * *"
 
 jobs:
   run-import:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -19,21 +17,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run import (download + inventory + enrich)
-        run: python scripts/import_cis_bdpm_to_airtable.py
         env:
           AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
 
-          STOP_ON_RCP_ERROR: "true"
-          AIRTABLE_SLEEP: "0.25"
-          AIRTABLE_MAX_RETRIES: "8"
-          RCP_TIMEOUT: "45"
-          RCP_MAX_RETRIES: "4"
-          RCP_SLEEP: "0.40"
+          # RCP behavior (modifiables dans les secrets/env si tu veux)
+          RCP_FETCH_ENABLED: "1"
+          RCP_STRICT: "1"
+          RCP_SLEEP: "0.25"
+          # RCP_MAX_PER_RUN: "0"
+        run: |
+          python scripts/import_and_enrich_bdpm_to_airtable.py
