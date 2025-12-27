@@ -19,7 +19,6 @@ from bs4 import BeautifulSoup
 
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
-BDPM_CIS_CPD_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
@@ -73,7 +72,6 @@ def safe_text(s: str) -> str:
         s = str(s)
     s = s.replace("\uFFFD", "")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 def normalize_ws_keep_lines(s: str) -> str:
@@ -141,7 +139,6 @@ def find_ansm_retro_excel_link() -> str:
     r = http_get(ANSM_RETRO_PAGE)
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {ANSM_RETRO_PAGE}")
-
     soup = BeautifulSoup(r.text, _bs_parser())
 
     links = []
@@ -151,7 +148,6 @@ def find_ansm_retro_excel_link() -> str:
             continue
         if href.startswith("/"):
             href = "https://ansm.sante.fr" + href
-
         low = href.lower()
         if ("ansm.sante.fr/uploads/" in low) and ("retrocession" in low) and re.search(r"\.xlsx?$|\.xls$", low):
             links.append(href)
@@ -177,7 +173,6 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
         ext = os.path.splitext(ext)[1].lower()
 
     import io
-
     if ext == ".xlsx":
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
@@ -214,7 +209,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
     return cis_set
 
 # ============================================================
-# BDPM parse
+# BDPM PARSE
 # ============================================================
 
 @dataclass
@@ -224,7 +219,6 @@ class CisRow:
     forme: str
     voie_admin: str
     titulaire: str
-    surveillance: str
 
 def parse_bdpm_cis(txt: str) -> Dict[str, CisRow]:
     out: Dict[str, CisRow] = {}
@@ -241,31 +235,8 @@ def parse_bdpm_cis(txt: str) -> Dict[str, CisRow]:
         forme = safe_text(parts[2]) if len(parts) > 2 else ""
         voie = safe_text(parts[3]) if len(parts) > 3 else ""
         titulaire = safe_text(parts[10]) if len(parts) > 10 else ""
-        surveil = safe_text(parts[11]) if len(parts) > 11 else ""
-        out[cis] = CisRow(cis=cis, specialite=denom, forme=forme, voie_admin=voie, titulaire=titulaire, surveillance=surveil)
+        out[cis] = CisRow(cis=cis, specialite=denom, forme=forme, voie_admin=voie, titulaire=titulaire)
     return out
-
-def normalize_lab_name(titulaire: str) -> str:
-    t = titulaire or ""
-    t = t.replace(",", " ").replace(";", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return ""
-
-    t = re.sub(r"\b(SAS|SA|SARL|S\.A\.|S\.A\.S\.|GMBH|LTD|INC|BV|AG|SPA|S\.P\.A\.)\b", "", t, flags=re.IGNORECASE).strip()
-    t = re.sub(r"\s+", " ", t).strip()
-
-    first = t.split(" ")[0].strip()
-    if first.isupper() and len(first) > 2:
-        first = first.capitalize()
-
-    if first.lower() in {"laboratoires", "laboratoire"} and len(t.split(" ")) > 1:
-        nxt = t.split(" ")[1]
-        if nxt.isupper() and len(nxt) > 2:
-            nxt = nxt.capitalize()
-        return nxt
-
-    return first
 
 @dataclass
 class CipInfo:
@@ -323,73 +294,90 @@ def parse_bdpm_cis_cip(txt: str) -> Dict[str, CipInfo]:
 
     return out
 
+def normalize_lab_name(titulaire: str) -> str:
+    t = titulaire or ""
+    t = t.replace(",", " ").replace(";", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return ""
+    t = re.sub(r"\b(SAS|SA|SARL|S\.A\.|S\.A\.S\.|GMBH|LTD|INC|BV|AG|SPA|S\.P\.A\.)\b", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    first = t.split(" ")[0].strip()
+    if first.isupper() and len(first) > 2:
+        first = first.capitalize()
+    if first.lower() in {"laboratoires", "laboratoire"} and len(t.split(" ")) > 1:
+        nxt = t.split(" ")[1]
+        if nxt.isupper() and len(nxt) > 2:
+            nxt = nxt.capitalize()
+        return nxt
+    return first
+
 # ============================================================
-# HOSPITAL DETECTION (FIX FALSE POSITIVES)
+# RULES / PATTERNS
 # ============================================================
 
-# "réservé à l'usage hospitalier" (fort) + variantes apostrophes/accents
-RESERVED_HOSP_PAT = re.compile(
-    r"réserv[ée]?\s+à\s+l['’]usage\s+hospitalier",
-    flags=re.IGNORECASE
-)
+HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
 
-# "usage hospitalier" (faible)
-USAGE_HOSP_PAT = re.compile(
-    r"\busage\s+hospitalier\b",
-    flags=re.IGNORECASE
-)
+# badge "usage hospitalier" (en haut)
+BADGE_USAGE_HOSP_PAT = re.compile(r"\busage\s+hospitalier\b", flags=re.IGNORECASE)
 
-# Négations fréquentes
+# uniquement dans le sous-bloc "Conditions de prescription et de délivrance" (Autres informations)
+RESERVED_HOSP_PAT = re.compile(r"réserv[ée]?\s+à\s+l['’]usage\s+hospitalier", flags=re.IGNORECASE)
+USAGE_HOSP_PAT = re.compile(r"\busage\s+hospitalier\b", flags=re.IGNORECASE)
+
 NEGATION_PAT = re.compile(
     r"(?:\bnon\b|\bpas\b|\bjamais\b)\s+(?:réserv[ée]?\s+à\s+l['’]usage\s+hospitalier|\busage\s+hospitalier\b)",
     flags=re.IGNORECASE
 )
 
-def hospital_flag_from_text(text: str) -> Tuple[bool, bool]:
-    """
-    Retourne (reserved_strict, usage_weak) en tenant compte des négations.
-    """
-    t = text or ""
-    if NEGATION_PAT.search(t):
-        return (False, False)
-    reserved = bool(RESERVED_HOSP_PAT.search(t))
-    usage = bool(USAGE_HOSP_PAT.search(t))
-    return (reserved, usage)
+# Lignes à ignorer dans CPD
+GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 
-def parse_bdpm_cis_cpd_hints(txt: str) -> Dict[str, Tuple[bool, bool]]:
-    """
-    CIS_CPD_bdpm.txt -> (reserved_strict, usage_weak) avec gestion des négations.
-    """
-    out: Dict[str, Tuple[bool, bool]] = {}
-    for line in txt.splitlines():
-        if not line.strip():
+# ATC
+ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
+
+def clean_cpd_text_keep_useful(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.split("\n")]
+    kept = []
+    for ln in lines:
+        if not ln:
+            kept.append("")
             continue
-        parts = line.split("\t")
-        if len(parts) < 2:
+        if GLOSSARY_PAT.search(ln):
             continue
-        cis = re.sub(r"\D", "", parts[0].strip())
-        if len(cis) != 8:
-            continue
-        text = " ".join(parts[1:])
-        out[cis] = hospital_flag_from_text(text)
+        kept.append(ln)
+    out = "\n".join(kept)
+    out = normalize_ws_keep_lines(out)
     return out
 
+def compute_disponibilite(has_taux_ville: bool, is_ansm_retro: bool, is_homeopathy: bool,
+                          reserved_hospital: bool, usage_hospital: bool) -> str:
+    ville = bool(has_taux_ville or is_homeopathy)
+
+    if is_ansm_retro and ville:
+        return "Disponible en ville et en rétrocession hospitalière"
+    if is_ansm_retro and not ville:
+        return "Disponible en rétrocession hospitalière"
+
+    if reserved_hospital:
+        return "Réservé à l'usage hospitalier"
+    if usage_hospital and not ville:
+        return "Réservé à l'usage hospitalier"
+
+    if ville:
+        return "Disponible en pharmacie de ville"
+
+    return "Pas d'informations mentionnées"
+
 # ============================================================
-# HOMEOPATHY (with/without accents)
+# RCP SCRAPING: ONLY TARGET ZONES + ATC
 # ============================================================
 
-HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
-
-def rcp_mentions_homeopathy(html: str) -> bool:
-    return bool(HOMEOPATHY_PAT.search(html or ""))
-
-# ============================================================
-# RCP HTML fetch + CPD extraction (STOP at 'Statut de l'autorisation')
-# ============================================================
-
-def fetch_rcp_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
+def fetch_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
     if not url or not url.startswith("http"):
-        raise RuntimeError(f"RCP invalide: {url}")
+        raise RuntimeError(f"URL invalide: {url}")
 
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -404,83 +392,94 @@ def fetch_rcp_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
             last_err = e
             time.sleep(1.0 * attempt)
 
-    raise RuntimeError(f"RCP inaccessible: {url}. Détail: {last_err}")
+    raise RuntimeError(f"Page inaccessible: {url}. Détail: {last_err}")
 
-def extract_cpd_from_rcp_html(html: str) -> str:
-    """
-    Extrait uniquement le bloc sous "Conditions de prescription et de délivrance"
-    et s'arrête dès qu'on voit "Statut de l'autorisation" (et autres champs info).
-    """
-    soup = BeautifulSoup(html, _bs_parser())
-    text = soup.get_text("\n", strip=True)
+def extract_badge_usage_hospitalier(soup: BeautifulSoup) -> bool:
+    for el in soup.find_all(["span", "div", "a", "p", "li"]):
+        t = (el.get_text(" ", strip=True) or "")
+        if len(t) > 40:
+            continue
+        if BADGE_USAGE_HOSP_PAT.search(t):
+            return True
+    return False
 
-    title_pat = re.compile(r"CONDITIONS\s+DE\s+PRESCRIPTION\s+ET\s+DE\s+D[ÉE]LIVRANCE", re.IGNORECASE)
+def extract_autres_infos_cpd_block(soup: BeautifulSoup) -> str:
+    page_text_lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n")]
 
+    autres_pat = re.compile(r"^Autres\s+informations$", re.IGNORECASE)
+    cpd_pat = re.compile(r"^Conditions\s+de\s+prescription\s+et\s+de\s+d[ée]livrance\s*:?$", re.IGNORECASE)
     stop_pat = re.compile(
         r"^(Statut\s+de\s+l['’]autorisation|Type\s+de\s+proc[ée]dure|Code\s+CIS|Titulaire\s+de\s+l['’]autorisation)\s*:",
         re.IGNORECASE
     )
 
-    lines = [ln.strip() for ln in text.split("\n")]
-
-    start_idx = None
-    for i, ln in enumerate(lines):
-        if title_pat.search(ln):
-            start_idx = i
+    start_autres = None
+    for i, ln in enumerate(page_text_lines):
+        if autres_pat.match(ln):
+            start_autres = i
             break
-    if start_idx is None:
+    if start_autres is None:
         return ""
 
-    collected: List[str] = []
-    for ln in lines[start_idx + 1:]:
+    start_cpd = None
+    for i in range(start_autres, len(page_text_lines)):
+        if cpd_pat.match(page_text_lines[i]):
+            start_cpd = i
+            break
+    if start_cpd is None:
+        return ""
+
+    collected = []
+    for ln in page_text_lines[start_cpd + 1:]:
         if stop_pat.search(ln):
             break
-        if not ln:
-            collected.append("")
-            continue
         collected.append(ln)
 
-    bloc = "\n".join(collected)
+    bloc = "\n".join(collected).strip()
     bloc = normalize_ws_keep_lines(bloc)
-
-    if len(bloc) < 3:
-        return ""
-    if len(bloc) > 6000:
-        bloc = bloc[:6000].rstrip() + "…"
+    bloc = clean_cpd_text_keep_useful(bloc)
     return bloc
 
-# ============================================================
-# DISPONIBILITE RULES (FIX: do not over-class hospital)
-# ============================================================
-
-def compute_disponibilite(
-    has_taux_ville: bool,
-    is_ansm_retro: bool,
-    is_homeopathy: bool,
-    reserved_hospital: bool,
-    usage_hospital_weak: bool,
-) -> str:
+def extract_atc_code_from_page(soup: BeautifulSoup) -> str:
     """
-    Ville si (taux OR homéopathie).
-    Hospital:
-      - si 'réservé à l'usage hospitalier' (strict) => réservé
-      - sinon si juste 'usage hospitalier' (faible) => réservé SEULEMENT si pas ville
+    Extrait le Code ATC si présent (ex: "code ATC : N02AX02").
+    On prend le 1er match.
     """
-    ville = bool(has_taux_ville or is_homeopathy)
+    text = soup.get_text("\n", strip=True)
+    m = ATC_PAT.search(text or "")
+    if not m:
+        return ""
+    return m.group(0).strip()
 
-    if is_ansm_retro and ville:
-        return "Disponible en ville et en rétrocession hospitalière"
-    if is_ansm_retro and not ville:
-        return "Disponible en rétrocession hospitalière"
+def analyze_rcp_page(rcp_url: str) -> Tuple[str, bool, bool, bool, str]:
+    """
+    Retourne:
+    - cpd_text (nettoyé, sans "Aller au glossaire")
+    - is_homeopathy
+    - reserved_hospital (strict, seulement dans CPD)
+    - usage_hospital (badge ou CPD)
+    - atc_code
+    """
+    html = fetch_html(rcp_url)
+    soup = BeautifulSoup(html, _bs_parser())
 
-    if reserved_hospital:
-        return "Réservé à l'usage hospitalier"
-    if usage_hospital_weak and not ville:
-        return "Réservé à l'usage hospitalier"
+    full_text = soup.get_text("\n", strip=True)
+    is_homeo = bool(HOMEOPATHY_PAT.search(full_text or ""))
 
-    if ville:
-        return "Disponible en pharmacie de ville"
-    return "Pas d'informations mentionnées"
+    badge_usage = extract_badge_usage_hospitalier(soup)
+    cpd_text = extract_autres_infos_cpd_block(soup)
+
+    zone_text = (cpd_text or "")
+    if NEGATION_PAT.search(zone_text):
+        reserved = False
+        usage = False
+    else:
+        reserved = bool(RESERVED_HOSP_PAT.search(zone_text))
+        usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
+
+    atc_code = extract_atc_code_from_page(soup)
+
+    return cpd_text, is_homeo, reserved, usage, atc_code
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -575,10 +574,6 @@ def main():
     cis_cip_txt = download_text(BDPM_CIS_CIP_URL, encoding="latin-1")
     ok(f"BDPM CIS_CIP OK ({len(cis_cip_txt)} chars)")
 
-    info("Téléchargement BDPM CIS_CPD ...")
-    cis_cpd_txt = download_text(BDPM_CIS_CPD_URL, encoding="latin-1")
-    ok(f"BDPM CIS_CPD OK ({len(cis_cpd_txt)} chars)")
-
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
     ok(f"Lien ANSM trouvé: {ansm_link}")
@@ -587,14 +582,9 @@ def main():
     ansm_bytes = download_bytes(ansm_link)
     ok(f"ANSM Excel OK ({len(ansm_bytes)} bytes)")
 
-    info("Parsing BDPM ...")
     cis_map = parse_bdpm_cis(cis_txt)
     cip_map = parse_bdpm_cis_cip(cis_cip_txt)
-    hosp_hints = parse_bdpm_cis_cpd_hints(cis_cpd_txt)  # (reserved_strict, usage_weak)
     ansm_retro_cis = parse_ansm_retrocession_cis(ansm_bytes, url_hint=ansm_link)
-
-    ok(f"CIS BDPM: {len(cis_map)}")
-    ok(f"CIS ANSM rétrocession: {len(ansm_retro_cis)}")
 
     at = AirtableClient(api_token, base_id, table_name)
 
@@ -609,6 +599,7 @@ def main():
         "Spécialité",
         "Forme",
         "Voie d'administration",
+        "Code ATC",
     ]
 
     info("Inventaire Airtable ...")
@@ -630,7 +621,7 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
-    # CREATE
+    # CREATE missing
     if to_create:
         info("Création des enregistrements manquants ...")
         new_recs = []
@@ -651,7 +642,6 @@ def main():
                 fields["CIP 13"] = cip.cip13
             if cip and cip.agrement_collectivites:
                 fields["Agrément aux collectivités"] = cip.agrement_collectivites
-
             new_recs.append({"fields": fields})
 
         at.create_records(new_recs)
@@ -673,7 +663,6 @@ def main():
         if ids:
             at.delete_records(ids)
             ok(f"Supprimés: {len(ids)}")
-
         # refresh
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
@@ -689,7 +678,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (CPD arrêt à 'Statut de l'autorisation' + dispo corrigée) ...")
+    info("Enrichissement (CPD sans glossaire + ATC + dispo + CIP) ...")
 
     updates = []
     failures_rcp = 0
@@ -726,35 +715,29 @@ def main():
 
         cur_cpd = str(fields_cur.get("Conditions de prescription et délivrance", "")).strip()
         cur_dispo = str(fields_cur.get("Disponibilité du traitement", "")).strip()
-        need_rcp = force_refresh or (not cur_cpd) or (not cur_dispo) or (cur_dispo == "Pas d'informations mentionnées")
+        cur_atc = str(fields_cur.get("Code ATC", "")).strip()
 
-        reserved_file, usage_file = hosp_hints.get(cis, (False, False))
+        need_rcp = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
+
         is_retro = cis in ansm_retro_cis
 
         if need_rcp:
             try:
-                html = fetch_rcp_html(rcp_url)
+                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_rcp_page(rcp_url)
 
-                # CPD: stop at "Statut de l'autorisation"
-                cpd_text = extract_cpd_from_rcp_html(html)
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields["Conditions de prescription et délivrance"] = cpd_text
 
-                # Homeopathy: homéopathie/homeopathie/homéopathique/homeopathique
-                is_homeo = rcp_mentions_homeopathy(html)
-
-                # Hospital flags from RCP (handle negations)
-                reserved_rcp, usage_rcp = hospital_flag_from_text(html)
-                reserved = reserved_file or reserved_rcp
-                usage_weak = usage_file or usage_rcp
+                if atc_code and atc_code != cur_atc:
+                    upd_fields["Code ATC"] = atc_code
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
                     has_taux_ville=has_taux,
                     is_ansm_retro=is_retro,
                     is_homeopathy=is_homeo,
-                    reserved_hospital=reserved,
-                    usage_hospital_weak=usage_weak,
+                    reserved_hospital=reserved_hosp,
+                    usage_hospital=usage_hosp,
                 )
 
                 if dispo != cur_dispo:
@@ -764,14 +747,14 @@ def main():
                 failures_rcp += 1
                 warn(f"RCP KO CIS={cis}: {e} (on continue)")
         else:
-            # Sans fetch: prudence, on n'utilise que l'indice fichier
             has_taux = cip.has_taux if cip else False
+            # sans fetch, on reste conservateur (on ne déduit pas réservé hosp)
             dispo = compute_disponibilite(
                 has_taux_ville=has_taux,
                 is_ansm_retro=is_retro,
                 is_homeopathy=False,
-                reserved_hospital=reserved_file,
-                usage_hospital_weak=usage_file,
+                reserved_hospital=False,
+                usage_hospital=False,
             )
             if dispo != cur_dispo:
                 upd_fields["Disponibilité du traitement"] = dispo
