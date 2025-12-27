@@ -241,27 +241,33 @@ def parse_ansm_retro_cis(xls_url: str) -> Set[str]:
 # ---------------------------
 def normalize_rcp_url(url: str) -> str:
     """
-    Convertit:
-      .../extrait#tab-rcp  -> .../extrait?tab=rcp
-      .../extrait#tab-rcp -> .../extrait?tab=rcp
+    Transforme:
+      https://.../extrait#tab-rcp
+    en:
+      https://.../extrait?tab=rcp
     """
     if not url:
         return url
+
     u = url.strip()
-    # si ancre tab-rcp
-    u = re.sub(r"#tab-rcp.*$", "", u)
+
+    # supprime ancre
+    u = re.sub(r"#.*$", "", u)
+
+    # force tab=rcp
     if "extrait" in u and "tab=rcp" not in u:
         if "?" in u:
-            u = u + "&tab=rcp"
+            u += "&tab=rcp"
         else:
-            u = u + "?tab=rcp"
+            u += "?tab=rcp"
     return u
 
-def fetch_rcp_html(url: str) -> str:
-    r = SESSION.get(url, timeout=90)
-    if r.status_code >= 400:
-        raise RuntimeError(f"RCP HTTP {r.status_code}")
-    return r.text
+
+def fetch_rcp_and_extract_cpd(rcp_url: str) -> str:
+    url = normalize_rcp_url(rcp_url)
+    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return extract_cpd_from_rcp_html(r.text)
 
 def strip_accents_lower(s: str) -> str:
     s = s.lower()
@@ -277,49 +283,54 @@ def strip_accents_lower(s: str) -> str:
          .replace("ç", "c")
     )
 
-def extract_cpd_from_rcp(html: str) -> str:
-    """
-    Extraction robuste "par lignes" à partir du texte rendu.
-    On récupère tout ce qui suit le titre CPD jusqu'à un stop.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = [re.sub(r"\s+", " ", l).strip() for l in text.split("\n") if l.strip()]
 
-    # repère la ligne titre
+def extract_cpd_from_rcp_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Texte rendu, ligne par ligne
+    raw = soup.get_text("\n", strip=True)
+    lines = [re.sub(r"\s+", " ", l).strip() for l in raw.split("\n") if l.strip()]
+
+    # Trouver le titre "CONDITIONS DE PRESCRIPTION ET DE DELIVRANCE"
     idx = -1
     for i, l in enumerate(lines):
-        if strip_accents_lower(l) == "conditions de prescription et de delivrance":
+        ll = strip_accents_lower(l)
+        if ll == "conditions de prescription et de delivrance":
             idx = i
             break
-        # parfois sans "de"
-        if "conditions de prescription" in strip_accents_lower(l) and "delivrance" in strip_accents_lower(l):
+        if "conditions de prescription" in ll and "delivrance" in ll:
             idx = i
             break
 
     if idx == -1:
         return ""
 
-    # collecte après le titre
     out = []
-    for l in lines[idx + 1 :]:
+    for l in lines[idx + 1:]:
         ll = strip_accents_lower(l)
-        # stops fréquents en bas de page
+
+        # Stops: footer + navigation
         if ll in ("haut de page",):
             break
         if "ministere du travail" in ll or "ministere de la sante" in ll:
             break
         if ll.startswith("legifrance") or ll.startswith("gouvernement") or ll.startswith("service-public"):
             break
-        # si on retombe sur un gros titre numéroté (10., 11., 12., etc.) on peut stopper
+
+        # Stops: retour à un gros titre numéroté type "10. DATE..." / "11. DOSIMETRIE"
         if re.match(r"^\d+\.\s", l):
             break
+
+        # Stops: certains pages ont des titres en MAJUSCULES pour sections
+        # (on garde "Liste I." etc, mais si on voit un gros titre très long en caps, on stop)
+        if len(l) > 8 and l == l.upper() and "CONDITIONS DE PRESCRIPTION" not in l:
+            break
+
         out.append(l)
 
-    cpd = "\n".join(out).strip()
-    # nettoyage sauts de ligne
-    cpd = re.sub(r"\n{3,}", "\n\n", cpd).strip()
-    return cpd
+    text = "\n".join(out).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
 
 def is_homeopathy(html: str) -> bool:
     t = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
