@@ -31,25 +31,23 @@ HEADERS_WEB = {
 }
 
 # Airtable
-AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))  # throttle global (≈4 req/s)
-AIRTABLE_BATCH_SIZE = 10                                                # limite Airtable / request
+AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))
+AIRTABLE_BATCH_SIZE = 10
 
-# Flush logique (tu peux mettre 1000 via env UPDATE_FLUSH_THRESHOLD)
 UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
 
-# Timeouts requests (connect, read)
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
 HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "20"))
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 4
 
-# Rapport suppression (workspace du repo)
 REPORT_DIR = os.getenv("REPORT_DIR", "reports")
 REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
-# Heartbeat
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
+
+ATC_LABELS_FILE = os.getenv("ATC_LABELS_FILE", "data/atc_labels.tsv")
 
 # ============================================================
 # LOG
@@ -93,10 +91,6 @@ def append_deleted_report(cis: str, reason: str, url: str):
         f.write(line)
 
 def try_git_commit_report():
-    """
-    Optionnel: commit/push automatique.
-    Nécessite que le workflow ait les permissions et un checkout du repo.
-    """
     if not REPORT_COMMIT:
         return
     try:
@@ -169,7 +163,59 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# URL HELPERS: FORCE FICHE-INFO
+# ATC LABELS (niveau 4)
+# ============================================================
+
+ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
+ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
+
+def load_atc_labels(path: str) -> Dict[str, str]:
+    if not os.path.exists(path):
+        warn(f"Fichier ATC introuvable: {path} (Libellé ATC restera vide)")
+        return {}
+    mapping: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.strip("\n").strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                parts = re.split(r"\s{2,}", line)
+                if len(parts) < 2:
+                    continue
+            code = safe_text(parts[0]).upper()
+            label = safe_text("\t".join(parts[1:]))
+            if not code:
+                continue
+            if code not in mapping and label:
+                mapping[code] = label
+    ok(f"ATC labels chargés: {len(mapping)} entrées")
+    return mapping
+
+def atc_level4_from_any(atc: str) -> str:
+    """
+    Retourne le code ATC niveau 4 (5 caractères) même si ATC est niveau 5 (7 caractères).
+    - A11CA01 -> A11CA
+    - A11CA   -> A11CA
+    Sinon -> ""
+    """
+    a = (atc or "").strip().upper()
+    if ATC7_PAT.fullmatch(a):
+        return a[:5]
+    if ATC5_PAT.fullmatch(a):
+        return a
+    # parfois bruit, on tente d'extraire un motif 7 puis 5
+    m7 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", a)
+    if m7:
+        return m7.group(1)[:5]
+    m5 = re.search(r"\b([A-Z]\d{2}[A-Z]{2})\b", a)
+    if m5:
+        return m5.group(1)
+    return ""
+
+# ============================================================
+# URL HELPERS
 # ============================================================
 
 def base_extrait_url_from_cis(cis: str) -> str:
@@ -405,7 +451,6 @@ NEGATION_PAT = re.compile(
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
 
-# Classe pharmacothérapeutique (ligne fiche-info)
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
 CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", re.IGNORECASE)
 
@@ -512,14 +557,6 @@ def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     return m2.group(0).strip() if m2 else ""
 
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
-    """
-    Extrait la ligne "Classe pharmacothérapeutique ..." dans fiche-info.
-    Exemples observés :
-      - "Classe pharmacothérapeutique : XXX – code ATC : L01BA01."
-      - "Classe pharmacothérapeutique - code ATC : N02AX02"
-      - "Classe pharmacothérapeutique : Médicament homéopathique"
-    Retourne (classe_pharm, atc_code_si_trouvé)
-    """
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
     for ln in lines:
         if not PHARM_CLASS_LINE_PAT.search(ln):
@@ -530,14 +567,10 @@ def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[st
         if m_atc:
             atc = m_atc.group(1).strip()
 
-        # Nettoyage : retirer "Classe pharmacothérapeutique" + séparateurs
         s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
         s = s.lstrip(":").strip()
-
-        # Si format "... - code ATC : XXX", on retire cette partie
         s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
 
-        # Si encore "code ATC ..." seul, c'est qu'il n'y a pas de libellé
         if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?", s, flags=re.IGNORECASE):
             s = ""
 
@@ -550,10 +583,6 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
 def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]:
-    """
-    Retour:
-      cpd_text, is_homeo, reserved, usage, atc_code, pharm_class
-    """
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -562,11 +591,8 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]
     cpd_text = extract_cpd_from_fiche_info(soup)
     cpd_text = capitalize_each_line(cpd_text)
 
-    # 🔹 Classe pharmacothérapeutique + ATC (prioritaire)
     pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
-
-    # 🔹 ATC fallback
-    atc_code = atc_from_class_line.strip() or extract_atc_from_fiche_info(soup)
+    atc_code = (atc_from_class_line.strip() or extract_atc_from_fiche_info(soup)).strip()
 
     badge_usage = extract_badge_usage_hospitalier_only(soup)
 
@@ -689,6 +715,8 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
+    atc_labels = load_atc_labels(ATC_LABELS_FILE)
+
     info("Téléchargement BDPM CIS ...")
     cis_txt = download_text(BDPM_CIS_URL, encoding="latin-1")
     ok(f"BDPM CIS OK ({len(cis_txt)} chars)")
@@ -722,7 +750,9 @@ def main():
         "Forme",
         "Voie d'administration",
         "Code ATC",
-        "Classe pharmacothérapeutique",  # ✅ NEW
+        "Code ATC (niveau 4)",   # ✅ NEW
+        "Libellé ATC",           # ✅ NEW
+        "Classe pharmacothérapeutique",
     ]
 
     info("Inventaire Airtable ...")
@@ -841,9 +871,11 @@ def main():
         cur_cpd = str(fields_cur.get("Conditions de prescription et délivrance", "")).strip()
         cur_dispo = str(fields_cur.get("Disponibilité du traitement", "")).strip()
         cur_atc = str(fields_cur.get("Code ATC", "")).strip()
+        cur_atc4 = str(fields_cur.get("Code ATC (niveau 4)", "")).strip()
+        cur_label = str(fields_cur.get("Libellé ATC", "")).strip()
         cur_class = str(fields_cur.get("Classe pharmacothérapeutique", "")).strip()
 
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_class)
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_atc4) or (not cur_label) or (not cur_class)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
@@ -853,13 +885,25 @@ def main():
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields["Conditions de prescription et délivrance"] = cpd_text
 
+                # garde le code ATC tel quel (souvent niveau 5)
                 if atc_code and atc_code != cur_atc:
                     upd_fields["Code ATC"] = atc_code
 
+                # ✅ calcule niveau 4 quoi qu'il arrive
+                atc4 = atc_level4_from_any(atc_code)
+                if atc4 and atc4 != cur_atc4:
+                    upd_fields["Code ATC (niveau 4)"] = atc4
+
+                # ✅ libellé basé UNIQUEMENT sur le niveau 4
+                if atc4 and atc4 in atc_labels:
+                    label = atc_labels[atc4]
+                    if label and label != cur_label:
+                        upd_fields["Libellé ATC"] = label
+
                 if pharm_class:
-                    pharm_class_clean = safe_text(pharm_class)
-                    if pharm_class_clean and pharm_class_clean != cur_class:
-                        upd_fields["Classe pharmacothérapeutique"] = pharm_class_clean
+                    pc = safe_text(pharm_class)
+                    if pc and pc != cur_class:
+                        upd_fields["Classe pharmacothérapeutique"] = pc
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
@@ -869,7 +913,6 @@ def main():
                     reserved_hospital=reserved_hosp,
                     usage_hospital=usage_hosp,
                 )
-
                 if dispo != cur_dispo:
                     upd_fields["Disponibilité du traitement"] = dispo
 
@@ -913,7 +956,6 @@ def main():
         ok(f"Updates finaux: {len(updates)}")
 
     try_git_commit_report()
-
     ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapport: {report_path_today()}")
 
 if __name__ == "__main__":
