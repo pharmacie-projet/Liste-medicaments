@@ -124,51 +124,25 @@ def find_ansm_excel_link(session: requests.Session) -> str:
     print(f"✅ Lien ANSM trouvé : {href}")
     return href
 
-def parse_ansm_retrocession_excel(path: str) -> Set[str]:
-    """
-    Règle: 3ème colonne = Code CIS.
-    Supporte .xls (pandas+xlrd==1.2.0) et .xlsx (openpyxl).
-    """
-    cis_set: Set[str] = set()
-    lower = path.lower()
+def parse_ansm_retrocession_excel(path: str) -> set:
+    import xlrd
 
-    def add_cis(val):
-        if val is None:
-            return
-        s = str(val).strip()
-        s = s.replace(".0", "")
-        if s.isdigit():
-            cis_set.add(s)
+    cis_set = set()
+    book = xlrd.open_workbook(path)
 
-    if lower.endswith(".xlsx"):
-        from openpyxl import load_workbook
-        wb = load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(values_only=True):
-            if not row or len(row) < 3:
+    for sheet in book.sheets():
+        for r in range(sheet.nrows):
+            if sheet.ncols < 3:
                 continue
-            add_cis(row[2])
-        return cis_set
-
-    # .xls (ou extension trompeuse)
-    import pandas as pd
-    try:
-        xls = pd.ExcelFile(path, engine="xlrd")
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet, header=None)
-            if df.shape[1] < 3:
+            v = sheet.cell_value(r, 2)
+            if v is None:
                 continue
-            col = df.iloc[:, 2]
-            for v in col.tolist():
-                add_cis(v)
-        return cis_set
-    except Exception:
-        # dernier recours : tentative generic
-        df = pd.read_excel(path, header=None)
-        if df.shape[1] >= 3:
-            for v in df.iloc[:, 2].tolist():
-                add_cis(v)
-        return cis_set
+            cis = str(v).strip().replace(".0", "")
+            if cis.isdigit():
+                cis_set.add(cis)
+
+    return cis_set
+
 
 def safe_strip(s: str) -> str:
     return (s or "").strip()
