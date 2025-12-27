@@ -142,6 +142,25 @@ def normalize_ws_keep_lines(s: str) -> str:
             out.append(line)
     return "\n".join(out).strip()
 
+def capitalize_each_line(text: str) -> str:
+    """
+    Met une majuscule à la première lettre de chaque ligne non vide
+    (en conservant d'éventuelles indentations).
+    """
+    if not text:
+        return text
+    out_lines: List[str] = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped:
+            prefix_len = len(line) - len(stripped)
+            prefix = line[:prefix_len]
+            stripped = stripped[0].upper() + stripped[1:]
+            out_lines.append(prefix + stripped)
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
 def chunked(lst: List, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
@@ -509,7 +528,10 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     soup = BeautifulSoup(html, _bs_parser())
 
     is_homeo = detect_homeopathy_from_fiche_info(soup)
+
     cpd_text = extract_cpd_from_fiche_info(soup)
+    cpd_text = capitalize_each_line(cpd_text)  # ✅ majuscule à chaque ligne
+
     atc_code = extract_atc_from_fiche_info(soup)
     badge_usage = extract_badge_usage_hospitalier_only(soup)
 
@@ -523,12 +545,18 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
 
     return cpd_text, is_homeo, reserved, usage, atc_code
 
-def compute_disponibilite(has_taux_ville: bool, is_ansm_retro: bool, is_homeo: bool,
-                          reserved_hospital: bool, usage_hospital: bool) -> str:
+def compute_disponibilite(
+    has_taux_ville: bool,
+    is_ansm_retro: bool,
+    is_homeo: bool,
+    reserved_hospital: bool,
+    usage_hospital: bool
+) -> str:
     ville = bool(has_taux_ville or is_homeo)
 
+    # ✅ libellé modifié
     if is_ansm_retro and ville:
-        return "Disponible en ville et en rétrocession hospitalière"
+        return "Disponible en pharmacie de ville et en rétrocession hospitalière"
     if is_ansm_retro and not ville:
         return "Disponible en rétrocession hospitalière"
 
@@ -540,7 +568,8 @@ def compute_disponibilite(has_taux_ville: bool, is_ansm_retro: bool, is_homeo: b
     if ville:
         return "Disponible en pharmacie de ville"
 
-    return "Pas d'informations mentionnées"
+    # ✅ libellé modifié
+    return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -806,6 +835,10 @@ def main():
                     reserved_hospital=reserved_hosp,
                     usage_hospital=usage_hosp,
                 )
+
+                # ✅ au cas où (phrase unique, mais on garde la cohérence)
+                dispo = capitalize_each_line(dispo)
+
                 if dispo != cur_dispo:
                     upd_fields["Disponibilité du traitement"] = dispo
 
