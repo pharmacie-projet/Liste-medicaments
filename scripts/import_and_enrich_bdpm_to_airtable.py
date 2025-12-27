@@ -330,7 +330,6 @@ def parse_bdpm_cis(txt: str) -> Dict[str, CisRow]:
 class CipInfo:
     cip13: str
     has_taux: bool
-    agrement_collectivites: str
 
 def looks_like_taux(val: str) -> bool:
     v = (val or "").strip()
@@ -346,6 +345,11 @@ def looks_like_taux(val: str) -> bool:
     return x in {0, 15, 30, 35, 65, 100}
 
 def parse_bdpm_cis_cip(txt: str) -> Dict[str, CipInfo]:
+    """
+    Parse CIS_CIP_bdpm.txt pour extraire :
+    - CIP 13 (premier 13 chiffres trouvé sur la ligne)
+    - has_taux (détection d'un taux de remboursement typique)
+    """
     out: Dict[str, CipInfo] = {}
     for line in txt.splitlines():
         if not line.strip():
@@ -366,19 +370,12 @@ def parse_bdpm_cis_cip(txt: str) -> Dict[str, CipInfo]:
 
         has_taux = any(looks_like_taux(p) for p in parts)
 
-        agrement = ""
-        joined = " ".join(parts).lower()
-        if "collectiv" in joined or "agrément" in joined or "agrement" in joined:
-            agrement = "Oui"
-
         if cis not in out:
-            out[cis] = CipInfo(cip13=cip13, has_taux=has_taux, agrement_collectivites=agrement)
+            out[cis] = CipInfo(cip13=cip13, has_taux=has_taux)
         else:
             if not out[cis].cip13 and cip13:
                 out[cis].cip13 = cip13
             out[cis].has_taux = out[cis].has_taux or has_taux
-            if not out[cis].agrement_collectivites and agrement:
-                out[cis].agrement_collectivites = agrement
 
     return out
 
@@ -682,7 +679,6 @@ def main():
         "Code cis",
         "Lien vers RCP",
         "CIP 13",
-        "Agrément aux collectivités",
         "Disponibilité du traitement",
         "Conditions de prescription et délivrance",
         "Laboratoire",
@@ -729,8 +725,6 @@ def main():
             }
             if cip and cip.cip13:
                 fields["CIP 13"] = cip.cip13
-            if cip and cip.agrement_collectivites:
-                fields["Agrément aux collectivités"] = cip.agrement_collectivites
             new_recs.append({"fields": fields})
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
@@ -800,8 +794,6 @@ def main():
         if cip:
             if cip.cip13 and str(fields_cur.get("CIP 13", "")).strip() != cip.cip13:
                 upd_fields["CIP 13"] = cip.cip13
-            if cip.agrement_collectivites and str(fields_cur.get("Agrément aux collectivités", "")).strip() != cip.agrement_collectivites:
-                upd_fields["Agrément aux collectivités"] = cip.agrement_collectivites
 
         link_rcp = str(fields_cur.get("Lien vers RCP", "")).strip()
         if not link_rcp:
