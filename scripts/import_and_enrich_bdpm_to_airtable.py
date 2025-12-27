@@ -7,6 +7,7 @@ import time
 import json
 import random
 import urllib.parse
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -29,15 +30,16 @@ HEADERS_WEB = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 
-# Airtable
-AIRTABLE_MIN_DELAY_S = 0.25          # throttle global (≈4 req/s)
-AIRTABLE_BATCH_SIZE = 10             # limite Airtable / request
-
-# Flush logique (dans le script) : on envoie les updates par paquets de 1000 records
+AIRTABLE_MIN_DELAY_S = 0.25
+AIRTABLE_BATCH_SIZE = 10
 UPDATE_FLUSH_THRESHOLD = 1000
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 4
+
+# Rapport suppression (workspace du repo)
+REPORT_DIR = os.getenv("REPORT_DIR", "reports")
+REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 # ============================================================
 # LOG
@@ -64,6 +66,40 @@ def sleep_throttle():
 
 def retry_sleep(attempt: int):
     time.sleep(min(8, 0.6 * (2 ** (attempt - 1))) + random.random() * 0.2)
+
+# ============================================================
+# REPORTING (GitHub workspace)
+# ============================================================
+
+def report_path_today() -> str:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    fname = f"deleted_records_{time.strftime('%Y-%m-%d')}.txt"
+    return os.path.join(REPORT_DIR, fname)
+
+def append_deleted_report(cis: str, reason: str, url: str):
+    p = report_path_today()
+    line = f"{_ts()}\tCIS={cis}\tSUPPRIME\treason={reason}\turl={url}\n"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(line)
+
+def try_git_commit_report():
+    """
+    Optionnel: commit/push automatique.
+    Nécessite que le workflow ait les permissions et un checkout du repo.
+    """
+    if not REPORT_COMMIT:
+        return
+    try:
+        p = report_path_today()
+        if not os.path.exists(p):
+            return
+        subprocess.run(["git", "status"], check=False)
+        subprocess.run(["git", "add", p], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: deleted Airtable records ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "push"], check=True)
+        ok("Rapport commit/push sur GitHub effectué.")
+    except Exception as e:
+        warn(f"Commit/push du rapport impossible (on continue): {e}")
 
 # ============================================================
 # TEXT UTIL
@@ -156,7 +192,7 @@ def download_bytes(url: str) -> bytes:
     return r.content
 
 # ============================================================
-# ANSM retrocession (unchanged)
+# ANSM retrocession
 # ============================================================
 
 def find_ansm_retro_excel_link() -> str:
@@ -336,7 +372,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# RULES / SCRAPING (fiche-info)
+# FICHE-INFO SCRAPING
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -352,6 +388,13 @@ NEGATION_PAT = re.compile(
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
 
+class PageUnavailable(Exception):
+    def __init__(self, url: str, status: Optional[int], detail: str):
+        super().__init__(detail)
+        self.url = url
+        self.status = status
+        self.detail = detail
+
 def clean_cpd_text_keep_useful(text: str) -> str:
     if not text:
         return ""
@@ -366,20 +409,24 @@ def clean_cpd_text_keep_useful(text: str) -> str:
         kept.append(ln)
     return normalize_ws_keep_lines("\n".join(kept))
 
-def fetch_html(url: str, timeout: int = 20, max_retries: int = 3) -> str:
+def fetch_html_checked(url: str, timeout: int = 20, max_retries: int = 3) -> str:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, headers=HEADERS_WEB, timeout=timeout)
+            if r.status_code == 404:
+                raise PageUnavailable(url, 404, f"HTTP 404")
             if r.status_code >= 400:
-                raise RuntimeError(f"HTTP {r.status_code}")
+                raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
             if not r.text or len(r.text) < 200:
-                raise RuntimeError("HTML vide/trop court")
+                raise PageUnavailable(url, r.status_code, "HTML vide/trop court")
             return r.text
+        except PageUnavailable:
+            raise
         except Exception as e:
             last_err = e
             time.sleep(1.0 * attempt)
-    raise RuntimeError(f"Page inaccessible: {url}. Détail: {last_err}")
+    raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
 
 def extract_badge_usage_hospitalier_only(soup: BeautifulSoup) -> bool:
     for el in soup.find_all(["span", "div", "a", "p", "li"]):
@@ -433,8 +480,7 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
             break
         collected.append(ln)
 
-    bloc = clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
-    return bloc
+    return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
 def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     text = soup.get_text("\n", strip=True)
@@ -449,7 +495,7 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
 def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
-    html = fetch_html(fiche_url)
+    html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
     is_homeo = detect_homeopathy_from_fiche_info(soup)
@@ -626,6 +672,7 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
+    # (Create/delete init comme avant si tu veux le garder)
     if to_create:
         info("Création des enregistrements manquants ...")
         new_recs = []
@@ -633,7 +680,6 @@ def main():
             row = cis_map[cis]
             cip = cip_map.get(cis)
             labo = normalize_lab_name(row.titulaire)
-
             fields = {
                 "Code cis": cis,
                 "Spécialité": safe_text(row.specialite),
@@ -647,7 +693,6 @@ def main():
             if cip and cip.agrement_collectivites:
                 fields["Agrément aux collectivités"] = cip.agrement_collectivites
             new_recs.append({"fields": fields})
-
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
 
@@ -665,7 +710,6 @@ def main():
         if ids:
             at.delete_records(ids)
             ok(f"Supprimés: {len(ids)}")
-
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
@@ -674,18 +718,24 @@ def main():
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
 
+    # ENRICH
     all_cis = sorted(list(set(cis_map.keys()) & set(airtable_by_cis.keys())))
     if max_cis > 0:
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
     info("Enrichissement (fiche-info) ...")
+
     updates = []
     failures = 0
+    deleted_count = 0
     start = time.time()
 
     for idx, cis in enumerate(all_cis, start=1):
-        rec = airtable_by_cis[cis]
+        rec = airtable_by_cis.get(cis)
+        if not rec:
+            continue
+
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
@@ -720,7 +770,6 @@ def main():
         cur_atc = str(fields_cur.get("Code ATC", "")).strip()
 
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
-
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
@@ -744,6 +793,26 @@ def main():
                 if dispo != cur_dispo:
                     upd_fields["Disponibilité du traitement"] = dispo
 
+            except PageUnavailable as e:
+                # ✅ NOUVEAU: si fiche-info/RCP introuvable -> on SUPPRIME la ligne Airtable
+                warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
+                # flush updates avant delete pour éviter mélange
+                if updates:
+                    at.update_records(updates)
+                    ok(f"Batch updates (flush before delete): {len(updates)}")
+                    updates = []
+
+                try:
+                    at.delete_records([rec["id"]])
+                    deleted_count += 1
+                    append_deleted_report(cis=cis, reason=f"Page indisponible ({e.status})", url=e.url)
+                except Exception as de:
+                    failures += 1
+                    warn(f"Suppression Airtable impossible CIS={cis}: {de} (on continue)")
+
+                # continuer au suivant
+                continue
+
             except Exception as e:
                 failures += 1
                 warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
@@ -760,13 +829,16 @@ def main():
             elapsed = time.time() - start
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
-            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | reste ~{int(remaining)}s")
+            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | reste ~{int(remaining)}s")
 
     if updates:
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
-    ok(f"Terminé. échecs: {failures}")
+    # Commit/push du rapport si demandé
+    try_git_commit_report()
+
+    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapport: {report_path_today()}")
 
 if __name__ == "__main__":
     main()
