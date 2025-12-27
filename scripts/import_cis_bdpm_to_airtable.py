@@ -2,7 +2,7 @@ import os
 import re
 import time
 import json
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -28,7 +28,6 @@ CIS_CIP_URL = os.getenv(
     "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 ).strip()
 
-# Optional but recommended (explicit CPD signals)
 CIS_CPD_URL = os.getenv(
     "CIS_CPD_URL",
     "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CPD_bdpm.txt"
@@ -62,11 +61,15 @@ RCP_TIMEOUT = int(os.getenv("RCP_TIMEOUT", "45"))
 RCP_MAX_RETRIES = int(os.getenv("RCP_MAX_RETRIES", "4"))
 RCP_SLEEP = float(os.getenv("RCP_SLEEP", "0.40"))
 
+# Patterns
 HOSP_PATTERNS = [
     r"usage\s+hospitalier",
     r"r[ée]serv[ée]\s+[àa]\s+l[’']usage\s+hospitalier",
     r"m[ée]dicament\s+r[ée]serv[ée]\s+[àa]\s+l[’']usage\s+hospitalier",
 ]
+
+# New: homeopathy detection (homéopathi / homeopathi)
+HOMEOPATHY_PATTERN = r"hom[éee]opathi"
 
 
 # =========================================================
@@ -129,7 +132,7 @@ def compact_fields(fields: Dict) -> Dict:
 
 
 # =========================================================
-# ANSM retro (dynamic excel link on a page)
+# ANSM retro (dynamic excel link)
 # =========================================================
 def find_ansm_excel_url() -> str:
     r = requests.get(ANSM_RETRO_PAGE, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
@@ -145,7 +148,6 @@ def find_ansm_excel_url() -> str:
     if not candidates:
         raise RuntimeError("❌ Impossible de trouver un lien .xls/.xlsx sur la page ANSM.")
 
-    # take first xls/xlsx found (you can refine if needed)
     return urljoin(ANSM_RETRO_PAGE, candidates[0])
 
 
@@ -173,8 +175,7 @@ def load_retro_cis_set(xls_path: str) -> Set[str]:
 # =========================================================
 def build_reimbursed_cis_set_from_cis_cip(filepath: str) -> Set[str]:
     """
-    CIS_CIP_bdpm.txt contains reimbursement rates as percent strings (e.g. 65%, 30%, 100%). :contentReference[oaicite:1]{index=1}
-    We mark a CIS as "ville" if ANY line for that CIS contains a percent token.
+    Mark CIS as "ville" if we detect any percent token in its CIS_CIP lines.
     """
     txt = read_text_with_fallback(filepath)
     reimbursed: Set[str] = set()
@@ -186,18 +187,12 @@ def build_reimbursed_cis_set_from_cis_cip(filepath: str) -> Set[str]:
         if len(parts) < 2:
             continue
         cis = parts[0].strip()
-        if not cis:
-            continue
-        if pct_re.search(line):
+        if cis and pct_re.search(line):
             reimbursed.add(cis)
     return reimbursed
 
 
 def build_hospital_cis_set_from_cpd(filepath: str) -> Set[str]:
-    """
-    CIS_CPD_bdpm.txt: cis \t conditions
-    We flag a CIS if conditions contain "usage hospitalier" (or "réservé à l'usage hospitalier")
-    """
     txt = read_text_with_fallback(filepath)
     hosp: Set[str] = set()
     for line in txt.splitlines():
@@ -274,15 +269,16 @@ class AirtableClient:
 
 
 # =========================================================
-# RCP checker (STOP on inaccessible if requested)
+# RCP checker (returns BOTH flags: homeopathy & hospital)
 # =========================================================
 class RCPChecker:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
-        self.cache: Dict[str, bool] = {}
+        # cache url -> (has_homeopathy, has_hospital)
+        self.cache: Dict[str, Tuple[bool, bool]] = {}
 
-    def rcp_has_hospital_mention(self, url: str) -> bool:
+    def rcp_flags(self, url: str) -> Tuple[bool, bool]:
         if not url:
             raise RuntimeError("Lien RCP vide")
         base_url = url.split("#")[0]
@@ -296,10 +292,13 @@ class RCPChecker:
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.text, "lxml")
                 text = norm(soup.get_text(" ", strip=True))
-                found = any(re.search(p, text) for p in HOSP_PATTERNS)
-                self.cache[base_url] = found
+
+                has_homeo = bool(re.search(HOMEOPATHY_PATTERN, text))
+                has_hosp = any(re.search(p, text) for p in HOSP_PATTERNS)
+
+                self.cache[base_url] = (has_homeo, has_hosp)
                 time.sleep(RCP_SLEEP)
-                return found
+                return has_homeo, has_hosp
             except Exception as e:
                 last_err = e
                 time.sleep(min(15.0, (2 ** attempt) * 0.8))
@@ -308,7 +307,7 @@ class RCPChecker:
 
 
 # =========================================================
-# MAIN
+# DECISION LOGIC
 # =========================================================
 def decide_status(
     cis: str,
@@ -319,31 +318,38 @@ def decide_status(
     rcp_checker: RCPChecker,
 ) -> str:
     # 1) taux de remboursement => ville
-    status = LABEL_CITY if cis in reimbursed_set else LABEL_UNKNOWN
+    base_status = LABEL_CITY if cis in reimbursed_set else LABEL_UNKNOWN
 
     # 2) liste ANSM rétrocession => override
     if cis in retro_set:
         return LABEL_RETRO
 
-    # 3) pour tous les autres: usage hospitalier explicite dans CPD ou RCP
+    # 3) autres: vérifier homéopathie / usage hospitalier (CPD ou RCP)
+    # CPD (explicite)
     if cis in hosp_cpd_set:
         return LABEL_HOSP
 
-    # Only check RCP for the "others" (not reimbursed & not retro)
-    if cis not in reimbursed_set:
-        try:
-            if rcp_checker.rcp_has_hospital_mention(rcp_link):
-                return LABEL_HOSP
-        except Exception as e:
-            if STOP_ON_RCP_ERROR:
-                raise
-            # If not stopping, fallback to unknown
-            return LABEL_UNKNOWN
+    # RCP (si nécessaire)
+    try:
+        has_homeo, has_hosp = rcp_checker.rcp_flags(rcp_link)
+    except Exception:
+        if STOP_ON_RCP_ERROR:
+            raise
+        return base_status if base_status != LABEL_UNKNOWN else LABEL_UNKNOWN
 
-    # 4) sinon
-    return status
+    # NEW RULE: homeopathy forces "ville"
+    if has_homeo:
+        return LABEL_CITY
+
+    if has_hosp:
+        return LABEL_HOSP
+
+    return base_status
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     require_env()
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -355,7 +361,7 @@ def main():
     print(f"   ✅ ANSM Excel: {ansm_url}")
 
     print("2) Parsing…")
-    reimbursed_set = build_reimbursed_cis_set_from_cis_cip(CIS_CIP_PATH)
+    reimbursed_set = build_reimbursed_cis_set_from_cis_cip(CIS_CIP_PATH)  # :contentReference[oaicite:0]{index=0}
     hosp_cpd_set = build_hospital_cis_set_from_cpd(CIS_CPD_PATH)
     retro_set = load_retro_cis_set(ANSM_XLS_PATH)
 
@@ -380,7 +386,6 @@ def main():
 
         rcp_link = str(fields.get(FIELD_RCP_LINK, "")).strip()
         if not rcp_link:
-            # if your table always has it, you can remove this fallback
             rcp_link = f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait#tab-rcp"
 
         status = decide_status(cis, rcp_link, reimbursed_set, retro_set, hosp_cpd_set, rcp)
