@@ -30,9 +30,16 @@ HEADERS_WEB = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 
-AIRTABLE_MIN_DELAY_S = 0.25
-AIRTABLE_BATCH_SIZE = 10
-UPDATE_FLUSH_THRESHOLD = 1000
+# Airtable
+AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))  # throttle global (≈4 req/s)
+AIRTABLE_BATCH_SIZE = 10                                                # limite Airtable / request
+
+# Flush logique (debug par défaut: 200). Tu peux remonter à 1000 ensuite.
+UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
+
+# Timeouts requests (connect, read)
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "20"))
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 4
@@ -40,6 +47,9 @@ MAX_RETRIES = 4
 # Rapport suppression (workspace du repo)
 REPORT_DIR = os.getenv("REPORT_DIR", "reports")
 REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
+
+# Heartbeat
+HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
 # ============================================================
 # LOG
@@ -167,7 +177,7 @@ def rcp_link_default(cis: str) -> str:
 # DOWNLOAD
 # ============================================================
 
-def http_get(url: str, timeout: int = REQUEST_TIMEOUT) -> requests.Response:
+def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 30.0)) -> requests.Response:
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -179,14 +189,14 @@ def http_get(url: str, timeout: int = REQUEST_TIMEOUT) -> requests.Response:
     raise RuntimeError(f"GET failed: {url} / {last_err}")
 
 def download_text(url: str, encoding: str = "latin-1") -> str:
-    r = http_get(url)
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 30.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} for {url}")
     r.encoding = encoding
     return r.text
 
 def download_bytes(url: str) -> bytes:
-    r = http_get(url)
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} for {url}")
     return r.content
@@ -196,7 +206,7 @@ def download_bytes(url: str) -> bytes:
 # ============================================================
 
 def find_ansm_retro_excel_link() -> str:
-    r = http_get(ANSM_RETRO_PAGE)
+    r = http_get(ANSM_RETRO_PAGE, timeout=(HTTP_CONNECT_TIMEOUT, 30.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {ANSM_RETRO_PAGE}")
     soup = BeautifulSoup(r.text, _bs_parser())
@@ -409,13 +419,13 @@ def clean_cpd_text_keep_useful(text: str) -> str:
         kept.append(ln)
     return normalize_ws_keep_lines("\n".join(kept))
 
-def fetch_html_checked(url: str, timeout: int = 20, max_retries: int = 3) -> str:
+def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT), max_retries: int = 3) -> str:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, headers=HEADERS_WEB, timeout=timeout)
             if r.status_code == 404:
-                raise PageUnavailable(url, 404, f"HTTP 404")
+                raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
                 raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
             if not r.text or len(r.text) < 200:
@@ -672,7 +682,7 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
-    # (Create/delete init comme avant si tu veux le garder)
+    # CREATE
     if to_create:
         info("Création des enregistrements manquants ...")
         new_recs = []
@@ -704,12 +714,14 @@ def main():
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
 
+    # DELETE init
     if to_delete:
         info("Suppression des enregistrements Airtable absents de BDPM ...")
         ids = [airtable_by_cis[c]["id"] for c in to_delete if c in airtable_by_cis]
         if ids:
             at.delete_records(ids)
             ok(f"Supprimés: {len(ids)}")
+
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
@@ -732,6 +744,10 @@ def main():
     start = time.time()
 
     for idx, cis in enumerate(all_cis, start=1):
+        # Heartbeat: prouve que ça avance
+        if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis})")
+
         rec = airtable_by_cis.get(cis)
         if not rec:
             continue
@@ -794,9 +810,9 @@ def main():
                     upd_fields["Disponibilité du traitement"] = dispo
 
             except PageUnavailable as e:
-                # ✅ NOUVEAU: si fiche-info/RCP introuvable -> on SUPPRIME la ligne Airtable
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
-                # flush updates avant delete pour éviter mélange
+
+                # flush updates avant delete
                 if updates:
                     at.update_records(updates)
                     ok(f"Batch updates (flush before delete): {len(updates)}")
@@ -809,8 +825,6 @@ def main():
                 except Exception as de:
                     failures += 1
                     warn(f"Suppression Airtable impossible CIS={cis}: {de} (on continue)")
-
-                # continuer au suivant
                 continue
 
             except Exception as e:
@@ -835,7 +849,6 @@ def main():
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
-    # Commit/push du rapport si demandé
     try_git_commit_report()
 
     ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapport: {report_path_today()}")
