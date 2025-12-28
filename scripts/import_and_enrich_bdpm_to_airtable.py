@@ -13,7 +13,12 @@ from typing import Dict, List, Tuple, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd  # pour equivalence ATC (Excel)
+
+# Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None  # noqa
 
 # ============================================================
 # CONFIG
@@ -21,8 +26,6 @@ import pandas as pd  # pour equivalence ATC (Excel)
 
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
-
-# Fichier des compositions (BDPM)
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
@@ -50,10 +53,10 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# Excel d'équivalence ATC (niveau 4 -> libellé)
+# Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
-# Champs Airtable
+# Champs Airtable (adapte ici si besoin)
 FIELD_CIS = "Code cis"
 FIELD_RCP = "Lien vers RCP"
 FIELD_CIP13 = "CIP 13"
@@ -66,7 +69,7 @@ FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"
 FIELD_ATC_LABEL = "Libellé ATC"
-FIELD_COMPOSITION = "Composition"  # ✅ cible Airtable
+FIELD_COMPOSITION = "Composition"  # ✅ colonne Airtable à remplir
 
 # ============================================================
 # LOG
@@ -206,6 +209,9 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     if not os.path.exists(path):
         warn(f"Fichier d'équivalence ATC introuvable: {path} (Libellé ATC restera vide)")
         return {}
+    if pd is None:
+        warn("pandas non disponible -> impossible de lire l'Excel d'équivalence ATC (Libellé ATC restera vide)")
+        return {}
     try:
         df = pd.read_excel(path)
     except Exception as e:
@@ -235,36 +241,68 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 # COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
 # ============================================================
 
-# Mots/expressions à supprimer en début "SEL DE ..."
-_SALT_PREFIX_RE = re.compile(
-    r"\b("
-    r"chlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
-    r"citrate|fumarate|succinate|tartrate|maleate|mal[eé]ate|"
-    r"m[eé]silate|mesilate|tosylate|benzoate|gluconate|lactate|"
-    r"carbonate|phosphate|sulfate|sulphate|ac[eé]tate|oxalate|"
-    r"nitrate|nitrite|"
-    r")\s+de\s+",
-    flags=re.IGNORECASE
+# Bruit / homeo
+_NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
+
+# "Complexe d'..."
+_COMPLEX_PREFIX_RE = re.compile(r"^\s*complexe\s+d['’]\s*", flags=re.IGNORECASE)
+
+# Sels / formes au début
+_SALT_WORDS = (
+    r"chlorhydrate|dichlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
+    r"citrate|fumarate|succinate|tartrate|mal[eé]ate|m[eé]silate|mesilate|"
+    r"tosylate|benzoate|gluconate|lactate|carbonate|phosphate|sulfate|sulphate|"
+    r"ac[eé]tate|oxalate|nitrate|nitrite|hydrog[eé]nosuccinate|"
+    r"b[eé]silate|besilate|besylate"
 )
 
-# Formes chimiques à supprimer (où qu'elles soient)
+# 1) cas "SEL de ..." et "SEL d'..."
+_SALT_PREFIX_RE = re.compile(rf"\b({_SALT_WORDS})\s+(?:de|d['’])\s*", flags=re.IGNORECASE)
+# 2) cas "SEL ..." sans "de/d'" en début
+_SALT_LEADING_RE = re.compile(rf"^\s*({_SALT_WORDS})\s+", flags=re.IGNORECASE)
+# 3) cas mot collé "hydrogénosuccinatedoxylamine" (sel collé en tête)
+_SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE)
+
+# Préfixes collés fréquents (dioxyde/peroxyde/oxyde + dichlorhydrate etc.)
+_PREFIX_GLUE_RES = [
+    re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyd(e|e)\s*|dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(peroxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
+]
+
+# Formes chimiques à supprimer
 _HYDRATE_RE = re.compile(
     r"\b("
     r"anhydre|base|"
+    r"sesquihydrat[ée]?|"
     r"monohydrat[ée]?|dihydrat[ée]?|trihydrat[ée]?|t[ée]trahydrat[ée]?|"
     r"pentahydrat[ée]?|h[ée]mihydrat[ée]?|hydrat[ée]?"
     r")\b",
     flags=re.IGNORECASE
 )
 
-# Bruits fréquents (radio, homeo, etc.)
-_NOISE_RE = re.compile(
-    r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b",
+# Contre-ions/qualificatifs en fin à retirer (peut se répéter)
+_COUNTERION_TAIL_RE = re.compile(
+    r"\b("
+    r"arginine|sodique|sodium|potassique|potassium|calcique|calcium|magnesium|magn[eé]sium|lithium|ammonium|"
+    r"zinc|cuivre|aluminium|manganese|manganèse"
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+# Descripteurs (souvent en fin)
+_DESC_TAIL_RE = re.compile(
+    r"\b("
+    r"humain|humaine|biog[eé]n[eé]tique|recombinant|recombinante|"
+    r"biosynth[eé]tique|biotechnologique|analogue|synthetique|synth[eé]tique"
+    r")\b",
     flags=re.IGNORECASE
 )
 
 def _pretty_segment(s: str) -> str:
-    """minuscules sauf 1ère lettre"""
     s = safe_text(s)
     if not s:
         return ""
@@ -273,13 +311,15 @@ def _pretty_segment(s: str) -> str:
 
 def clean_to_main_dci(raw: str) -> str:
     """
-    Transforme une "denomination" BDPM (composition) en DCI principale:
-    - enlève sels '... de ...'
-    - enlève hydrate/base/anhydre...
-    - enlève bruit homeo
-    - enlève contenus entre crochets/parenthèses (ex: [18F])
-    - normalise espaces
-    - retourne "Levodopa" etc (format demandé)
+    Transforme une denom BDPM en DCI principale:
+    - gère '/' dans une même cellule (on le traite comme séparateur)
+    - corrige sels collés en tête
+    - supprime sels "de/d'"
+    - supprime hydrates/base/anhydre
+    - supprime descripteurs (humain, biogénétique...)
+    - ignore certains excipients (dioxyde/oxyde/peroxyde ...)
+    - supprime contre-ions en suffixe (sodique, arginine...) même multiples
+    - conserve saccharose s'il est seul (géré ensuite par règle spéciale fer saccharose)
     """
     s = safe_text(raw)
     if not s:
@@ -289,21 +329,51 @@ def clean_to_main_dci(raw: str) -> str:
     s = re.sub(r"\[[^\]]*\]", " ", s)      # [18F]
     s = re.sub(r"\([^)]*\)", " ", s)       # (xxx)
 
-    # retire bruit
-    s = _NOISE_RE.sub(" ", s)
-
-    # enlève "sel de"
-    s = _SALT_PREFIX_RE.sub("", s)
-
-    # enlève hydrate/base/anhydre...
-    s = _HYDRATE_RE.sub(" ", s)
-
-    # nettoie séparateurs / ponctuation parasite
+    # normalise séparateurs & anti-slash
     s = s.replace("\\", " ")
-    s = re.sub(r"[;,:]+", " ", s)
+    s = s.replace("/", " / ")  # on découpe plus haut, mais on sécurise
     s = re.sub(r"\s+", " ", s).strip()
 
-    # si après nettoyage ça devient vide
+    # "Complexe d'..."
+    s = _COMPLEX_PREFIX_RE.sub("", s)
+
+    # bruit (homeo)
+    s = _NOISE_RE.sub(" ", s)
+
+    # corrige préfixes collés (dichlorhydratelévocétirizine, dioxydetitane, oxydezinc, etc.)
+    for rgx in _PREFIX_GLUE_RES:
+        s = rgx.sub(r"\1 \2", s)
+
+    # corrige cas sel collé en tête (hydrogénosuccinatedoxylamine)
+    s = _SALT_GLUE_RE.sub(r"\1 \2", s)
+
+    # ignore excipients "dioxyde/oxyde/peroxyde ..." (on ne veut pas 'Titane'/'Zinc' remontés)
+    if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
+        return ""
+
+    # supprime sels "xxx de" / "xxx d'"
+    s = _SALT_PREFIX_RE.sub("", s)
+
+    # supprime sel en début sans de/d'
+    s = _SALT_LEADING_RE.sub("", s)
+
+    # supprime hydrate/base/anhydre...
+    s = _HYDRATE_RE.sub(" ", s)
+
+    # supprime descripteurs (humain, biogénétique...)
+    s = _DESC_TAIL_RE.sub(" ", s)
+
+    # nettoyage final
+    s = re.sub(r"[;,:]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    # supprime contre-ions finaux (peut se répéter)
+    tokens = s.split()
+    while tokens and _COUNTERION_TAIL_RE.fullmatch(tokens[-1]):
+        tokens.pop()
+    s = " ".join(tokens).strip()
     if not s:
         return ""
 
@@ -311,10 +381,13 @@ def clean_to_main_dci(raw: str) -> str:
 
 def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
     """
-    CIS_COMPO_bdpm.txt est tabulé.
-    Pour avoir le NOM (pas le code numérique), on prend la 4ème colonne (index 3) = denom/composant.
-    On transforme en DCI principale nettoyée (sans sels/formes) et on dédoublonne.
-    On concatène ensuite avec " - " (comme demandé).
+    CIS_COMPO_bdpm.txt tabulé.
+    On prend la 4ème colonne (index 3) = dénomination du composant.
+    On nettoie en DCI principale et on dédoublonne.
+    Règle spéciale demandée:
+      - si "hydroxyde ferrique" + "saccharose" présents -> on remplace par "Fer saccharose"
+        (et on supprime "Fer" s'il est là)
+      - si saccharose seul -> on le laisse.
     """
     cis_to_set: Dict[str, Dict[str, str]] = {}
 
@@ -329,23 +402,34 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
         if len(cis) != 8:
             continue
 
-        # ✅ NOM de la substance/composant (4ème colonne)
         denom = safe_text(parts[3])
         if not denom:
             continue
 
-        dci = clean_to_main_dci(denom)
-        if not dci:
-            continue
+        # Certaines lignes peuvent contenir plusieurs items séparés par "/"
+        denom_norm = denom.replace("\\|", "|").replace("|", "|")  # sécurité
+        denom_norm = denom_norm.replace("/", "|")
+        pieces = [p.strip() for p in denom_norm.split("|") if p.strip()]
 
-        # dédoublonnage robuste (clé = lowercase)
-        key = dci.lower().strip()
-        cis_to_set.setdefault(cis, {})
-        cis_to_set[cis][key] = dci  # conserve la dernière forme "propre"
+        for piece in pieces:
+            dci = clean_to_main_dci(piece)
+            if not dci:
+                continue
+            key = dci.lower().strip()
+            cis_to_set.setdefault(cis, {})
+            cis_to_set[cis][key] = dci  # dédoublonnage
+
+    # Règle spéciale "Fer saccharose"
+    for cis, kv in cis_to_set.items():
+        keys = set(kv.keys())
+        if "hydroxyde ferrique" in keys and "saccharose" in keys:
+            kv.pop("hydroxyde ferrique", None)
+            kv.pop("saccharose", None)
+            kv.pop("fer", None)
+            kv["fer saccharose"] = "Fer saccharose"
 
     out: Dict[str, str] = {}
     for cis, kv in cis_to_set.items():
-        # tri alpha stable (optionnel)
         values = list(kv.values())
         values.sort(key=lambda x: x.lower())
         out[cis] = " - ".join(values)
@@ -589,7 +673,6 @@ NEGATION_PAT = re.compile(
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
-
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
 CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", re.IGNORECASE)
 
@@ -864,11 +947,10 @@ def main():
     cis_cip_txt = download_text(BDPM_CIS_CIP_URL, encoding="latin-1")
     ok(f"BDPM CIS_CIP OK ({len(cis_cip_txt)} chars)")
 
-    # ✅ Compositions
     info("Téléchargement BDPM COMPO ...")
     compo_txt = download_text(BDPM_COMPO_URL, encoding="latin-1")
     ok(f"BDPM COMPO OK ({len(compo_txt)} chars)")
-    compo_map = parse_bdpm_compositions(compo_txt)  # CIS -> "Dci1 - Dci2" (nettoyé, sans doublons)
+    compo_map = parse_bdpm_compositions(compo_txt)
 
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
@@ -939,7 +1021,6 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # ✅ composition (DCI principales nettoyées)
             compo = compo_map.get(cis, "")
             if compo:
                 fields[FIELD_COMPOSITION] = compo
@@ -997,13 +1078,13 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ Composition: maintenue à jour depuis le fichier BDPM COMPO (nettoyée, sans doublons)
+        # ✅ Composition depuis BDPM_COMPO (DCI principales nettoyées)
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         new_compo = compo_map.get(cis, "")
         if new_compo and new_compo != cur_compo:
             upd_fields[FIELD_COMPOSITION] = new_compo
 
-        # ✅ libellé ATC depuis Excel si ATC4 existe déjà
+        # ✅ Libellé ATC depuis Excel si Code ATC (niveau 4) existe déjà
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1012,6 +1093,7 @@ def main():
             if label and label != cur_label:
                 upd_fields[FIELD_ATC_LABEL] = label
 
+        # infos BDPM CIS
         row = cis_map.get(cis)
         if row:
             labo = normalize_lab_name(row.titulaire)
@@ -1024,11 +1106,13 @@ def main():
             if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
                 upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
 
+        # CIP
         cip = cip_map.get(cis)
         if cip:
             if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
                 upd_fields[FIELD_CIP13] = cip.cip13
 
+        # Lien RCP
         link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
@@ -1040,7 +1124,6 @@ def main():
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
-        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
 
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_atc4)
         is_retro = cis in ansm_retro_cis
