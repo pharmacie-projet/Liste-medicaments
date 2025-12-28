@@ -22,7 +22,7 @@ import pandas as pd  # pour equivalence ATC (Excel)
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 
-# ✅ Fichier des compositions (BDPM)
+# Fichier des compositions (BDPM)
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
@@ -37,7 +37,6 @@ HEADERS_WEB = {
 # Airtable
 AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))
 AIRTABLE_BATCH_SIZE = 10
-
 UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
 
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
@@ -51,7 +50,7 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# ✅ ton excel d'équivalence ATC
+# Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
 # Champs Airtable
@@ -67,9 +66,7 @@ FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"
 FIELD_ATC_LABEL = "Libellé ATC"
-
-# ✅ NEW: champ Airtable cible
-FIELD_COMPOSITION = "Composition"
+FIELD_COMPOSITION = "Composition"  # ✅ cible Airtable
 
 # ============================================================
 # LOG
@@ -235,51 +232,125 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     return mapping
 
 # ============================================================
-# COMPOSITION BDPM (3ème colonne)
+# COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
 # ============================================================
+
+# Mots/expressions à supprimer en début "SEL DE ..."
+_SALT_PREFIX_RE = re.compile(
+    r"\b("
+    r"chlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
+    r"citrate|fumarate|succinate|tartrate|maleate|mal[eé]ate|"
+    r"m[eé]silate|mesilate|tosylate|benzoate|gluconate|lactate|"
+    r"carbonate|phosphate|sulfate|sulphate|ac[eé]tate|oxalate|"
+    r"nitrate|nitrite|"
+    r")\s+de\s+",
+    flags=re.IGNORECASE
+)
+
+# Formes chimiques à supprimer (où qu'elles soient)
+_HYDRATE_RE = re.compile(
+    r"\b("
+    r"anhydre|base|"
+    r"monohydrat[ée]?|dihydrat[ée]?|trihydrat[ée]?|t[ée]trahydrat[ée]?|"
+    r"pentahydrat[ée]?|h[ée]mihydrat[ée]?|hydrat[ée]?"
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+# Bruits fréquents (radio, homeo, etc.)
+_NOISE_RE = re.compile(
+    r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b",
+    flags=re.IGNORECASE
+)
+
+def _pretty_segment(s: str) -> str:
+    """minuscules sauf 1ère lettre"""
+    s = safe_text(s)
+    if not s:
+        return ""
+    s = s.lower()
+    return s[0].upper() + s[1:] if s else ""
+
+def clean_to_main_dci(raw: str) -> str:
+    """
+    Transforme une "denomination" BDPM (composition) en DCI principale:
+    - enlève sels '... de ...'
+    - enlève hydrate/base/anhydre...
+    - enlève bruit homeo
+    - enlève contenus entre crochets/parenthèses (ex: [18F])
+    - normalise espaces
+    - retourne "Levodopa" etc (format demandé)
+    """
+    s = safe_text(raw)
+    if not s:
+        return ""
+
+    # retire isotopes/notes
+    s = re.sub(r"\[[^\]]*\]", " ", s)      # [18F]
+    s = re.sub(r"\([^)]*\)", " ", s)       # (xxx)
+
+    # retire bruit
+    s = _NOISE_RE.sub(" ", s)
+
+    # enlève "sel de"
+    s = _SALT_PREFIX_RE.sub("", s)
+
+    # enlève hydrate/base/anhydre...
+    s = _HYDRATE_RE.sub(" ", s)
+
+    # nettoie séparateurs / ponctuation parasite
+    s = s.replace("\\", " ")
+    s = re.sub(r"[;,:]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # si après nettoyage ça devient vide
+    if not s:
+        return ""
+
+    return _pretty_segment(s)
 
 def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
     """
-    Le fichier CIS_COMPO_bdpm.txt contient des lignes tabulées.
-    Tu veux importer la 4ème colonne (index 3) dans Airtable "Composition".
-
-    On agrège toutes les valeurs (col3) pour un CIS donné :
-    - dédoublonnage
-    - concaténation avec " | " (modifiable)
+    CIS_COMPO_bdpm.txt est tabulé.
+    Pour avoir le NOM (pas le code numérique), on prend la 4ème colonne (index 3) = denom/composant.
+    On transforme en DCI principale nettoyée (sans sels/formes) et on dédoublonne.
+    On concatène ensuite avec " - " (comme demandé).
     """
-    compo_by_cis: Dict[str, List[str]] = {}
+    cis_to_set: Dict[str, Dict[str, str]] = {}
 
     for line in txt.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
 
         cis = re.sub(r"\D", "", parts[0].strip())
         if len(cis) != 8:
             continue
 
-        compo_val = safe_text(parts[3])
-        if not compo_val:
+        # ✅ NOM de la substance/composant (4ème colonne)
+        denom = safe_text(parts[3])
+        if not denom:
             continue
 
-        compo_by_cis.setdefault(cis, []).append(compo_val)
+        dci = clean_to_main_dci(denom)
+        if not dci:
+            continue
+
+        # dédoublonnage robuste (clé = lowercase)
+        key = dci.lower().strip()
+        cis_to_set.setdefault(cis, {})
+        cis_to_set[cis][key] = dci  # conserve la dernière forme "propre"
 
     out: Dict[str, str] = {}
-    for cis, values in compo_by_cis.items():
-        # dédoublonnage en conservant l'ordre
-        seen = set()
-        uniq = []
-        for v in values:
-            key = v.strip().lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(v.strip())
-        out[cis] = " | ".join(uniq)
+    for cis, kv in cis_to_set.items():
+        # tri alpha stable (optionnel)
+        values = list(kv.values())
+        values.sort(key=lambda x: x.lower())
+        out[cis] = " - ".join(values)
 
-    ok(f"Compositions BDPM chargées: {len(out)} CIS avec au moins une composition")
+    ok(f"Compositions (DCI principales) chargées: {len(out)} CIS")
     return out
 
 # ============================================================
@@ -503,7 +574,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING (inchangé, sans champ "classe pharmacothérapeutique")
+# FICHE-INFO SCRAPING
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -783,7 +854,6 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    # ✅ mapping ATC4 -> libellé (Excel)
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
     info("Téléchargement BDPM CIS ...")
@@ -794,11 +864,11 @@ def main():
     cis_cip_txt = download_text(BDPM_CIS_CIP_URL, encoding="latin-1")
     ok(f"BDPM CIS_CIP OK ({len(cis_cip_txt)} chars)")
 
-    # ✅ NEW: compositions
+    # ✅ Compositions
     info("Téléchargement BDPM COMPO ...")
     compo_txt = download_text(BDPM_COMPO_URL, encoding="latin-1")
     ok(f"BDPM COMPO OK ({len(compo_txt)} chars)")
-    compo_map = parse_bdpm_compositions(compo_txt)  # CIS -> " | ".join(col3 values)
+    compo_map = parse_bdpm_compositions(compo_txt)  # CIS -> "Dci1 - Dci2" (nettoyé, sans doublons)
 
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
@@ -827,7 +897,7 @@ def main():
         FIELD_ATC,
         FIELD_ATC4,
         FIELD_ATC_LABEL,
-        FIELD_COMPOSITION,  # ✅ NEW
+        FIELD_COMPOSITION,
     ]
 
     info("Inventaire Airtable ...")
@@ -857,6 +927,7 @@ def main():
             row = cis_map[cis]
             cip = cip_map.get(cis)
             labo = normalize_lab_name(row.titulaire)
+
             fields = {
                 FIELD_CIS: cis,
                 FIELD_SPEC: safe_text(row.specialite),
@@ -868,12 +939,13 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # ✅ composition depuis BDPM (3ème colonne agrégée)
+            # ✅ composition (DCI principales nettoyées)
             compo = compo_map.get(cis, "")
             if compo:
                 fields[FIELD_COMPOSITION] = compo
 
             new_recs.append({"fields": fields})
+
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
 
@@ -885,7 +957,7 @@ def main():
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
 
-    # DELETE init
+    # DELETE
     if to_delete:
         info("Suppression des enregistrements Airtable absents de BDPM ...")
         ids = [airtable_by_cis[c]["id"] for c in to_delete if c in airtable_by_cis]
@@ -925,11 +997,20 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ composition (priorité BDPM) : met à jour si différent / vide
-        new_compo = compo_map.get(cis, "")
+        # ✅ Composition: maintenue à jour depuis le fichier BDPM COMPO (nettoyée, sans doublons)
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
+        new_compo = compo_map.get(cis, "")
         if new_compo and new_compo != cur_compo:
             upd_fields[FIELD_COMPOSITION] = new_compo
+
+        # ✅ libellé ATC depuis Excel si ATC4 existe déjà
+        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
+        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
+        if cur_atc4:
+            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
+            label = atc_labels.get(atc4_norm, "")
+            if label and label != cur_label:
+                upd_fields[FIELD_ATC_LABEL] = label
 
         row = cis_map.get(cis)
         if row:
@@ -961,15 +1042,7 @@ def main():
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
 
-        # ✅ libellé ATC depuis Excel, sans fetch, si ATC4 déjà en base
-        if cur_atc4:
-            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
-            label = atc_labels.get(atc4_norm, "")
-            if label and label != cur_label:
-                upd_fields[FIELD_ATC_LABEL] = label
-
-        # fetch uniquement si besoin d'autres champs
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_atc4)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
