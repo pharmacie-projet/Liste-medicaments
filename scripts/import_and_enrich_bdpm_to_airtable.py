@@ -50,9 +50,22 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# ✅ NEW: on pointe vers ton fichier Excel "equivalence atc" dans data
-# (tu peux aussi surcharger via variable d'env ATC_LABELS_FILE)
-ATC_LABELS_FILE = os.getenv("ATC_LABELS_FILE", "data/equivalence atc.xlsx")
+# ✅ Ton fichier d'équivalence ATC dans /data
+ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
+
+# Champs Airtable
+FIELD_CIS = "Code cis"
+FIELD_RCP = "Lien vers RCP"
+FIELD_CIP13 = "CIP 13"
+FIELD_DISPO = "Disponibilité du traitement"
+FIELD_CPD = "Conditions de prescription et délivrance"
+FIELD_LABO = "Laboratoire"
+FIELD_SPEC = "Spécialité"
+FIELD_FORME = "Forme"
+FIELD_VOIE = "Voie d'administration"
+FIELD_ATC = "Code ATC"
+FIELD_ATC4 = "Code ATC (niveau 4)"
+FIELD_ATC_LABEL = "Libellé ATC"
 
 # ============================================================
 # LOG
@@ -168,51 +181,11 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC LABELS (niveau 4)
+# ATC HELPERS
 # ============================================================
 
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
-
-def load_atc_labels(path: str) -> Dict[str, str]:
-    """
-    ✅ Charge l'équivalence ATC depuis un fichier Excel
-    attendu: colonnes "Code ATC (niveau 4)" et "Libellé ATC"
-    """
-    if not os.path.exists(path):
-        warn(f"Fichier d'équivalence ATC introuvable: {path} (Libellé ATC restera vide)")
-        return {}
-
-    try:
-        df = pd.read_excel(path)
-    except Exception as e:
-        warn(f"Impossible de lire l'Excel {path}: {e} (Libellé ATC restera vide)")
-        return {}
-
-    col_code = "Code ATC (niveau 4)"
-    col_label = "Libellé ATC"
-
-    if col_code not in df.columns or col_label not in df.columns:
-        warn(
-            f"Colonnes attendues absentes dans {path}. "
-            f"Trouvé: {list(df.columns)} | Attendu: ['{col_code}', '{col_label}']"
-        )
-        return {}
-
-    mapping: Dict[str, str] = {}
-
-    for _, row in df.iterrows():
-        code = safe_text(row.get(col_code, "")).upper()
-        label = safe_text(row.get(col_label, ""))
-        if not code or not label:
-            continue
-        # sécurité: on ne garde que les codes de niveau 4 (5 chars) si possible
-        code = atc_level4_from_any(code) or code
-        if code and code not in mapping:
-            mapping[code] = label
-
-    ok(f"ATC labels chargés depuis Excel: {len(mapping)} entrées")
-    return mapping
 
 def atc_level4_from_any(atc: str) -> str:
     """
@@ -233,6 +206,46 @@ def atc_level4_from_any(atc: str) -> str:
     if m5:
         return m5.group(1)
     return ""
+
+def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
+    """
+    Charge le mapping:
+    "Code ATC (niveau 4)" -> "Libellé ATC"
+    depuis l'Excel: data/equivalence atc.xlsx
+    """
+    if not os.path.exists(path):
+        warn(f"Fichier d'équivalence ATC introuvable: {path} (Libellé ATC restera vide)")
+        return {}
+
+    try:
+        df = pd.read_excel(path)
+    except Exception as e:
+        warn(f"Impossible de lire l'Excel {path}: {e} (Libellé ATC restera vide)")
+        return {}
+
+    col_code = FIELD_ATC4
+    col_label = FIELD_ATC_LABEL
+
+    if col_code not in df.columns or col_label not in df.columns:
+        warn(
+            f"Colonnes attendues absentes dans {path}. "
+            f"Trouvé: {list(df.columns)} | Attendu: ['{col_code}', '{col_label}']"
+        )
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        code = safe_text(row.get(col_code, "")).upper()
+        label = safe_text(row.get(col_label, ""))
+        if not code or not label:
+            continue
+
+        code = atc_level4_from_any(code) or code
+        if code and label:
+            mapping[code] = label
+
+    ok(f"Équivalence ATC chargée: {len(mapping)} entrées")
+    return mapping
 
 # ============================================================
 # URL HELPERS
@@ -577,6 +590,7 @@ def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     return m2.group(0).strip() if m2 else ""
 
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
+    # On ne conserve que la classe et l'ATC; mais on ne stocke plus la classe dans Airtable (tu n'as pas ce champ).
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
     for ln in lines:
         if not PHARM_CLASS_LINE_PAT.search(ln):
@@ -602,7 +616,10 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
-def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]:
+def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
+    """
+    ✅ On ne renvoie plus la classe pharmacothérapeutique car tu n'as pas le champ.
+    """
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -611,7 +628,7 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]
     cpd_text = extract_cpd_from_fiche_info(soup)
     cpd_text = capitalize_each_line(cpd_text)
 
-    pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
+    _pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
     atc_code = (atc_from_class_line.strip() or extract_atc_from_fiche_info(soup)).strip()
 
     badge_usage = extract_badge_usage_hospitalier_only(soup)
@@ -624,7 +641,7 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str, str]
         reserved = bool(RESERVED_HOSP_PAT.search(zone_text))
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
-    return cpd_text, is_homeo, reserved, usage, atc_code, pharm_class
+    return cpd_text, is_homeo, reserved, usage, atc_code
 
 def compute_disponibilite(
     has_taux_ville: bool,
@@ -735,8 +752,8 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    # ✅ NEW: charge les libellés depuis ton Excel d'équivalence ATC
-    atc_labels = load_atc_labels(ATC_LABELS_FILE)
+    # ✅ NEW: mapping ATC4 -> libellé depuis ton Excel
+    atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
     info("Téléchargement BDPM CIS ...")
     cis_txt = download_text(BDPM_CIS_URL, encoding="latin-1")
@@ -760,20 +777,20 @@ def main():
 
     at = AirtableClient(api_token, base_id, table_name)
 
+    # ✅ On retire complètement "Classe pharmacothérapeutique"
     needed_fields = [
-        "Code cis",
-        "Lien vers RCP",
-        "CIP 13",
-        "Disponibilité du traitement",
-        "Conditions de prescription et délivrance",
-        "Laboratoire",
-        "Spécialité",
-        "Forme",
-        "Voie d'administration",
-        "Code ATC",
-        "Code ATC (niveau 4)",
-        "Libellé ATC",
-        "Classe pharmacothérapeutique",
+        FIELD_CIS,
+        FIELD_RCP,
+        FIELD_CIP13,
+        FIELD_DISPO,
+        FIELD_CPD,
+        FIELD_LABO,
+        FIELD_SPEC,
+        FIELD_FORME,
+        FIELD_VOIE,
+        FIELD_ATC,
+        FIELD_ATC4,
+        FIELD_ATC_LABEL,
     ]
 
     info("Inventaire Airtable ...")
@@ -782,7 +799,7 @@ def main():
 
     airtable_by_cis: Dict[str, dict] = {}
     for rec in records:
-        cis = str(rec.get("fields", {}).get("Code cis", "")).strip()
+        cis = str(rec.get("fields", {}).get(FIELD_CIS, "")).strip()
         cis = re.sub(r"\D", "", cis)
         if len(cis) == 8:
             airtable_by_cis[cis] = rec
@@ -804,15 +821,15 @@ def main():
             cip = cip_map.get(cis)
             labo = normalize_lab_name(row.titulaire)
             fields = {
-                "Code cis": cis,
-                "Spécialité": safe_text(row.specialite),
-                "Forme": safe_text(row.forme),
-                "Voie d'administration": safe_text(row.voie_admin),
-                "Laboratoire": labo,
-                "Lien vers RCP": rcp_link_default(cis),
+                FIELD_CIS: cis,
+                FIELD_SPEC: safe_text(row.specialite),
+                FIELD_FORME: safe_text(row.forme),
+                FIELD_VOIE: safe_text(row.voie_admin),
+                FIELD_LABO: labo,
+                FIELD_RCP: rcp_link_default(cis),
             }
             if cip and cip.cip13:
-                fields["CIP 13"] = cip.cip13
+                fields[FIELD_CIP13] = cip.cip13
             new_recs.append({"fields": fields})
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
@@ -820,7 +837,7 @@ def main():
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
-            cis = str(rec.get("fields", {}).get("Code cis", "")).strip()
+            cis = str(rec.get("fields", {}).get(FIELD_CIS, "")).strip()
             cis = re.sub(r"\D", "", cis)
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
@@ -836,7 +853,7 @@ def main():
         records = at.list_all_records(fields=needed_fields)
         airtable_by_cis = {}
         for rec in records:
-            cis = str(rec.get("fields", {}).get("Code cis", "")).strip()
+            cis = str(rec.get("fields", {}).get(FIELD_CIS, "")).strip()
             cis = re.sub(r"\D", "", cis)
             if len(cis) == 8:
                 airtable_by_cis[cis] = rec
@@ -868,75 +885,62 @@ def main():
         row = cis_map.get(cis)
         if row:
             labo = normalize_lab_name(row.titulaire)
-            if labo and str(fields_cur.get("Laboratoire", "")).strip() != labo:
-                upd_fields["Laboratoire"] = labo
-            if safe_text(row.specialite) and str(fields_cur.get("Spécialité", "")).strip() != safe_text(row.specialite):
-                upd_fields["Spécialité"] = safe_text(row.specialite)
-            if safe_text(row.forme) and str(fields_cur.get("Forme", "")).strip() != safe_text(row.forme):
-                upd_fields["Forme"] = safe_text(row.forme)
-            if safe_text(row.voie_admin) and str(fields_cur.get("Voie d'administration", "")).strip() != safe_text(row.voie_admin):
-                upd_fields["Voie d'administration"] = safe_text(row.voie_admin)
+            if labo and str(fields_cur.get(FIELD_LABO, "")).strip() != labo:
+                upd_fields[FIELD_LABO] = labo
+            if safe_text(row.specialite) and str(fields_cur.get(FIELD_SPEC, "")).strip() != safe_text(row.specialite):
+                upd_fields[FIELD_SPEC] = safe_text(row.specialite)
+            if safe_text(row.forme) and str(fields_cur.get(FIELD_FORME, "")).strip() != safe_text(row.forme):
+                upd_fields[FIELD_FORME] = safe_text(row.forme)
+            if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
+                upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
 
         cip = cip_map.get(cis)
         if cip:
-            if cip.cip13 and str(fields_cur.get("CIP 13", "")).strip() != cip.cip13:
-                upd_fields["CIP 13"] = cip.cip13
+            if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
+                upd_fields[FIELD_CIP13] = cip.cip13
 
-        link_rcp = str(fields_cur.get("Lien vers RCP", "")).strip()
+        link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
-            upd_fields["Lien vers RCP"] = link_rcp
+            upd_fields[FIELD_RCP] = link_rcp
 
         fiche_url = normalize_to_fiche_info(link_rcp, cis)
 
-        cur_cpd = str(fields_cur.get("Conditions de prescription et délivrance", "")).strip()
-        cur_dispo = str(fields_cur.get("Disponibilité du traitement", "")).strip()
-        cur_atc = str(fields_cur.get("Code ATC", "")).strip()
-        cur_atc4 = str(fields_cur.get("Code ATC (niveau 4)", "")).strip()
-        cur_label = str(fields_cur.get("Libellé ATC", "")).strip()
-        cur_class = str(fields_cur.get("Classe pharmacothérapeutique", "")).strip()
+        cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
+        cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
+        cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
+        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
+        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
 
-        # ✅ IMPORTANT: on ne refetch pas la page juste pour le libellé
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_class)
-        is_retro = cis in ansm_retro_cis
-
-        # ✅ Si on a déjà atc4 mais pas le libellé -> on remplit SANS fetch
-        if (not cur_label) and cur_atc4:
+        # ✅ On ne fetch PAS juste pour remplir le libellé :
+        # - si atc4 existe déjà, on remplit libellé via Excel direct
+        if cur_atc4:
             atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
-            if atc4_norm in atc_labels:
-                label = atc_labels[atc4_norm]
-                if label:
-                    upd_fields["Libellé ATC"] = label
+            label = atc_labels.get(atc4_norm, "")
+            if label and label != cur_label:
+                upd_fields[FIELD_ATC_LABEL] = label
+
+        # fetch uniquement si besoin d'autres champs
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
+        is_retro = cis in ansm_retro_cis
 
         if need_fetch:
             try:
-                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code, pharm_class = analyze_fiche_info(fiche_url)
+                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
-                    upd_fields["Conditions de prescription et délivrance"] = cpd_text
+                    upd_fields[FIELD_CPD] = cpd_text
 
                 if atc_code and atc_code != cur_atc:
-                    upd_fields["Code ATC"] = atc_code
+                    upd_fields[FIELD_ATC] = atc_code
 
-                # ✅ calcule niveau 4 à partir de l'ATC (niveau 5 en général)
+                # recalcul atc4 (au cas où)
                 atc4 = atc_level4_from_any(atc_code)
                 if atc4 and atc4 != cur_atc4:
-                    upd_fields["Code ATC (niveau 4)"] = atc4
-
-                # ✅ libellé basé UNIQUEMENT sur le niveau 4
-                # (on privilégie atc4 calculé, sinon celui déjà en base)
-                atc4_for_label = (atc4 or cur_atc4 or "").strip().upper()
-                atc4_for_label = atc_level4_from_any(atc4_for_label) or atc4_for_label
-
-                if atc4_for_label and atc4_for_label in atc_labels:
-                    label = atc_labels[atc4_for_label]
+                    upd_fields[FIELD_ATC4] = atc4
+                    label = atc_labels.get(atc4, "")
                     if label and label != cur_label:
-                        upd_fields["Libellé ATC"] = label
-
-                if pharm_class:
-                    pc = safe_text(pharm_class)
-                    if pc and pc != cur_class:
-                        upd_fields["Classe pharmacothérapeutique"] = pc
+                        upd_fields[FIELD_ATC_LABEL] = label
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
@@ -947,7 +951,7 @@ def main():
                     usage_hospital=usage_hosp,
                 )
                 if dispo != cur_dispo:
-                    upd_fields["Disponibilité du traitement"] = dispo
+                    upd_fields[FIELD_DISPO] = dispo
 
             except PageUnavailable as e:
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
