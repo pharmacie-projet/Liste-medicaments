@@ -14,6 +14,9 @@ from typing import Dict, List, Tuple, Optional, Set
 import requests
 from bs4 import BeautifulSoup
 
+# ✅ NEW: lecture Excel pour l'équivalence ATC
+import pandas as pd
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -47,7 +50,9 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-ATC_LABELS_FILE = os.getenv("ATC_LABELS_FILE", "data/atc_labels.tsv")
+# ✅ NEW: on pointe vers ton fichier Excel "equivalence atc" dans data
+# (tu peux aussi surcharger via variable d'env ATC_LABELS_FILE)
+ATC_LABELS_FILE = os.getenv("ATC_LABELS_FILE", "data/equivalence atc.xlsx")
 
 # ============================================================
 # LOG
@@ -170,27 +175,43 @@ ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
 def load_atc_labels(path: str) -> Dict[str, str]:
+    """
+    ✅ Charge l'équivalence ATC depuis un fichier Excel
+    attendu: colonnes "Code ATC (niveau 4)" et "Libellé ATC"
+    """
     if not os.path.exists(path):
-        warn(f"Fichier ATC introuvable: {path} (Libellé ATC restera vide)")
+        warn(f"Fichier d'équivalence ATC introuvable: {path} (Libellé ATC restera vide)")
         return {}
+
+    try:
+        df = pd.read_excel(path)
+    except Exception as e:
+        warn(f"Impossible de lire l'Excel {path}: {e} (Libellé ATC restera vide)")
+        return {}
+
+    col_code = "Code ATC (niveau 4)"
+    col_label = "Libellé ATC"
+
+    if col_code not in df.columns or col_label not in df.columns:
+        warn(
+            f"Colonnes attendues absentes dans {path}. "
+            f"Trouvé: {list(df.columns)} | Attendu: ['{col_code}', '{col_label}']"
+        )
+        return {}
+
     mapping: Dict[str, str] = {}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for raw in f:
-            line = raw.strip("\n").strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                parts = re.split(r"\s{2,}", line)
-                if len(parts) < 2:
-                    continue
-            code = safe_text(parts[0]).upper()
-            label = safe_text("\t".join(parts[1:]))
-            if not code:
-                continue
-            if code not in mapping and label:
-                mapping[code] = label
-    ok(f"ATC labels chargés: {len(mapping)} entrées")
+
+    for _, row in df.iterrows():
+        code = safe_text(row.get(col_code, "")).upper()
+        label = safe_text(row.get(col_label, ""))
+        if not code or not label:
+            continue
+        # sécurité: on ne garde que les codes de niveau 4 (5 chars) si possible
+        code = atc_level4_from_any(code) or code
+        if code and code not in mapping:
+            mapping[code] = label
+
+    ok(f"ATC labels chargés depuis Excel: {len(mapping)} entrées")
     return mapping
 
 def atc_level4_from_any(atc: str) -> str:
@@ -205,7 +226,6 @@ def atc_level4_from_any(atc: str) -> str:
         return a[:5]
     if ATC5_PAT.fullmatch(a):
         return a
-    # parfois bruit, on tente d'extraire un motif 7 puis 5
     m7 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", a)
     if m7:
         return m7.group(1)[:5]
@@ -715,6 +735,7 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
+    # ✅ NEW: charge les libellés depuis ton Excel d'équivalence ATC
     atc_labels = load_atc_labels(ATC_LABELS_FILE)
 
     info("Téléchargement BDPM CIS ...")
@@ -750,8 +771,8 @@ def main():
         "Forme",
         "Voie d'administration",
         "Code ATC",
-        "Code ATC (niveau 4)",   # ✅ NEW
-        "Libellé ATC",           # ✅ NEW
+        "Code ATC (niveau 4)",
+        "Libellé ATC",
         "Classe pharmacothérapeutique",
     ]
 
@@ -875,8 +896,17 @@ def main():
         cur_label = str(fields_cur.get("Libellé ATC", "")).strip()
         cur_class = str(fields_cur.get("Classe pharmacothérapeutique", "")).strip()
 
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_atc4) or (not cur_label) or (not cur_class)
+        # ✅ IMPORTANT: on ne refetch pas la page juste pour le libellé
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_class)
         is_retro = cis in ansm_retro_cis
+
+        # ✅ Si on a déjà atc4 mais pas le libellé -> on remplit SANS fetch
+        if (not cur_label) and cur_atc4:
+            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
+            if atc4_norm in atc_labels:
+                label = atc_labels[atc4_norm]
+                if label:
+                    upd_fields["Libellé ATC"] = label
 
         if need_fetch:
             try:
@@ -885,18 +915,21 @@ def main():
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields["Conditions de prescription et délivrance"] = cpd_text
 
-                # garde le code ATC tel quel (souvent niveau 5)
                 if atc_code and atc_code != cur_atc:
                     upd_fields["Code ATC"] = atc_code
 
-                # ✅ calcule niveau 4 quoi qu'il arrive
+                # ✅ calcule niveau 4 à partir de l'ATC (niveau 5 en général)
                 atc4 = atc_level4_from_any(atc_code)
                 if atc4 and atc4 != cur_atc4:
                     upd_fields["Code ATC (niveau 4)"] = atc4
 
                 # ✅ libellé basé UNIQUEMENT sur le niveau 4
-                if atc4 and atc4 in atc_labels:
-                    label = atc_labels[atc4]
+                # (on privilégie atc4 calculé, sinon celui déjà en base)
+                atc4_for_label = (atc4 or cur_atc4 or "").strip().upper()
+                atc4_for_label = atc_level4_from_any(atc4_for_label) or atc4_for_label
+
+                if atc4_for_label and atc4_for_label in atc_labels:
+                    label = atc_labels[atc4_for_label]
                     if label and label != cur_label:
                         upd_fields["Libellé ATC"] = label
 
