@@ -8,6 +8,7 @@ import json
 import random
 import urllib.parse
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -67,11 +68,11 @@ FIELD_SPEC = "Spécialité"
 FIELD_FORME = "Forme"
 FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
-FIELD_ATC4 = "Code ATC (niveau 4)"      # ✅ computed -> lecture seulement
-FIELD_ATC_LABEL = "Libellé ATC"          # ✅ champ à écrire
-FIELD_COMPOSITION = "Composition"        # ✅ champ à écrire
+FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
+FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
+FIELD_COMPOSITION = "Composition"        # champ à écrire
 
-# ✅ règle absolue : ne jamais écrire ces champs (computed)
+# règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
     FIELD_ATC4,  # computed Airtable -> interdiction totale d'écriture
 }
@@ -144,6 +145,15 @@ def safe_text(s: str) -> str:
     s = s.replace("\uFFFD", "")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     return s.strip()
+
+def strip_accents(s: str) -> str:
+    s = safe_text(s)
+    if not s:
+        return ""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
 
 def normalize_ws_keep_lines(s: str) -> str:
     s = safe_text(s)
@@ -862,7 +872,6 @@ class AirtableClient:
         return out
 
     def _strip_forbidden_fields(self, recs: List[dict]) -> None:
-        """Sécurité: même si du code tente de les envoyer, on les retire."""
         for rec in recs:
             fields = rec.get("fields")
             if isinstance(fields, dict):
@@ -870,14 +879,12 @@ class AirtableClient:
                     fields.pop(f, None)
 
     def create_records(self, records: List[dict]) -> None:
-        # sécurité
         self._strip_forbidden_fields(records)
         for batch in chunked(records, AIRTABLE_BATCH_SIZE):
             payload = {"records": batch, "typecast": True}
             self._request("POST", self.table_url, data=json.dumps(payload))
 
     def update_records(self, records: List[dict]) -> None:
-        # sécurité
         self._strip_forbidden_fields(records)
         for batch in chunked(records, AIRTABLE_BATCH_SIZE):
             payload = {"records": batch, "typecast": True}
@@ -933,7 +940,6 @@ def main():
 
     at = AirtableClient(api_token, base_id, table_name)
 
-    # ✅ On garde FIELD_ATC4 dans la lecture (computed), mais on ne l'écrit jamais
     needed_fields = [
         FIELD_CIS,
         FIELD_RCP,
@@ -989,12 +995,16 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            compo = compo_map.get(cis, "")
+            compo = compo_map.get(cis, "").strip()
             if compo:
-                fields[FIELD_COMPOSITION] = compo
+                # ajoute aussi une version sans accents (si absente)
+                compo_no_acc = strip_accents(compo)
+                if compo_no_acc and compo_no_acc.lower() not in compo.lower():
+                    fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
+                else:
+                    fields[FIELD_COMPOSITION] = compo
 
-            # ✅ IMPORTANT: ne jamais écrire FIELD_ATC4
-            fields.pop(FIELD_ATC4, None)
+            fields.pop(FIELD_ATC4, None)  # sécurité
 
             new_recs.append({"fields": fields})
 
@@ -1049,11 +1059,19 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ Composition depuis BDPM_COMPO (DCI principales nettoyées)
+        # ✅ Composition depuis BDPM_COMPO + ajout version sans accent (si absente)
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
-        new_compo = compo_map.get(cis, "")
-        if new_compo and new_compo != cur_compo:
-            upd_fields[FIELD_COMPOSITION] = new_compo
+        new_compo = compo_map.get(cis, "").strip()
+        if new_compo:
+            new_no_acc = strip_accents(new_compo).strip()
+
+            final_compo = new_compo
+            # ajoute la version sans accent seulement si elle n'apparait pas déjà (dans le champ actuel)
+            if new_no_acc and new_no_acc.lower() not in cur_compo.lower():
+                final_compo = f"{new_compo}\n{new_no_acc}"
+
+            if final_compo != cur_compo:
+                upd_fields[FIELD_COMPOSITION] = final_compo
 
         # ✅ Libellé ATC : on LIT le computed FIELD_ATC4 dans Airtable
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
@@ -1095,7 +1113,7 @@ def main():
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
 
-        # ✅ IMPORTANT: on ne force plus le fetch à cause de FIELD_ATC4 (computed)
+        # IMPORTANT: on ne force plus le fetch à cause de FIELD_ATC4 (computed)
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
@@ -1109,7 +1127,7 @@ def main():
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
 
-                # ✅ On peut mettre à jour Libellé ATC immédiatement via un calcul interne ATC4,
+                # On peut mettre à jour Libellé ATC immédiatement via un calcul interne ATC4,
                 # MAIS on n'écrit jamais FIELD_ATC4.
                 if atc_code:
                     atc4_tmp = atc_level4_from_any(atc_code)
@@ -1151,8 +1169,7 @@ def main():
                 warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
 
         if upd_fields:
-            # ✅ Sécurité: au cas où, on purge FIELD_ATC4
-            upd_fields.pop(FIELD_ATC4, None)
+            upd_fields.pop(FIELD_ATC4, None)  # sécurité
             updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
