@@ -67,9 +67,14 @@ FIELD_SPEC = "Spécialité"
 FIELD_FORME = "Forme"
 FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
-FIELD_ATC4 = "Code ATC (niveau 4)"
-FIELD_ATC_LABEL = "Libellé ATC"
-FIELD_COMPOSITION = "Composition"  # ✅ colonne Airtable à remplir
+FIELD_ATC4 = "Code ATC (niveau 4)"      # ✅ computed -> lecture seulement
+FIELD_ATC_LABEL = "Libellé ATC"          # ✅ champ à écrire
+FIELD_COMPOSITION = "Composition"        # ✅ champ à écrire
+
+# ✅ règle absolue : ne jamais écrire ces champs (computed)
+DO_NOT_WRITE_FIELDS: Set[str] = {
+    FIELD_ATC4,  # computed Airtable -> interdiction totale d'écriture
+}
 
 # ============================================================
 # LOG
@@ -241,13 +246,9 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 # COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
 # ============================================================
 
-# Bruit / homeo
 _NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
-
-# "Complexe d'..."
 _COMPLEX_PREFIX_RE = re.compile(r"^\s*complexe\s+d['’]\s*", flags=re.IGNORECASE)
 
-# Sels / formes au début
 _SALT_WORDS = (
     r"chlorhydrate|dichlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
     r"citrate|fumarate|succinate|tartrate|mal[eé]ate|m[eé]silate|mesilate|"
@@ -256,14 +257,10 @@ _SALT_WORDS = (
     r"b[eé]silate|besilate|besylate"
 )
 
-# 1) cas "SEL de ..." et "SEL d'..."
 _SALT_PREFIX_RE = re.compile(rf"\b({_SALT_WORDS})\s+(?:de|d['’])\s*", flags=re.IGNORECASE)
-# 2) cas "SEL ..." sans "de/d'" en début
 _SALT_LEADING_RE = re.compile(rf"^\s*({_SALT_WORDS})\s+", flags=re.IGNORECASE)
-# 3) cas mot collé "hydrogénosuccinatedoxylamine" (sel collé en tête)
 _SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE)
 
-# Préfixes collés fréquents (dioxyde/peroxyde/oxyde + dichlorhydrate etc.)
 _PREFIX_GLUE_RES = [
     re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
     re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
@@ -273,7 +270,6 @@ _PREFIX_GLUE_RES = [
     re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
 ]
 
-# Formes chimiques à supprimer
 _HYDRATE_RE = re.compile(
     r"\b("
     r"anhydre|base|"
@@ -284,7 +280,6 @@ _HYDRATE_RE = re.compile(
     flags=re.IGNORECASE
 )
 
-# Contre-ions/qualificatifs en fin à retirer (peut se répéter)
 _COUNTERION_TAIL_RE = re.compile(
     r"\b("
     r"arginine|sodique|sodium|potassique|potassium|calcique|calcium|magnesium|magn[eé]sium|lithium|ammonium|"
@@ -293,7 +288,6 @@ _COUNTERION_TAIL_RE = re.compile(
     flags=re.IGNORECASE
 )
 
-# Descripteurs (souvent en fin)
 _DESC_TAIL_RE = re.compile(
     r"\b("
     r"humain|humaine|biog[eé]n[eé]tique|recombinant|recombinante|"
@@ -310,66 +304,38 @@ def _pretty_segment(s: str) -> str:
     return s[0].upper() + s[1:] if s else ""
 
 def clean_to_main_dci(raw: str) -> str:
-    """
-    Transforme une denom BDPM en DCI principale:
-    - gère '/' dans une même cellule (on le traite comme séparateur)
-    - corrige sels collés en tête
-    - supprime sels "de/d'"
-    - supprime hydrates/base/anhydre
-    - supprime descripteurs (humain, biogénétique...)
-    - ignore certains excipients (dioxyde/oxyde/peroxyde ...)
-    - supprime contre-ions en suffixe (sodique, arginine...) même multiples
-    - conserve saccharose s'il est seul (géré ensuite par règle spéciale fer saccharose)
-    """
     s = safe_text(raw)
     if not s:
         return ""
 
-    # retire isotopes/notes
-    s = re.sub(r"\[[^\]]*\]", " ", s)      # [18F]
-    s = re.sub(r"\([^)]*\)", " ", s)       # (xxx)
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
 
-    # normalise séparateurs & anti-slash
     s = s.replace("\\", " ")
-    s = s.replace("/", " / ")  # on découpe plus haut, mais on sécurise
+    s = s.replace("/", " / ")
     s = re.sub(r"\s+", " ", s).strip()
 
-    # "Complexe d'..."
     s = _COMPLEX_PREFIX_RE.sub("", s)
-
-    # bruit (homeo)
     s = _NOISE_RE.sub(" ", s)
 
-    # corrige préfixes collés (dichlorhydratelévocétirizine, dioxydetitane, oxydezinc, etc.)
     for rgx in _PREFIX_GLUE_RES:
         s = rgx.sub(r"\1 \2", s)
 
-    # corrige cas sel collé en tête (hydrogénosuccinatedoxylamine)
     s = _SALT_GLUE_RE.sub(r"\1 \2", s)
 
-    # ignore excipients "dioxyde/oxyde/peroxyde ..." (on ne veut pas 'Titane'/'Zinc' remontés)
     if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
         return ""
 
-    # supprime sels "xxx de" / "xxx d'"
     s = _SALT_PREFIX_RE.sub("", s)
-
-    # supprime sel en début sans de/d'
     s = _SALT_LEADING_RE.sub("", s)
-
-    # supprime hydrate/base/anhydre...
     s = _HYDRATE_RE.sub(" ", s)
-
-    # supprime descripteurs (humain, biogénétique...)
     s = _DESC_TAIL_RE.sub(" ", s)
 
-    # nettoyage final
     s = re.sub(r"[;,:]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return ""
 
-    # supprime contre-ions finaux (peut se répéter)
     tokens = s.split()
     while tokens and _COUNTERION_TAIL_RE.fullmatch(tokens[-1]):
         tokens.pop()
@@ -380,15 +346,6 @@ def clean_to_main_dci(raw: str) -> str:
     return _pretty_segment(s)
 
 def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
-    """
-    CIS_COMPO_bdpm.txt tabulé.
-    On prend la 4ème colonne (index 3) = dénomination du composant.
-    On nettoie en DCI principale et on dédoublonne.
-    Règle spéciale demandée:
-      - si "hydroxyde ferrique" + "saccharose" présents -> on remplace par "Fer saccharose"
-        (et on supprime "Fer" s'il est là)
-      - si saccharose seul -> on le laisse.
-    """
     cis_to_set: Dict[str, Dict[str, str]] = {}
 
     for line in txt.splitlines():
@@ -406,8 +363,7 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
         if not denom:
             continue
 
-        # Certaines lignes peuvent contenir plusieurs items séparés par "/"
-        denom_norm = denom.replace("\\|", "|").replace("|", "|")  # sécurité
+        denom_norm = denom.replace("\\|", "|").replace("|", "|")
         denom_norm = denom_norm.replace("/", "|")
         pieces = [p.strip() for p in denom_norm.split("|") if p.strip()]
 
@@ -417,9 +373,8 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
                 continue
             key = dci.lower().strip()
             cis_to_set.setdefault(cis, {})
-            cis_to_set[cis][key] = dci  # dédoublonnage
+            cis_to_set[cis][key] = dci
 
-    # Règle spéciale "Fer saccharose"
     for cis, kv in cis_to_set.items():
         keys = set(kv.keys())
         if "hydroxyde ferrique" in keys and "saccharose" in keys:
@@ -906,12 +861,24 @@ class AirtableClient:
                 break
         return out
 
+    def _strip_forbidden_fields(self, recs: List[dict]) -> None:
+        """Sécurité: même si du code tente de les envoyer, on les retire."""
+        for rec in recs:
+            fields = rec.get("fields")
+            if isinstance(fields, dict):
+                for f in DO_NOT_WRITE_FIELDS:
+                    fields.pop(f, None)
+
     def create_records(self, records: List[dict]) -> None:
+        # sécurité
+        self._strip_forbidden_fields(records)
         for batch in chunked(records, AIRTABLE_BATCH_SIZE):
             payload = {"records": batch, "typecast": True}
             self._request("POST", self.table_url, data=json.dumps(payload))
 
     def update_records(self, records: List[dict]) -> None:
+        # sécurité
+        self._strip_forbidden_fields(records)
         for batch in chunked(records, AIRTABLE_BATCH_SIZE):
             payload = {"records": batch, "typecast": True}
             self._request("PATCH", self.table_url, data=json.dumps(payload))
@@ -966,6 +933,7 @@ def main():
 
     at = AirtableClient(api_token, base_id, table_name)
 
+    # ✅ On garde FIELD_ATC4 dans la lecture (computed), mais on ne l'écrit jamais
     needed_fields = [
         FIELD_CIS,
         FIELD_RCP,
@@ -977,9 +945,9 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,
-        FIELD_ATC_LABEL,
-        FIELD_COMPOSITION,
+        FIELD_ATC4,        # lecture
+        FIELD_ATC_LABEL,   # écriture possible
+        FIELD_COMPOSITION, # écriture
     ]
 
     info("Inventaire Airtable ...")
@@ -1024,6 +992,9 @@ def main():
             compo = compo_map.get(cis, "")
             if compo:
                 fields[FIELD_COMPOSITION] = compo
+
+            # ✅ IMPORTANT: ne jamais écrire FIELD_ATC4
+            fields.pop(FIELD_ATC4, None)
 
             new_recs.append({"fields": fields})
 
@@ -1084,7 +1055,7 @@ def main():
         if new_compo and new_compo != cur_compo:
             upd_fields[FIELD_COMPOSITION] = new_compo
 
-        # ✅ Libellé ATC depuis Excel si Code ATC (niveau 4) existe déjà
+        # ✅ Libellé ATC : on LIT le computed FIELD_ATC4 dans Airtable
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1123,9 +1094,9 @@ def main():
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
-        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
 
-        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc) or (not cur_atc4)
+        # ✅ IMPORTANT: on ne force plus le fetch à cause de FIELD_ATC4 (computed)
+        need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
@@ -1138,12 +1109,14 @@ def main():
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
 
-                atc4 = atc_level4_from_any(atc_code)
-                if atc4 and atc4 != cur_atc4:
-                    upd_fields[FIELD_ATC4] = atc4
-                    label = atc_labels.get(atc4, "")
-                    if label and label != cur_label:
-                        upd_fields[FIELD_ATC_LABEL] = label
+                # ✅ On peut mettre à jour Libellé ATC immédiatement via un calcul interne ATC4,
+                # MAIS on n'écrit jamais FIELD_ATC4.
+                if atc_code:
+                    atc4_tmp = atc_level4_from_any(atc_code)
+                    if atc4_tmp:
+                        label = atc_labels.get(atc4_tmp, "")
+                        if label and label != cur_label:
+                            upd_fields[FIELD_ATC_LABEL] = label
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
@@ -1178,6 +1151,8 @@ def main():
                 warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
 
         if upd_fields:
+            # ✅ Sécurité: au cas où, on purge FIELD_ATC4
+            upd_fields.pop(FIELD_ATC4, None)
             updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
