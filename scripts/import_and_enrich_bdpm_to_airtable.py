@@ -13,9 +13,7 @@ from typing import Dict, List, Tuple, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
-
-# ✅ NEW: lecture Excel pour l'équivalence ATC
-import pandas as pd
+import pandas as pd  # pour equivalence ATC (Excel)
 
 # ============================================================
 # CONFIG
@@ -23,6 +21,9 @@ import pandas as pd
 
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
+
+# ✅ Fichier des compositions (BDPM)
+BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
@@ -50,7 +51,7 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# ✅ Ton fichier d'équivalence ATC dans /data
+# ✅ ton excel d'équivalence ATC
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
 # Champs Airtable
@@ -66,6 +67,9 @@ FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"
 FIELD_ATC_LABEL = "Libellé ATC"
+
+# ✅ NEW: champ Airtable cible
+FIELD_COMPOSITION = "Composition"
 
 # ============================================================
 # LOG
@@ -188,12 +192,6 @@ ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
 def atc_level4_from_any(atc: str) -> str:
-    """
-    Retourne le code ATC niveau 4 (5 caractères) même si ATC est niveau 5 (7 caractères).
-    - A11CA01 -> A11CA
-    - A11CA   -> A11CA
-    Sinon -> ""
-    """
     a = (atc or "").strip().upper()
     if ATC7_PAT.fullmatch(a):
         return a[:5]
@@ -208,44 +206,81 @@ def atc_level4_from_any(atc: str) -> str:
     return ""
 
 def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
-    """
-    Charge le mapping:
-    "Code ATC (niveau 4)" -> "Libellé ATC"
-    depuis l'Excel: data/equivalence atc.xlsx
-    """
     if not os.path.exists(path):
         warn(f"Fichier d'équivalence ATC introuvable: {path} (Libellé ATC restera vide)")
         return {}
-
     try:
         df = pd.read_excel(path)
     except Exception as e:
         warn(f"Impossible de lire l'Excel {path}: {e} (Libellé ATC restera vide)")
         return {}
 
-    col_code = FIELD_ATC4
-    col_label = FIELD_ATC_LABEL
-
-    if col_code not in df.columns or col_label not in df.columns:
+    if FIELD_ATC4 not in df.columns or FIELD_ATC_LABEL not in df.columns:
         warn(
             f"Colonnes attendues absentes dans {path}. "
-            f"Trouvé: {list(df.columns)} | Attendu: ['{col_code}', '{col_label}']"
+            f"Trouvé: {list(df.columns)} | Attendu: ['{FIELD_ATC4}', '{FIELD_ATC_LABEL}']"
         )
         return {}
 
     mapping: Dict[str, str] = {}
     for _, row in df.iterrows():
-        code = safe_text(row.get(col_code, "")).upper()
-        label = safe_text(row.get(col_label, ""))
+        code = safe_text(row.get(FIELD_ATC4, "")).upper()
+        label = safe_text(row.get(FIELD_ATC_LABEL, ""))
         if not code or not label:
             continue
-
         code = atc_level4_from_any(code) or code
-        if code and label:
-            mapping[code] = label
+        mapping[code] = label
 
     ok(f"Équivalence ATC chargée: {len(mapping)} entrées")
     return mapping
+
+# ============================================================
+# COMPOSITION BDPM (3ème colonne)
+# ============================================================
+
+def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
+    """
+    Le fichier CIS_COMPO_bdpm.txt contient des lignes tabulées.
+    Tu veux importer la 3ème colonne (index 2) dans Airtable "Composition".
+
+    On agrège toutes les valeurs (col3) pour un CIS donné :
+    - dédoublonnage
+    - concaténation avec " | " (modifiable)
+    """
+    compo_by_cis: Dict[str, List[str]] = {}
+
+    for line in txt.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+
+        cis = re.sub(r"\D", "", parts[0].strip())
+        if len(cis) != 8:
+            continue
+
+        compo_val = safe_text(parts[2])
+        if not compo_val:
+            continue
+
+        compo_by_cis.setdefault(cis, []).append(compo_val)
+
+    out: Dict[str, str] = {}
+    for cis, values in compo_by_cis.items():
+        # dédoublonnage en conservant l'ordre
+        seen = set()
+        uniq = []
+        for v in values:
+            key = v.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(v.strip())
+        out[cis] = " | ".join(uniq)
+
+    ok(f"Compositions BDPM chargées: {len(out)} CIS avec au moins une composition")
+    return out
 
 # ============================================================
 # URL HELPERS
@@ -372,7 +407,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
     return cis_set
 
 # ============================================================
-# BDPM PARSE
+# BDPM PARSE (CIS, CIP)
 # ============================================================
 
 @dataclass
@@ -468,7 +503,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING
+# FICHE-INFO SCRAPING (inchangé, sans champ "classe pharmacothérapeutique")
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -590,7 +625,6 @@ def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     return m2.group(0).strip() if m2 else ""
 
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
-    # On ne conserve que la classe et l'ATC; mais on ne stocke plus la classe dans Airtable (tu n'as pas ce champ).
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
     for ln in lines:
         if not PHARM_CLASS_LINE_PAT.search(ln):
@@ -617,9 +651,6 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
 def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
-    """
-    ✅ On ne renvoie plus la classe pharmacothérapeutique car tu n'as pas le champ.
-    """
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -752,7 +783,7 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    # ✅ NEW: mapping ATC4 -> libellé depuis ton Excel
+    # ✅ mapping ATC4 -> libellé (Excel)
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
     info("Téléchargement BDPM CIS ...")
@@ -762,6 +793,12 @@ def main():
     info("Téléchargement BDPM CIS_CIP ...")
     cis_cip_txt = download_text(BDPM_CIS_CIP_URL, encoding="latin-1")
     ok(f"BDPM CIS_CIP OK ({len(cis_cip_txt)} chars)")
+
+    # ✅ NEW: compositions
+    info("Téléchargement BDPM COMPO ...")
+    compo_txt = download_text(BDPM_COMPO_URL, encoding="latin-1")
+    ok(f"BDPM COMPO OK ({len(compo_txt)} chars)")
+    compo_map = parse_bdpm_compositions(compo_txt)  # CIS -> " | ".join(col3 values)
 
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
@@ -777,7 +814,6 @@ def main():
 
     at = AirtableClient(api_token, base_id, table_name)
 
-    # ✅ On retire complètement "Classe pharmacothérapeutique"
     needed_fields = [
         FIELD_CIS,
         FIELD_RCP,
@@ -791,6 +827,7 @@ def main():
         FIELD_ATC,
         FIELD_ATC4,
         FIELD_ATC_LABEL,
+        FIELD_COMPOSITION,  # ✅ NEW
     ]
 
     info("Inventaire Airtable ...")
@@ -830,6 +867,12 @@ def main():
             }
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
+
+            # ✅ composition depuis BDPM (3ème colonne agrégée)
+            compo = compo_map.get(cis, "")
+            if compo:
+                fields[FIELD_COMPOSITION] = compo
+
             new_recs.append({"fields": fields})
         at.create_records(new_recs)
         ok(f"Créés: {len(new_recs)}")
@@ -864,7 +907,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) ...")
+    info("Enrichissement (fiche-info) + libellé ATC + composition ...")
 
     updates = []
     failures = 0
@@ -881,6 +924,12 @@ def main():
 
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
+
+        # ✅ composition (priorité BDPM) : met à jour si différent / vide
+        new_compo = compo_map.get(cis, "")
+        cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
+        if new_compo and new_compo != cur_compo:
+            upd_fields[FIELD_COMPOSITION] = new_compo
 
         row = cis_map.get(cis)
         if row:
@@ -912,8 +961,7 @@ def main():
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
 
-        # ✅ On ne fetch PAS juste pour remplir le libellé :
-        # - si atc4 existe déjà, on remplit libellé via Excel direct
+        # ✅ libellé ATC depuis Excel, sans fetch, si ATC4 déjà en base
         if cur_atc4:
             atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
             label = atc_labels.get(atc4_norm, "")
@@ -934,7 +982,6 @@ def main():
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
 
-                # recalcul atc4 (au cas où)
                 atc4 = atc_level4_from_any(atc_code)
                 if atc4 and atc4 != cur_atc4:
                     upd_fields[FIELD_ATC4] = atc4
