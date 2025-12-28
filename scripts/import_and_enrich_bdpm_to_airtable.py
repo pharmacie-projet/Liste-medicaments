@@ -241,7 +241,7 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
     """
     Le fichier CIS_COMPO_bdpm.txt contient des lignes tabulées.
-    Tu veux importer la 3ème colonne (index 2) dans Airtable "Composition".
+    Tu veux importer la 4ème colonne (index 3) dans Airtable "Composition".
 
     On agrège toutes les valeurs (col3) pour un CIS donné :
     - dédoublonnage
@@ -260,7 +260,7 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
         if len(cis) != 8:
             continue
 
-        compo_val = safe_text(parts[2])
+        compo_val = safe_text(parts[3])
         if not compo_val:
             continue
 
