@@ -9,5 +9,9 @@ pandas==2.2.3
 
 openpyxl==3.1.5
 
-# Lecture du .xls ANSM en "xlrd pur" (pas via pandas)
+# Lecture du .xls ANSM
 xlrd==2.0.1
+
+# PDF RCP (extraction texte)
+pdfminer.six==20231228
+pypdf==5.1.0
