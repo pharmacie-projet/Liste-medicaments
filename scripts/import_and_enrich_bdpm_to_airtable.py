@@ -60,10 +60,8 @@ ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.x
 
 # --- Fallback ATC via RCP ---
 RCP_ATC_FALLBACK = os.getenv("RCP_ATC_FALLBACK", "1").strip() == "1"
-RCP_PDF_MAX_PAGES = int(os.getenv("RCP_PDF_MAX_PAGES", "3"))          # lire seulement les 2-3 premières pages
-MAX_RCP_CHECK = int(os.getenv("MAX_RCP_CHECK", "500"))                # limite de tentatives RCP par run
-RCP_REPORT_FILE = os.getenv("RCP_REPORT_FILE", "").strip()            # optionnel: forcer le nom du fichier
-RCP_TRY_ONLY_IF_LINK_PRESENT = os.getenv("RCP_ONLY_IF_LINK_PRESENT", "1").strip() == "1"
+RCP_PDF_MAX_PAGES = int(os.getenv("RCP_PDF_MAX_PAGES", "3"))  # lire seulement les premières pages
+RCP_REPORT_FILE = os.getenv("RCP_REPORT_FILE", "").strip()
 
 # Champs Airtable (adapte ici si besoin)
 FIELD_CIS = "Code cis"
@@ -241,6 +239,20 @@ def _bs_parser():
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
+# ex "L02B G03" (niveau4 + espace + reste)
+ATC_SPACED_4_3_PAT = re.compile(r"\b([A-Z]\d{2}[A-Z])\s*([A-Z]\d{2})\b")
+
+# ex "code ATC : L02B G03" ou "code ATC: L02BG03"
+CODE_ATC_FLEX_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z0-9 ]{4,12})", re.IGNORECASE)
+
+def normalize_atc_candidate(s: str) -> str:
+    if not s:
+        return ""
+    cand = re.sub(r"[^A-Z0-9]", "", s.upper())
+    if ATC7_PAT.fullmatch(cand):
+        return cand
+    return ""
+
 def atc_level4_from_any(atc: str) -> str:
     a = (atc or "").strip().upper()
     if ATC7_PAT.fullmatch(a):
@@ -288,7 +300,7 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     return mapping
 
 # ============================================================
-# COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
+# COMPOSITION BDPM -> DCI principales
 # ============================================================
 
 _NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
@@ -685,9 +697,11 @@ NEGATION_PAT = re.compile(
 )
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
+
+# ATC contiguous classique
 ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
+
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
-CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", re.IGNORECASE)
 
 class PageUnavailable(Exception):
     def __init__(self, url: str, status: Optional[int], detail: str):
@@ -783,13 +797,37 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
 
     return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
+def extract_atc_from_text_blob(text: str) -> str:
+    """
+    Extrait un ATC (niveau 5) en acceptant :
+    - L02BG03 (collé)
+    - L02B G03 (avec espace)
+    - code ATC : L02B G03
+    """
+    if not text:
+        return ""
+
+    # 1) forme "code ATC : ...." (tolérant)
+    m = CODE_ATC_FLEX_PAT.search(text)
+    if m:
+        atc = normalize_atc_candidate(m.group(1))
+        if atc:
+            return atc
+
+    # 2) forme espacée L02B G03
+    m2 = ATC_SPACED_4_3_PAT.search(text)
+    if m2:
+        atc = normalize_atc_candidate(m2.group(1) + m2.group(2))
+        if atc:
+            return atc
+
+    # 3) forme collée classique
+    m3 = ATC_PAT.search(text)
+    return m3.group(0).strip().upper() if m3 else ""
+
 def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
     text = soup.get_text("\n", strip=True)
-    m = re.search(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\d{2})", text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m2 = ATC_PAT.search(text or "")
-    return m2.group(0).strip() if m2 else ""
+    return extract_atc_from_text_blob(text)
 
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
@@ -797,17 +835,12 @@ def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[st
         if not PHARM_CLASS_LINE_PAT.search(ln):
             continue
 
-        atc = ""
-        m_atc = CODE_ATC_INLINE_PAT.search(ln)
-        if m_atc:
-            atc = m_atc.group(1).strip()
+        atc = extract_atc_from_text_blob(ln)
 
         s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
         s = s.lstrip(":").strip()
-        s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
-
-        if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\d{2}[A-Z]{2}\d{2}\.?", s, flags=re.IGNORECASE):
-            s = ""
+        # on retire un éventuel suffixe "code ATC: ..."
+        s = re.sub(r"code\s+ATC\s*[:\-].*$", "", s, flags=re.IGNORECASE).strip()
 
         return s, atc
 
@@ -915,15 +948,6 @@ def find_pdf_links_in_rcp_html(soup: BeautifulSoup, base_url: str) -> List[str]:
         out.append(u)
     return out
 
-def extract_atc_from_text_blob(text: str) -> str:
-    if not text:
-        return ""
-    m = CODE_ATC_INLINE_PAT.search(text)
-    if m:
-        return m.group(1).strip().upper()
-    m2 = ATC_PAT.search(text)
-    return m2.group(0).strip().upper() if m2 else ""
-
 def try_extract_atc_from_rcp(rcp_url: str, cis: str) -> Tuple[str, str]:
     """
     Retourne (atc_code, method)
@@ -944,12 +968,13 @@ def try_extract_atc_from_rcp(rcp_url: str, cis: str) -> Tuple[str, str]:
         html = fetch_html_checked(rcp_url)
         soup = BeautifulSoup(html, _bs_parser())
         text = soup.get_text("\n", strip=True)
+
         atc = extract_atc_from_text_blob(text)
         if atc:
             return (atc, "rcp_html")
 
         pdf_links = find_pdf_links_in_rcp_html(soup, rcp_url)
-        for pdf in pdf_links[:3]:
+        for pdf in pdf_links[:5]:
             try:
                 pdf_bytes = download_bytes(pdf)
                 txt = extract_text_from_pdf_bytes(pdf_bytes, max_pages=RCP_PDF_MAX_PAGES)
@@ -1185,18 +1210,16 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) + libellé ATC + composition + fallback RCP ...")
+    info("Enrichissement (fiche-info) + libellé ATC + composition + fallback RCP sans limite ...")
 
     updates = []
     failures = 0
     deleted_count = 0
     start = time.time()
 
-    rcp_checks_done = 0
-
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK}")
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis})")
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1205,7 +1228,7 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ Composition depuis BDPM_COMPO + ajout version sans accent (si absente)
+        # ✅ Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
@@ -1216,7 +1239,7 @@ def main():
             if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # ✅ Libellé ATC : lecture du computed FIELD_ATC4 dans Airtable
+        # ✅ Libellé ATC via computed ATC4
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1256,11 +1279,13 @@ def main():
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
 
+        # On déclenche la lecture fiche-info dès qu'il manque un des champs clés, notamment ATC
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch:
             try:
+                # 1) FICHE-INFO d'abord
                 cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
@@ -1269,7 +1294,8 @@ def main():
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
 
-                # Libellé ATC via ATC trouvé dans fiche-info
+                # Libellé ATC via ATC trouvé
+                effective_atc = atc_code or cur_atc
                 if atc_code:
                     atc4_tmp = atc_level4_from_any(atc_code)
                     if atc4_tmp:
@@ -1277,18 +1303,11 @@ def main():
                         if label and label != cur_label:
                             upd_fields[FIELD_ATC_LABEL] = label
 
-                # ✅ Fallback RCP UNIQUEMENT si ATC toujours manquant
-                if (
-                    RCP_ATC_FALLBACK
-                    and (not atc_code)
-                    and (not cur_atc)
-                    and (rcp_checks_done < MAX_RCP_CHECK)
-                    and ((not RCP_TRY_ONLY_IF_LINK_PRESENT) or bool(link_rcp))
-                ):
-                    rcp_checks_done += 1
+                # 2) Si ATC toujours non trouvé -> RCP (sans limite)
+                if RCP_ATC_FALLBACK and (not effective_atc) and link_rcp:
                     rcp_url = normalize_to_rcp_tab(link_rcp, cis)
                     rcp_atc, method = try_extract_atc_from_rcp(link_rcp, cis)
-                    if rcp_atc:
+                    if rcp_atc and rcp_atc != cur_atc:
                         upd_fields[FIELD_ATC] = rcp_atc
                         atc4_tmp = atc_level4_from_any(rcp_atc)
                         if atc4_tmp:
@@ -1346,14 +1365,14 @@ def main():
             elapsed = time.time() - start
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
-            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK} | reste ~{int(remaining)}s")
+            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | reste ~{int(remaining)}s")
 
     if updates:
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
     try_git_commit_report()
-    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK} | rapports: {report_path_today()} + {report_atc_rcp_path_today()}")
+    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapports: {report_path_today()} + {report_atc_rcp_path_today()}")
 
 if __name__ == "__main__":
     main()
