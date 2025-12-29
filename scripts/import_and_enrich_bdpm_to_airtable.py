@@ -9,6 +9,7 @@ import random
 import urllib.parse
 import subprocess
 import unicodedata
+import io
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -56,6 +57,13 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
+
+# --- Fallback ATC via RCP ---
+RCP_ATC_FALLBACK = os.getenv("RCP_ATC_FALLBACK", "1").strip() == "1"
+RCP_PDF_MAX_PAGES = int(os.getenv("RCP_PDF_MAX_PAGES", "3"))          # lire seulement les 2-3 premières pages
+MAX_RCP_CHECK = int(os.getenv("MAX_RCP_CHECK", "500"))                # limite de tentatives RCP par run
+RCP_REPORT_FILE = os.getenv("RCP_REPORT_FILE", "").strip()            # optionnel: forcer le nom du fichier
+RCP_TRY_ONLY_IF_LINK_PRESENT = os.getenv("RCP_ONLY_IF_LINK_PRESENT", "1").strip() == "1"
 
 # Champs Airtable (adapte ici si besoin)
 FIELD_CIS = "Code cis"
@@ -118,20 +126,47 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
+def report_atc_rcp_path_today() -> str:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    if RCP_REPORT_FILE:
+        return os.path.join(REPORT_DIR, RCP_REPORT_FILE)
+    fname = f"atc_from_rcp_{time.strftime('%Y-%m-%d')}.tsv"
+    return os.path.join(REPORT_DIR, fname)
+
+def init_atc_rcp_report() -> str:
+    p = report_atc_rcp_path_today()
+    if not os.path.exists(p):
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("ts\tcis\trcp_url\tstatus\tatc_found\tatc_code\tmethod\terror\n")
+    return p
+
+def append_atc_rcp_report(cis: str, rcp_url: str, status: str, atc_found: bool, atc_code: str, method: str, error: str = ""):
+    p = init_atc_rcp_report()
+    line = f"{_ts()}\t{cis}\t{rcp_url}\t{status}\t{int(atc_found)}\t{atc_code}\t{method}\t{error}\n"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(line)
+
 def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        p = report_path_today()
-        if not os.path.exists(p):
+        paths = []
+        p1 = report_path_today()
+        if os.path.exists(p1):
+            paths.append(p1)
+        p2 = report_atc_rcp_path_today()
+        if os.path.exists(p2):
+            paths.append(p2)
+        if not paths:
             return
+
         subprocess.run(["git", "status"], check=False)
-        subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: deleted Airtable records ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "add"] + paths, check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: Airtable sync reports ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
-        ok("Rapport commit/push sur GitHub effectué.")
+        ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
-        warn(f"Commit/push du rapport impossible (on continue): {e}")
+        warn(f"Commit/push des rapports impossible (on continue): {e}")
 
 # ============================================================
 # TEXT UTIL
@@ -422,6 +457,20 @@ def normalize_to_fiche_info(url: str, cis_fallback: str) -> str:
 def rcp_link_default(cis: str) -> str:
     return f"{base_extrait_url_from_cis(cis)}?tab=rcp#tab-rcp"
 
+def normalize_to_rcp_tab(url: str, cis_fallback: str) -> str:
+    if not url or not url.startswith("http"):
+        return rcp_link_default(cis_fallback)
+
+    parts = urllib.parse.urlsplit(url)
+    if parts.path.lower().endswith(".pdf"):
+        return url
+
+    qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+    qs["tab"] = ["rcp"]
+    new_query = urllib.parse.urlencode(qs, doseq=True)
+    cleaned = parts._replace(query=new_query, fragment="tab-rcp")
+    return urllib.parse.urlunsplit(cleaned)
+
 # ============================================================
 # DOWNLOAD
 # ============================================================
@@ -490,7 +539,6 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
         ext = url_hint.lower().split("?")[0].split("#")[0]
         ext = os.path.splitext(ext)[1].lower()
 
-    import io
     if ext == ".xlsx":
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
@@ -818,6 +866,104 @@ def compute_disponibilite(
     return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
+# RCP -> ATC FALLBACK
+# ============================================================
+
+def is_probably_pdf_url(url: str) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return low.endswith(".pdf") or ("pdf" in low and ("download" in low or "telecharg" in low))
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3) -> str:
+    # 1) PyMuPDF
+    try:
+        import fitz  # type: ignore
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        texts = []
+        n = min(len(doc), max_pages)
+        for i in range(n):
+            texts.append(doc[i].get_text("text"))
+        return "\n".join(texts)
+    except Exception:
+        pass
+
+    # 2) pdfminer.six
+    try:
+        from pdfminer.high_level import extract_text  # type: ignore
+        return extract_text(io.BytesIO(pdf_bytes), maxpages=max_pages) or ""
+    except Exception:
+        return ""
+
+def find_pdf_links_in_rcp_html(soup: BeautifulSoup, base_url: str) -> List[str]:
+    pdfs = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if href.startswith("/"):
+            href = urllib.parse.urljoin(base_url, href)
+        low = href.lower()
+        if ".pdf" in low or ("pdf" in low and ("download" in low or "telecharg" in low)):
+            pdfs.append(href)
+    seen = set()
+    out = []
+    for u in pdfs:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+def extract_atc_from_text_blob(text: str) -> str:
+    if not text:
+        return ""
+    m = CODE_ATC_INLINE_PAT.search(text)
+    if m:
+        return m.group(1).strip().upper()
+    m2 = ATC_PAT.search(text)
+    return m2.group(0).strip().upper() if m2 else ""
+
+def try_extract_atc_from_rcp(rcp_url: str, cis: str) -> Tuple[str, str]:
+    """
+    Retourne (atc_code, method)
+    method ∈ {"rcp_html", "rcp_pdf", "rcp_pdf_link", "rcp_none"}
+    """
+    rcp_url = normalize_to_rcp_tab(rcp_url, cis)
+
+    if is_probably_pdf_url(rcp_url):
+        try:
+            pdf_bytes = download_bytes(rcp_url)
+            txt = extract_text_from_pdf_bytes(pdf_bytes, max_pages=RCP_PDF_MAX_PAGES)
+            atc = extract_atc_from_text_blob(txt)
+            return (atc, "rcp_pdf" if atc else "rcp_none")
+        except Exception:
+            return ("", "rcp_none")
+
+    try:
+        html = fetch_html_checked(rcp_url)
+        soup = BeautifulSoup(html, _bs_parser())
+        text = soup.get_text("\n", strip=True)
+        atc = extract_atc_from_text_blob(text)
+        if atc:
+            return (atc, "rcp_html")
+
+        pdf_links = find_pdf_links_in_rcp_html(soup, rcp_url)
+        for pdf in pdf_links[:3]:
+            try:
+                pdf_bytes = download_bytes(pdf)
+                txt = extract_text_from_pdf_bytes(pdf_bytes, max_pages=RCP_PDF_MAX_PAGES)
+                atc2 = extract_atc_from_text_blob(txt)
+                if atc2:
+                    return (atc2, "rcp_pdf_link")
+            except Exception:
+                continue
+
+        return ("", "rcp_none")
+    except Exception:
+        return ("", "rcp_none")
+
+# ============================================================
 # AIRTABLE CLIENT
 # ============================================================
 
@@ -997,7 +1143,6 @@ def main():
 
             compo = compo_map.get(cis, "").strip()
             if compo:
-                # ajoute aussi une version sans accents (si absente)
                 compo_no_acc = strip_accents(compo)
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
@@ -1005,7 +1150,6 @@ def main():
                     fields[FIELD_COMPOSITION] = compo
 
             fields.pop(FIELD_ATC4, None)  # sécurité
-
             new_recs.append({"fields": fields})
 
         at.create_records(new_recs)
@@ -1041,16 +1185,18 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) + libellé ATC + composition ...")
+    info("Enrichissement (fiche-info) + libellé ATC + composition + fallback RCP ...")
 
     updates = []
     failures = 0
     deleted_count = 0
     start = time.time()
 
+    rcp_checks_done = 0
+
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis})")
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK}")
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1064,16 +1210,13 @@ def main():
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
             new_no_acc = strip_accents(new_compo).strip()
-
             final_compo = new_compo
-            # ajoute la version sans accent seulement si elle n'apparait pas déjà (dans le champ actuel)
             if new_no_acc and new_no_acc.lower() not in cur_compo.lower():
                 final_compo = f"{new_compo}\n{new_no_acc}"
-
             if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # ✅ Libellé ATC : on LIT le computed FIELD_ATC4 dans Airtable
+        # ✅ Libellé ATC : lecture du computed FIELD_ATC4 dans Airtable
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1113,7 +1256,6 @@ def main():
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
 
-        # IMPORTANT: on ne force plus le fetch à cause de FIELD_ATC4 (computed)
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
@@ -1127,14 +1269,35 @@ def main():
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
 
-                # On peut mettre à jour Libellé ATC immédiatement via un calcul interne ATC4,
-                # MAIS on n'écrit jamais FIELD_ATC4.
+                # Libellé ATC via ATC trouvé dans fiche-info
                 if atc_code:
                     atc4_tmp = atc_level4_from_any(atc_code)
                     if atc4_tmp:
                         label = atc_labels.get(atc4_tmp, "")
                         if label and label != cur_label:
                             upd_fields[FIELD_ATC_LABEL] = label
+
+                # ✅ Fallback RCP UNIQUEMENT si ATC toujours manquant
+                if (
+                    RCP_ATC_FALLBACK
+                    and (not atc_code)
+                    and (not cur_atc)
+                    and (rcp_checks_done < MAX_RCP_CHECK)
+                    and ((not RCP_TRY_ONLY_IF_LINK_PRESENT) or bool(link_rcp))
+                ):
+                    rcp_checks_done += 1
+                    rcp_url = normalize_to_rcp_tab(link_rcp, cis)
+                    rcp_atc, method = try_extract_atc_from_rcp(link_rcp, cis)
+                    if rcp_atc:
+                        upd_fields[FIELD_ATC] = rcp_atc
+                        atc4_tmp = atc_level4_from_any(rcp_atc)
+                        if atc4_tmp:
+                            label = atc_labels.get(atc4_tmp, "")
+                            if label and label != cur_label:
+                                upd_fields[FIELD_ATC_LABEL] = label
+                        append_atc_rcp_report(cis, rcp_url, "OK", True, rcp_atc, method, "")
+                    else:
+                        append_atc_rcp_report(cis, rcp_url, "OK", False, "", method, "not found in RCP")
 
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
@@ -1149,6 +1312,7 @@ def main():
 
             except PageUnavailable as e:
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
+                append_atc_rcp_report(cis, fiche_url, "FICHE_INFO_KO", False, "", "fiche_info", e.detail)
 
                 if updates:
                     at.update_records(updates)
@@ -1167,6 +1331,7 @@ def main():
             except Exception as e:
                 failures += 1
                 warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
+                append_atc_rcp_report(cis, fiche_url, "FICHE_INFO_ERR", False, "", "fiche_info", str(e)[:200])
 
         if upd_fields:
             upd_fields.pop(FIELD_ATC4, None)  # sécurité
@@ -1181,14 +1346,14 @@ def main():
             elapsed = time.time() - start
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
-            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | reste ~{int(remaining)}s")
+            info(f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK} | reste ~{int(remaining)}s")
 
     if updates:
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
     try_git_commit_report()
-    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapport: {report_path_today()}")
+    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | RCP checks: {rcp_checks_done}/{MAX_RCP_CHECK} | rapports: {report_path_today()} + {report_atc_rcp_path_today()}")
 
 if __name__ == "__main__":
     main()
