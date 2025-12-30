@@ -15,6 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install system deps (OCR + PDF rendering)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra poppler-utils
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -25,10 +30,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run import (download + inventory + enrich)
+      - name: Run import (download + inventory + enrich + OCR fallback)
         env:
           AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
+          # OCR controls (optionnels)
+          OCR_ENABLE: "1"
+          OCR_MAX_PAGES: "2"
+          OCR_DPI: "200"
         run: |
           python scripts/import_and_enrich_bdpm_to_airtable.py
+
+      - name: Upload reports (PDF/OCR)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: reports/*
