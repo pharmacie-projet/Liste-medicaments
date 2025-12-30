@@ -230,35 +230,32 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC HELPERS
+# ATC HELPERS (sans normalisation lourde)
 # ============================================================
 
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
-# pattern tolérant (avec espaces) ex "C10A A07" ou "N05A H03."
-ATC7_FLEX_PAT = re.compile(r"\b([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})\b")
-ATC7_NEAR_ATC_WORD = re.compile(r"\bATC\b[^A-Z0-9]{0,40}([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
+# capture tolérante: "C10A A07", "C 10 A A 07", "N05A H03", etc.
+ATC7_FLEX_PAT = re.compile(r"\b([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})\b")
+ATC7_NEAR_ATC_WORD = re.compile(r"\bATC\b[^A-Z0-9]{0,60}([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
 
-def normalize_atc7(raw: str) -> str:
-    """Retourne un ATC7 normalisé (sans espaces/ponctuation) si détectable, sinon ''."""
-    if not raw:
+def atc_compact(s: str) -> str:
+    """Compactage MINIMAL (comparaison uniquement) : retire espaces/ponctuation."""
+    if not s:
         return ""
-    s = safe_text(raw).upper()
-    s = s.replace("\u00a0", " ")  # nbsp
-    # enlève ponctuation fréquente après le code
-    s = s.replace(".", " ").replace(";", " ").replace(",", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    m = ATC7_FLEX_PAT.search(s)
-    if m:
-        code = re.sub(r"\s+", "", m.group(1))
-        return code if ATC7_PAT.fullmatch(code) else ""
-    s2 = re.sub(r"[^A-Z0-9]", "", s)
-    return s2 if ATC7_PAT.fullmatch(s2) else ""
+    return re.sub(r"[^A-Z0-9]", "", safe_text(s).upper())
+
+def atc_display(s: str) -> str:
+    """Ce qu'on écrit dans Airtable : conserve les espaces mais nettoie l'espacement."""
+    if not s:
+        return ""
+    x = safe_text(s).upper().replace("\u00a0", " ")
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
 
 def atc_level4_from_any(atc: str) -> str:
-    a = (atc or "").strip().upper()
-    a = a.replace(" ", "")
+    a = atc_compact(atc)
     if ATC7_PAT.fullmatch(a):
         return a[:5]
     if ATC5_PAT.fullmatch(a):
@@ -689,7 +686,7 @@ NEGATION_PAT = re.compile(
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
-CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
+CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
 
 class PageUnavailable(Exception):
     def __init__(self, url: str, status: Optional[int], detail: str):
@@ -789,20 +786,22 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
     return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
 def extract_atc_from_text_blob(text: str) -> str:
-    """ATC depuis un texte (HTML->text ou PDF->text), tolérant espaces."""
+    """
+    ATC depuis un texte (HTML->text ou PDF->text).
+    ==> On renvoie tel quel (avec espaces), juste espacement nettoyé.
+    """
     if not text:
         return ""
     t = text.replace("\u00a0", " ")
+
     m = ATC7_NEAR_ATC_WORD.search(t)
     if m:
-        code = normalize_atc7(m.group(1))
-        if code:
-            return code
+        return atc_display(m.group(1))
+
     m2 = ATC7_FLEX_PAT.search(t)
     if m2:
-        code = normalize_atc7(m2.group(1))
-        if code:
-            return code
+        return atc_display(m2.group(1))
+
     return ""
 
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
@@ -814,13 +813,13 @@ def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[st
         atc = ""
         m_atc = CODE_ATC_INLINE_PAT.search(ln)
         if m_atc:
-            atc = normalize_atc7(m_atc.group(1)) or ""
+            atc = atc_display(m_atc.group(1)) or ""
 
         s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
         s = s.lstrip(":").strip()
-        s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\d{2}\s*[A-Z]{2}\s*\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
+        s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
 
-        if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\d{2}\s*[A-Z]{2}\s*\d{2}\.?", s, flags=re.IGNORECASE):
+        if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2}\.?", s, flags=re.IGNORECASE):
             s = ""
 
         return s, atc
@@ -889,7 +888,7 @@ def _resolve_and_validate_pdf(url: str) -> str:
         ct = (r.headers.get("content-type") or "").lower()
         if "application/pdf" in ct:
             return r.url
-        head = r.raw.read(5)  # lit quelques octets
+        head = r.raw.read(5)
         if _looks_like_pdf_bytes(head):
             return r.url
     except Exception:
@@ -947,14 +946,6 @@ def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     return out
 
 def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
-    """
-    Sur tab=rcp-et-notice, le lien est parfois chargé côté navigateur.
-    On cherche dans:
-      - le HTML brut (regex .pdf)
-      - les balises <a>, <iframe>, <embed>, <object>
-      - si on trouve une page EMA HTML, on l'ouvre et on re-extrait un .pdf
-      - on valide en vérifiant content-type ou signature %PDF
-    """
     if rcp_notice_url.lower().split("?")[0].endswith(".pdf"):
         return _resolve_and_validate_pdf(rcp_notice_url)
 
@@ -1003,11 +994,11 @@ def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
     Extraction ATC robuste:
     - PyMuPDF si dispo (page par page, rapide)
     - fallback pypdf si dispo
+    => renvoie ATC tel quel (avec espaces)
     """
     if not pdf_bytes:
         return ""
 
-    # 1) PyMuPDF (recommandé)
     if fitz is not None:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1021,7 +1012,6 @@ def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
         except Exception:
             return ""
 
-    # 2) fallback pypdf
     if PdfReader is not None:
         try:
             from io import BytesIO
@@ -1044,7 +1034,7 @@ def get_atc_from_pdf_url(pdf_url: str) -> str:
         b = download_bytes(pdf_url, timeout_s=160.0)
     except Exception:
         return ""
-    return normalize_atc7(extract_atc_from_pdf_bytes(b))
+    return extract_atc_from_pdf_bytes(b)
 
 # ============================================================
 # DISPONIBILITE
@@ -1168,8 +1158,8 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    if fitz is None:
-        warn("PyMuPDF (fitz) indisponible -> extraction ATC PDF très limitée (installe PyMuPDF).")
+    if fitz is None and PdfReader is None:
+        warn("Ni PyMuPDF (fitz) ni pypdf disponibles -> extraction ATC PDF impossible (installe PyMuPDF).")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
@@ -1374,9 +1364,12 @@ def main():
 
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
-        cur_atc = normalize_atc7(str(fields_cur.get(FIELD_ATC, "")).strip())
 
-        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
+        # IMPORTANT : on garde le ATC en l'état (avec espaces)
+        cur_atc_raw = atc_display(str(fields_cur.get(FIELD_ATC, "")).strip())
+        cur_atc_cmp = atc_compact(cur_atc_raw)
+
+        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc_cmp)
         is_retro = cis in ansm_retro_cis
 
         if need_fetch_fiche:
@@ -1386,36 +1379,39 @@ def main():
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
-                atc_code_norm = normalize_atc7(atc_code)
+                atc_code_disp = atc_display(atc_code)
+                atc_code_cmp = atc_compact(atc_code_disp)
 
                 # fallback RCP HTML
-                if not atc_code_norm and not cur_atc:
+                if not atc_code_cmp and not cur_atc_cmp:
                     rcp_checks += 1
                     atc_from_rcp_html = analyze_rcp_html_for_atc(rcp_html_url)
-                    atc_code_norm = normalize_atc7(atc_from_rcp_html)
+                    atc_code_disp = atc_display(atc_from_rcp_html)
+                    atc_code_cmp = atc_compact(atc_code_disp)
 
                 # fallback PDF
                 pdf_url_used = ""
-                if not atc_code_norm and not cur_atc:
+                if not atc_code_cmp and not cur_atc_cmp:
                     rcp_checks += 1
                     pdf_url = find_pdf_url_from_rcp_notice_page(rcp_notice_url)
                     if pdf_url:
                         pdf_checks += 1
                         pdf_url_used = pdf_url
                         atc_from_pdf = get_atc_from_pdf_url(pdf_url)
-                        atc_code_norm = normalize_atc7(atc_from_pdf)
-                        if atc_code_norm:
+                        atc_code_disp = atc_display(atc_from_pdf)
+                        atc_code_cmp = atc_compact(atc_code_disp)
+                        if atc_code_cmp:
                             pdf_hits += 1
 
                 # update ATC + report si PDF
-                if atc_code_norm and atc_code_norm != cur_atc:
-                    upd_fields[FIELD_ATC] = atc_code_norm
+                if atc_code_cmp and atc_code_cmp != cur_atc_cmp:
+                    upd_fields[FIELD_ATC] = atc_code_disp  # <= écrit tel quel (avec espaces)
                     if pdf_url_used:
                         pdf_atc_added += 1
-                        append_pdf_atc_report(cis=cis, atc=atc_code_norm, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
+                        append_pdf_atc_report(cis=cis, atc=atc_code_disp, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
 
-                # Libellé ATC immédiat
-                atc_for_label = atc_code_norm or cur_atc
+                # Libellé ATC immédiat (calculé sur version compactée)
+                atc_for_label = atc_code_disp or cur_atc_raw
                 if atc_for_label:
                     atc4_tmp = atc_level4_from_any(atc_for_label)
                     if atc4_tmp:
