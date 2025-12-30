@@ -37,7 +37,7 @@ jobs:
           AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
           # OCR controls (optionnels)
           OCR_ENABLE: "1"
-          OCR_MAX_PAGES: "2"
+          OCR_MAX_PAGES: "25"
           OCR_DPI: "200"
         run: |
           python scripts/import_and_enrich_bdpm_to_airtable.py
