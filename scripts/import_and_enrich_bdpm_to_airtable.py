@@ -230,32 +230,64 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC HELPERS (sans normalisation lourde)
+# ATC HELPERS
 # ============================================================
 
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
-# capture tolérante: "C10A A07", "C 10 A A 07", "N05A H03", etc.
-ATC7_FLEX_PAT = re.compile(r"\b([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})\b")
-ATC7_NEAR_ATC_WORD = re.compile(r"\bATC\b[^A-Z0-9]{0,60}([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
+# >>> NOUVEAU: pattern ultra tolérant (espaces entre chaque caractère)
+ATC7_ANY_FLEX_PAT = re.compile(r"\b([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)\b", re.IGNORECASE)
+ATC7_NEAR_ATC_WORD = re.compile(
+    r"(?:\bATC\b|code\s*ATC|ATC\s*code)\s*[:\-]?\s*([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)",
+    re.IGNORECASE
+)
 
-def atc_compact(s: str) -> str:
-    """Compactage MINIMAL (comparaison uniquement) : retire espaces/ponctuation."""
-    if not s:
+def canonical_atc7(raw: str) -> str:
+    """Retourne un ATC7 canonique (sans espaces/ponctuation) si valide, sinon ''."""
+    if not raw:
         return ""
-    return re.sub(r"[^A-Z0-9]", "", safe_text(s).upper())
+    s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    return s if ATC7_PAT.fullmatch(s) else ""
 
-def atc_display(s: str) -> str:
-    """Ce qu'on écrit dans Airtable : conserve les espaces mais nettoie l'espacement."""
-    if not s:
+def format_atc_like_found(found: str) -> str:
+    """
+    Si le texte trouvé contient au moins un espace/retour/ponctuation -> renvoie 'XXXX XXX' (format espace).
+    Sinon -> renvoie 'XXXXXXX'.
+    """
+    canon = canonical_atc7(found)
+    if not canon:
         return ""
-    x = safe_text(s).upper().replace("\u00a0", " ")
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
+    has_separator = bool(re.search(r"\s|\.", found))
+    return f"{canon[:4]} {canon[4:]}" if has_separator else canon
+
+def extract_atc_from_text_blob(text: str) -> str:
+    """
+    ATC depuis un texte (HTML brut, HTML->text, PDF->text) :
+    - match avec ou sans espace/ponctuation
+    - retourne 'C10A A07' si écrit avec séparateur, sinon 'C10AA07'
+    """
+    if not text:
+        return ""
+    t = (text or "").replace("\u00a0", " ")
+
+    m = ATC7_NEAR_ATC_WORD.search(t)
+    if m:
+        out = format_atc_like_found(m.group(1))
+        if out:
+            return out
+
+    m2 = ATC7_ANY_FLEX_PAT.search(t)
+    if m2:
+        out = format_atc_like_found(m2.group(1))
+        if out:
+            return out
+
+    return ""
 
 def atc_level4_from_any(atc: str) -> str:
-    a = atc_compact(atc)
+    a = (atc or "").strip().upper()
+    a = a.replace(" ", "")
     if ATC7_PAT.fullmatch(a):
         return a[:5]
     if ATC5_PAT.fullmatch(a):
@@ -302,6 +334,7 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 
 # ============================================================
 # COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
+# (INCHANGÉ)
 # ============================================================
 
 _NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
@@ -499,7 +532,7 @@ def download_bytes(url: str, timeout_s: float = 140.0) -> bytes:
     return r.content
 
 # ============================================================
-# ANSM retrocession
+# ANSM retrocession (INCHANGÉ)
 # ============================================================
 
 def find_ansm_retro_excel_link() -> str:
@@ -575,7 +608,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
     return cis_set
 
 # ============================================================
-# BDPM PARSE (CIS, CIP)
+# BDPM PARSE (CIS, CIP) (INCHANGÉ)
 # ============================================================
 
 @dataclass
@@ -671,7 +704,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING + ATC
+# FICHE-INFO SCRAPING + ATC (INCHANGÉ sauf extraction ATC)
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -686,7 +719,12 @@ NEGATION_PAT = re.compile(
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
-CODE_ATC_INLINE_PAT = re.compile(r"code\s+ATC\s*[:\-]\s*([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
+
+# >>> MODIF: capture flex (espaces possibles)
+CODE_ATC_INLINE_PAT = re.compile(
+    r"code\s+ATC\s*[:\-]?\s*([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)",
+    re.IGNORECASE
+)
 
 class PageUnavailable(Exception):
     def __init__(self, url: str, status: Optional[int], detail: str):
@@ -785,25 +823,6 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
 
     return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
-def extract_atc_from_text_blob(text: str) -> str:
-    """
-    ATC depuis un texte (HTML->text ou PDF->text).
-    ==> On renvoie tel quel (avec espaces), juste espacement nettoyé.
-    """
-    if not text:
-        return ""
-    t = text.replace("\u00a0", " ")
-
-    m = ATC7_NEAR_ATC_WORD.search(t)
-    if m:
-        return atc_display(m.group(1))
-
-    m2 = ATC7_FLEX_PAT.search(t)
-    if m2:
-        return atc_display(m2.group(1))
-
-    return ""
-
 def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
     for ln in lines:
@@ -813,15 +832,10 @@ def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[st
         atc = ""
         m_atc = CODE_ATC_INLINE_PAT.search(ln)
         if m_atc:
-            atc = atc_display(m_atc.group(1)) or ""
+            atc = format_atc_like_found(m_atc.group(1)) or ""
 
         s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
         s = s.lstrip(":").strip()
-        s = re.sub(r"[–\-]\s*code\s+ATC\s*[:\-]\s*[A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2}\.?\s*$", "", s, flags=re.IGNORECASE).strip()
-
-        if re.fullmatch(r"code\s+ATC\s*[:\-]\s*[A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2}\.?", s, flags=re.IGNORECASE):
-            s = ""
-
         return s, atc
 
     return "", ""
@@ -868,7 +882,7 @@ def analyze_rcp_html_for_atc(rcp_url: str) -> str:
     return extract_atc_from_text_blob(text)
 
 # ============================================================
-# PDF (RCP/EMA) -> trouver URL PDF + extraire ATC
+# PDF (RCP/EMA) -> trouver URL PDF + extraire ATC (INCHANGÉ sauf extraction ATC)
 # ============================================================
 
 PDF_URL_RE = re.compile(r'(https?:\/\/[^\s"\'<>]+\.pdf)', re.IGNORECASE)
@@ -888,7 +902,7 @@ def _resolve_and_validate_pdf(url: str) -> str:
         ct = (r.headers.get("content-type") or "").lower()
         if "application/pdf" in ct:
             return r.url
-        head = r.raw.read(5)
+        head = r.raw.read(5)  # lit quelques octets
         if _looks_like_pdf_bytes(head):
             return r.url
     except Exception:
@@ -990,15 +1004,10 @@ def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
     return ""
 
 def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
-    """
-    Extraction ATC robuste:
-    - PyMuPDF si dispo (page par page, rapide)
-    - fallback pypdf si dispo
-    => renvoie ATC tel quel (avec espaces)
-    """
     if not pdf_bytes:
         return ""
 
+    # PyMuPDF
     if fitz is not None:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1012,6 +1021,7 @@ def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
         except Exception:
             return ""
 
+    # fallback pypdf
     if PdfReader is not None:
         try:
             from io import BytesIO
@@ -1037,7 +1047,7 @@ def get_atc_from_pdf_url(pdf_url: str) -> str:
     return extract_atc_from_pdf_bytes(b)
 
 # ============================================================
-# DISPONIBILITE
+# DISPONIBILITE (INCHANGÉ)
 # ============================================================
 
 def compute_disponibilite(
@@ -1065,7 +1075,7 @@ def compute_disponibilite(
     return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
-# AIRTABLE CLIENT
+# AIRTABLE CLIENT (INCHANGÉ)
 # ============================================================
 
 class AirtableClient:
@@ -1143,7 +1153,7 @@ class AirtableClient:
             self._request("DELETE", self.table_url, params=params)
 
 # ============================================================
-# MAIN
+# MAIN (MODIF: n’écrit ATC QUE si champ Airtable vide)
 # ============================================================
 
 def main():
@@ -1158,8 +1168,8 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    if fitz is None and PdfReader is None:
-        warn("Ni PyMuPDF (fitz) ni pypdf disponibles -> extraction ATC PDF impossible (installe PyMuPDF).")
+    if fitz is None:
+        warn("PyMuPDF (fitz) indisponible -> extraction ATC PDF très limitée (installe PyMuPDF).")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
@@ -1303,7 +1313,10 @@ def main():
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}")
+            info(
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks} | "
+                f"PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}"
+            )
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1365,11 +1378,11 @@ def main():
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
 
-        # IMPORTANT : on garde le ATC en l'état (avec espaces)
-        cur_atc_raw = atc_display(str(fields_cur.get(FIELD_ATC, "")).strip())
-        cur_atc_cmp = atc_compact(cur_atc_raw)
+        # >>> MODIF: ATC est "vide" si aucun contenu (on ne compare pas/écrase pas si déjà présent)
+        cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
+        atc_is_blank = (cur_atc_raw == "")
 
-        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc_cmp)
+        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or atc_is_blank
         is_retro = cis in ansm_retro_cis
 
         if need_fetch_fiche:
@@ -1379,45 +1392,40 @@ def main():
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
-                atc_code_disp = atc_display(atc_code)
-                atc_code_cmp = atc_compact(atc_code_disp)
+                # >>> MODIF: on ne cherche/écrit l’ATC QUE si champ Airtable vide
+                atc_found = ""
+                if atc_is_blank:
+                    atc_found = atc_code.strip()
+                    # fallback RCP HTML
+                    if not canonical_atc7(atc_found):
+                        rcp_checks += 1
+                        atc_found = analyze_rcp_html_for_atc(rcp_html_url).strip()
 
-                # fallback RCP HTML
-                if not atc_code_cmp and not cur_atc_cmp:
-                    rcp_checks += 1
-                    atc_from_rcp_html = analyze_rcp_html_for_atc(rcp_html_url)
-                    atc_code_disp = atc_display(atc_from_rcp_html)
-                    atc_code_cmp = atc_compact(atc_code_disp)
+                    # fallback PDF
+                    pdf_url_used = ""
+                    if not canonical_atc7(atc_found):
+                        pdf_url = find_pdf_url_from_rcp_notice_page(rcp_notice_url)
+                        if pdf_url:
+                            pdf_checks += 1
+                            pdf_url_used = pdf_url
+                            atc_from_pdf = get_atc_from_pdf_url(pdf_url)
+                            atc_found = (atc_from_pdf or "").strip()
+                            if canonical_atc7(atc_found):
+                                pdf_hits += 1
 
-                # fallback PDF
-                pdf_url_used = ""
-                if not atc_code_cmp and not cur_atc_cmp:
-                    rcp_checks += 1
-                    pdf_url = find_pdf_url_from_rcp_notice_page(rcp_notice_url)
-                    if pdf_url:
-                        pdf_checks += 1
-                        pdf_url_used = pdf_url
-                        atc_from_pdf = get_atc_from_pdf_url(pdf_url)
-                        atc_code_disp = atc_display(atc_from_pdf)
-                        atc_code_cmp = atc_compact(atc_code_disp)
-                        if atc_code_cmp:
-                            pdf_hits += 1
+                    # écriture si valide
+                    if canonical_atc7(atc_found):
+                        upd_fields[FIELD_ATC] = atc_found
+                        if pdf_url_used:
+                            pdf_atc_added += 1
+                            append_pdf_atc_report(cis=cis, atc=atc_found, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
 
-                # update ATC + report si PDF
-                if atc_code_cmp and atc_code_cmp != cur_atc_cmp:
-                    upd_fields[FIELD_ATC] = atc_code_disp  # <= écrit tel quel (avec espaces)
-                    if pdf_url_used:
-                        pdf_atc_added += 1
-                        append_pdf_atc_report(cis=cis, atc=atc_code_disp, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
-
-                # Libellé ATC immédiat (calculé sur version compactée)
-                atc_for_label = atc_code_disp or cur_atc_raw
-                if atc_for_label:
-                    atc4_tmp = atc_level4_from_any(atc_for_label)
-                    if atc4_tmp:
-                        label = atc_labels.get(atc4_tmp, "")
-                        if label and label != cur_label:
-                            upd_fields[FIELD_ATC_LABEL] = label
+                        # libellé ATC immédiat
+                        atc4_tmp = atc_level4_from_any(atc_found)
+                        if atc4_tmp:
+                            label = atc_labels.get(atc4_tmp, "")
+                            if label and label != cur_label:
+                                upd_fields[FIELD_ATC_LABEL] = label
 
                 # dispo
                 has_taux = cip.has_taux if cip else False
