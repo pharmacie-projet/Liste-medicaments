@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Config (modifiable si besoin) ----------
+# ---------- Config ----------
 AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_CIS_TABLE_NAME", "")
@@ -19,11 +19,7 @@ FIELD_RCP_LINK = os.getenv("AIRTABLE_FIELD_RCP_LINK", "Lien vers RCP")
 FIELD_SPECIALITE = os.getenv("AIRTABLE_FIELD_SPECIALITE", "Spécialité")  # optionnel
 FIELD_ATC_LABEL = os.getenv("AIRTABLE_FIELD_ATC_LABEL", "Libellé ATC")  # optionnel
 
-# Si tu as un mapping ATC->Libellé dans un CSV local (optionnel)
-# Format attendu: atc_code,label
-ATC_MAPPING_CSV = os.getenv("ATC_MAPPING_CSV", "")  # ex: "data/atc_equivalence.csv"
-
-# Throttle pour éviter d'être bloqué
+ATC_MAPPING_CSV = os.getenv("ATC_MAPPING_CSV", "")  # optionnel (csv atc_code,label)
 REQUEST_SLEEP_SEC = float(os.getenv("REQUEST_SLEEP_SEC", "0.15"))
 
 USER_AGENT = os.getenv(
@@ -140,14 +136,14 @@ def fetch_html_text(sess: requests.Session, url: str, timeout: int = 25) -> Opti
 
 def extract_atc_from_html(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "lxml")
-    # On récupère du texte “plat”
     text = soup.get_text(" ", strip=True)
     return extract_atc_from_text(text)
 
 
-def find_pdf_url_in_html(base_url: str, html: str) -> Optional[str]:
+def find_pdf_url_in_html(sess: requests.Session, base_url: str, html: str) -> Optional[str]:
     """
-    Cherche un lien PDF direct ou un lien EMA qui mène à un PDF.
+    Cherche un lien PDF direct ou un lien EMA/ANSM menant à un PDF.
+    (corrigé: sess passé en paramètre)
     """
     soup = BeautifulSoup(html, "lxml")
     links = []
@@ -167,11 +163,11 @@ def find_pdf_url_in_html(base_url: str, html: str) -> Optional[str]:
     # 2) Liens “Vers le RCP” / “RCP et notice” / EMA
     priority = []
     for label, u in links:
-        if "rcp" in label or "notice" in label or "product-information" in u or "ema.europa.eu" in u:
+        if ("rcp" in label) or ("notice" in label) or ("product-information" in u) or ("ema.europa.eu" in u):
             priority.append(u)
 
-    # 3) Si pas trouvé: on tente de suivre un lien prioritaire et trouver un PDF dedans
-    for u in priority[:10]:
+    # 3) Suivre quelques liens prioritaires et trouver un PDF dedans
+    for u in priority[:12]:
         if u.lower().endswith(".pdf"):
             return u
         try:
@@ -180,7 +176,7 @@ def find_pdf_url_in_html(base_url: str, html: str) -> Optional[str]:
             continue
         if not html2:
             continue
-        pdf = find_pdf_url_in_html(u, html2)
+        pdf = find_pdf_url_in_html(sess, u, html2)
         if pdf:
             return pdf
 
@@ -202,12 +198,11 @@ def extract_atc_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Optional[str], Optiona
         text = page.get_text("text") or ""
         atc = extract_atc_from_text(text)
         if atc:
-            # Contexte court pour le rapport
             idx = text.lower().find("atc")
             snippet = None
             if idx != -1:
-                start = max(0, idx - 80)
-                end = min(len(text), idx + 120)
+                start = max(0, idx - 90)
+                end = min(len(text), idx + 160)
                 snippet = re.sub(r"\s+", " ", text[start:end]).strip()
             return atc, i + 1, snippet
     return None, None, None
@@ -220,9 +215,13 @@ def airtable_list_records(sess: requests.Session) -> List[dict]:
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_TOKEN}"}
 
+    # Filtre: seulement les lignes où ATC est vide (=> beaucoup moins d'appels)
+    filter_formula = f"AND({{{FIELD_CIS}}}!='', OR({{{FIELD_ATC}}}='', {{"+FIELD_ATC+"}}=BLANK()))"
+
     params = {
         "pageSize": 100,
-        "fields[]": [FIELD_CIS, FIELD_ATC, FIELD_RCP_LINK, FIELD_SPECIALITE]
+        "filterByFormula": filter_formula,
+        "fields[]": [FIELD_CIS, FIELD_ATC, FIELD_RCP_LINK, FIELD_SPECIALITE],
     }
 
     records = []
@@ -244,7 +243,6 @@ def airtable_batch_update(sess: requests.Session, updates: List[dict]) -> None:
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_TOKEN}", "Content-Type": "application/json"}
 
-    # Airtable: max 10 par batch
     for i in range(0, len(updates), 10):
         chunk = updates[i:i+10]
         payload = {"records": chunk}
@@ -273,7 +271,7 @@ def load_atc_mapping() -> Dict[str, str]:
 
 def bdm_urls(cis: str) -> Dict[str, str]:
     base = f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/"
-    fiche_info = base  # page principale
+    fiche_info = base
     rcp_html = urljoin(base, "extrait?tab=rcp")
     rcp_notice = urljoin(base, "extrait?tab=rcp-et-notice")
     return {"fiche_info": fiche_info, "rcp_html": rcp_html, "rcp_notice": rcp_notice}
@@ -281,28 +279,19 @@ def bdm_urls(cis: str) -> Dict[str, str]:
 
 def main():
     if PDF_ENGINE != "pymupdf":
-        log("[ERREUR] PyMuPDF non dispo => impossible de lire les PDF. Vérifie requirements.txt (PyMuPDF==...).")
+        log("[ERREUR] PyMuPDF non dispo => impossible de lire les PDF. Ajoute PyMuPDF==1.24.14 dans requirements.txt")
         raise SystemExit(1)
 
     sess = requests_session()
     atc_map = load_atc_mapping()
 
-    log("📥 Lecture Airtable ...")
-    records = airtable_list_records(sess)
-    log(f"[OK] Records: {len(records)}")
-
-    missing = []
-    for rec in records:
-        fields = rec.get("fields", {})
-        atc = (fields.get(FIELD_ATC) or "").strip()
-        cis = str(fields.get(FIELD_CIS) or "").strip()
-        if cis and not atc:
-            missing.append(rec)
-
+    log("📥 Lecture Airtable (lignes sans ATC) ...")
+    missing = airtable_list_records(sess)
     log(f"🔎 Lignes sans ATC: {len(missing)}")
 
     updates = []
-    pdf_report_rows = []  # uniquement ceux ajoutés depuis PDF
+    pdf_report_rows = []
+
     rcp_checks = 0
     pdf_checks = 0
     pdf_hits = 0
@@ -325,7 +314,7 @@ def main():
         page_no = None
         snippet = None
 
-        # 1) Essai RCP HTML (BDPM)
+        # 1) RCP HTML
         try:
             html = fetch_html_text(sess, urls["rcp_html"])
             rcp_checks += 1
@@ -337,47 +326,46 @@ def main():
         except Exception:
             pass
 
-        # 2) Si pas trouvé: chercher PDF (dans fiche info ou rcp_notice)
+        # 2) Sinon: PDF (fiche-info / rcp-et-notice / lien Airtable)
         if not found_atc:
             pdf_url = None
 
-            # a) si tu as un champ “Lien vers RCP” dans Airtable, on l’utilise comme indice
             link_rcp = (fields.get(FIELD_RCP_LINK) or "").strip()
-            if link_rcp and link_rcp.startswith("//"):
+            if link_rcp.startswith("//"):
                 link_rcp = "https:" + link_rcp
 
-            # b) on scrape fiche-info
             try:
                 html_fiche = fetch_html_text(sess, urls["fiche_info"])
                 if html_fiche:
-                    pdf_url = find_pdf_url_in_html(urls["fiche_info"], html_fiche)
+                    pdf_url = find_pdf_url_in_html(sess, urls["fiche_info"], html_fiche)
             except Exception:
-                html_fiche = None
+                pass
 
-            # c) si pas trouvé, on scrape l’onglet rcp-et-notice
             if not pdf_url:
                 try:
                     html_notice = fetch_html_text(sess, urls["rcp_notice"])
                     if html_notice:
-                        pdf_url = find_pdf_url_in_html(urls["rcp_notice"], html_notice)
+                        pdf_url = find_pdf_url_in_html(sess, urls["rcp_notice"], html_notice)
                 except Exception:
-                    html_notice = None
+                    pass
 
-            # d) si lien Airtable semble utile, on tente aussi
             if not pdf_url and link_rcp and is_http_url(link_rcp):
                 try:
                     html_lr = fetch_html_text(sess, link_rcp)
                     if html_lr:
-                        pdf_url = find_pdf_url_in_html(link_rcp, html_lr) or (link_rcp if link_rcp.lower().endswith(".pdf") else None)
+                        pdf_url = find_pdf_url_in_html(sess, link_rcp, html_lr)
+                    if not pdf_url and link_rcp.lower().endswith(".pdf"):
+                        pdf_url = link_rcp
                 except Exception:
                     pass
 
-            # 3) Téléchargement PDF + extraction
+            # Téléchargement + extraction
             if pdf_url:
                 try:
                     time.sleep(REQUEST_SLEEP_SEC)
                     r = sess.get(pdf_url, timeout=60, allow_redirects=True)
-                    if r.status_code < 400 and (r.headers.get("content-type", "").lower().find("pdf") != -1 or pdf_url.lower().endswith(".pdf")):
+                    ctype = (r.headers.get("content-type", "") or "").lower()
+                    if r.status_code < 400 and (("pdf" in ctype) or pdf_url.lower().endswith(".pdf")):
                         pdf_checks += 1
                         found_atc, page_no, snippet = extract_atc_from_pdf_bytes(r.content)
                         if found_atc:
@@ -389,7 +377,7 @@ def main():
 
         if found_atc:
             payload_fields = {FIELD_ATC: found_atc}
-            # libellé si mapping dispo
+
             if atc_map.get(found_atc) and FIELD_ATC_LABEL:
                 payload_fields[FIELD_ATC_LABEL] = atc_map[found_atc]
 
@@ -405,12 +393,11 @@ def main():
                     "page": str(page_no or ""),
                     "snippet": snippet or ""
                 })
-
-                log(f"[PDF ✅] CIS={cis} ATC={found_atc} page={page_no} {source_url}")
+                log(f"[PDF ✅] CIS={cis} ATC={found_atc} page={page_no}")
             else:
                 log(f"[HTML ✅] CIS={cis} ATC={found_atc}")
 
-        # batch update toutes les 50 trouvailles pour éviter de tout perdre si crash
+        # Push Airtable par paquets
         if len(updates) >= 50:
             airtable_batch_update(sess, updates)
             updates = []
@@ -418,11 +405,9 @@ def main():
         if idx % 100 == 0:
             log(f"Heartbeat: {idx}/{len(missing)} | RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | ATC added: {atc_added}")
 
-    # flush final
     if updates:
         airtable_batch_update(sess, updates)
 
-    # Rapport PDF
     os.makedirs("reports", exist_ok=True)
     report_path = "reports/atc_added_from_pdf.csv"
     with open(report_path, "w", newline="", encoding="utf-8") as f:
