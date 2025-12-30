@@ -29,7 +29,7 @@ BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
-# NOUVEAU: Equivalence CIS -> ATC depuis le fichier MITM
+# Equivalence CIS -> ATC depuis le fichier MITM
 BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
@@ -61,7 +61,7 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
-# Champs Airtable (adapte ici si besoin)
+# Champs Airtable
 FIELD_CIS = "Code cis"
 FIELD_RCP = "Lien vers RCP"
 FIELD_CIP13 = "CIP 13"
@@ -74,7 +74,8 @@ FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
-FIELD_COMPOSITION = "Composition"        # champ à écrire
+FIELD_COMPOSITION = "Composition"        # champ à écrire (avec accents + parfois sans accents en 2e ligne)
+FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (avec accents uniquement)
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
@@ -270,8 +271,7 @@ def parse_bdpm_mitm_cis_atc(txt: str) -> Dict[str, str]:
     Fichier CIS_MITM.txt : attendu (tab):
       col0 = CIS (8 chiffres)
       col1 = ATC (souvent ATC7)
-      col2 = libellé spécialité (optionnel)
-      col3 = url extrait (optionnel)
+      autres colonnes possibles (ignorées)
     """
     out: Dict[str, str] = {}
     for line in (txt or "").splitlines():
@@ -917,7 +917,7 @@ def main():
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
-    # 1) NOUVEAU: Télécharger CIS_MITM au début (CIS -> ATC)
+    # Télécharger CIS_MITM au début (CIS -> ATC)
     info("Téléchargement BDPM MITM (CIS -> ATC) ...")
     mitm_txt = download_text(BDPM_MITM_URL, encoding="latin-1")
     ok(f"BDPM MITM OK ({len(mitm_txt)} chars)")
@@ -961,9 +961,10 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,        # lecture
-        FIELD_ATC_LABEL,   # écriture possible
-        FIELD_COMPOSITION, # écriture
+        FIELD_ATC4,                 # lecture
+        FIELD_ATC_LABEL,            # écriture possible
+        FIELD_COMPOSITION,          # écriture
+        FIELD_COMPOSITION_DETAILS,  # écriture
     ]
 
     info("Inventaire Airtable ...")
@@ -1015,8 +1016,13 @@ def main():
                     if label:
                         fields[FIELD_ATC_LABEL] = label
 
+            # Composition + Composition détails
             compo = compo_map.get(cis, "").strip()
             if compo:
+                # Détails = avec accents uniquement
+                fields[FIELD_COMPOSITION_DETAILS] = compo
+
+                # Composition = avec accents + éventuellement sans accents (2e ligne)
                 compo_no_acc = strip_accents(compo)
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
@@ -1059,7 +1065,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: ATC via MITM + fiche-info (CPD/dispo) + libellé ATC + composition ...")
+    info("Enrichissement: ATC via MITM + fiche-info (CPD/dispo) + libellé ATC + compositions ...")
 
     updates = []
     failures = 0
@@ -1077,7 +1083,7 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields: Dict[str, str] = {}
 
-        # 1) ATC depuis MITM (sans RCP/notice/PDF/OCR)
+        # 1) ATC depuis MITM
         atc_mitm = mitm_atc_map.get(cis, "")
         cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
         if atc_mitm and (force_refresh or not cur_atc or canonical_atc7(cur_atc) != atc_mitm):
@@ -1091,15 +1097,23 @@ def main():
                 if label and label != cur_label:
                     upd_fields[FIELD_ATC_LABEL] = label
 
-        # 2) Composition
+        # 2) Composition + Composition détails
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
+        cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
+
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
+            # Détails = toujours la version avec accents uniquement
+            if force_refresh or (not cur_compo_details) or (cur_compo_details != new_compo):
+                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
+
+            # Composition = avec accents + éventuellement sans accents (2e ligne)
             new_no_acc = strip_accents(new_compo).strip()
             final_compo = new_compo
-            if new_no_acc and new_no_acc.lower() not in cur_compo.lower():
+            if new_no_acc and new_no_acc.lower() not in new_compo.lower():
                 final_compo = f"{new_compo}\n{new_no_acc}"
-            if final_compo != cur_compo:
+
+            if force_refresh or (not cur_compo) or (cur_compo != final_compo):
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
         # 3) Libellé ATC via ATC4 computed (si ton Airtable calcule ATC4)
