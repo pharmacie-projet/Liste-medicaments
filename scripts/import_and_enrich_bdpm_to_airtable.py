@@ -21,14 +21,15 @@ try:
 except Exception:
     pd = None  # noqa
 
-# PDF extraction (fortement recommandé)
+# PDF extraction (recommandé)
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None  # type: ignore
 
+# fallback (moins fiable pour ATC, mais évite crash si pas fitz)
 try:
-    from pypdf import PdfReader  # fallback
+    from pypdf import PdfReader  # type: ignore
 except Exception:
     PdfReader = None  # type: ignore
 
@@ -47,6 +48,7 @@ AIRTABLE_API_BASE = "https://api.airtable.com/v0"
 HEADERS_WEB = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7",
 }
 
 # Airtable
@@ -85,7 +87,7 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
-    FIELD_ATC4,  # computed Airtable -> interdiction totale d'écriture
+    FIELD_ATC4,
 }
 
 # ============================================================
@@ -234,24 +236,24 @@ def _bs_parser():
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
-# pattern tolérant (avec espaces) ex "C10A A07"
+# pattern tolérant (avec espaces) ex "C10A A07" ou "N05A H03."
 ATC7_FLEX_PAT = re.compile(r"\b([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})\b")
-ATC7_NEAR_ATC_WORD = re.compile(r"\bATC\b[^A-Z0-9]{0,30}([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
+ATC7_NEAR_ATC_WORD = re.compile(r"\bATC\b[^A-Z0-9]{0,40}([A-Z]\d{2}\s*[A-Z]{2}\s*\d{2})", re.IGNORECASE)
 
 def normalize_atc7(raw: str) -> str:
-    """Retourne un ATC7 normalisé (sans espaces) si détectable, sinon ''."""
+    """Retourne un ATC7 normalisé (sans espaces/ponctuation) si détectable, sinon ''."""
     if not raw:
         return ""
     s = safe_text(raw).upper()
     s = s.replace("\u00a0", " ")  # nbsp
+    # enlève ponctuation fréquente après le code
+    s = s.replace(".", " ").replace(";", " ").replace(",", " ")
     s = re.sub(r"\s+", " ", s).strip()
-    # extraire une forme flexible
     m = ATC7_FLEX_PAT.search(s)
     if m:
-        code = m.group(1).replace(" ", "")
+        code = re.sub(r"\s+", "", m.group(1))
         return code if ATC7_PAT.fullmatch(code) else ""
-    # sinon direct
-    s2 = s.replace(" ", "")
+    s2 = re.sub(r"[^A-Z0-9]", "", s)
     return s2 if ATC7_PAT.fullmatch(s2) else ""
 
 def atc_level4_from_any(atc: str) -> str:
@@ -451,7 +453,7 @@ def base_extrait_url_from_cis(cis: str) -> str:
     return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
 def set_tab(url: str, cis_fallback: str, tab: str) -> str:
-    """Force tab=... dans query ET fragment, compatible avec les URLs BDPM (#tab=...)."""
+    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
     if not url or not url.startswith("http"):
         url = base_extrait_url_from_cis(cis_fallback)
     parts = urllib.parse.urlsplit(url)
@@ -463,7 +465,6 @@ def set_tab(url: str, cis_fallback: str, tab: str) -> str:
     if re.search(r"\btab=", frag):
         frag = re.sub(r"tab=[^&]+", f"tab={tab}", frag)
     else:
-        # Beaucoup de pages BDPM utilisent #tab=xxx
         frag = f"tab={tab}"
 
     cleaned = parts._replace(query=new_query, fragment=frag)
@@ -673,34 +674,6 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# PDF (RCP) -> extraction texte (pour trouver le code ATC)
-# Dépendance: pdfminer.six
-# ============================================================
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 0) -> str:
-    """
-    Extrait le texte d'un PDF (bytes) avec pdfminer.six.
-    max_pages=0 => toutes les pages
-    """
-    if not pdf_bytes:
-        return ""
-
-    try:
-        from io import BytesIO
-        from pdfminer.high_level import extract_text as _extract_text
-
-        # pdfminer prend un "file-like"
-        bio = BytesIO(pdf_bytes)
-
-        # maxpages=0 => toutes les pages
-        text = _extract_text(bio, maxpages=max_pages if max_pages and max_pages > 0 else 0) or ""
-        return normalize_ws_keep_lines(text)
-
-    except Exception as e:
-        warn(f"PDF text extraction failed: {e}")
-        return ""
-
-# ============================================================
 # FICHE-INFO SCRAPING + ATC
 # ============================================================
 
@@ -820,13 +793,11 @@ def extract_atc_from_text_blob(text: str) -> str:
     if not text:
         return ""
     t = text.replace("\u00a0", " ")
-    # prioritaire: motif près du mot ATC
     m = ATC7_NEAR_ATC_WORD.search(t)
     if m:
         code = normalize_atc7(m.group(1))
         if code:
             return code
-    # fallback: premier code ATC7 plausible
     m2 = ATC7_FLEX_PAT.search(t)
     if m2:
         code = normalize_atc7(m2.group(1))
@@ -885,25 +856,20 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     return cpd_text, is_homeo, reserved, usage, atc_code
 
 def analyze_rcp_html_for_atc(rcp_url: str) -> str:
-    """Récupère ATC depuis la page RCP (même si le texte est dans du HTML/JSON embarqué)."""
+    """ATC depuis la page RCP HTML."""
     try:
         html = fetch_html_checked(rcp_url, max_retries=2)
     except Exception:
         return ""
-
-    # 1) cherche dans le HTML brut (au cas où ATC est dans un JSON embarqué)
     atc = extract_atc_from_text_blob(html)
     if atc:
         return atc
-
-    # 2) cherche dans le texte rendu
     soup = BeautifulSoup(html, _bs_parser())
     text = soup.get_text("\n", strip=True)
     return extract_atc_from_text_blob(text)
 
-
 # ============================================================
-# PDF (RCP/EMA) -> extraction ATC
+# PDF (RCP/EMA) -> trouver URL PDF + extraire ATC
 # ============================================================
 
 PDF_URL_RE = re.compile(r'(https?:\/\/[^\s"\'<>]+\.pdf)', re.IGNORECASE)
@@ -913,7 +879,7 @@ def _looks_like_pdf_bytes(b: bytes) -> bool:
     return b.startswith(b"%PDF")
 
 def _resolve_and_validate_pdf(url: str) -> str:
-    """Retourne url si c'est bien un PDF (content-type ou %PDF). Sinon ''. """
+    """Retourne url finale si c'est bien un PDF (content-type ou %PDF). Sinon ''."""
     if not url:
         return ""
     try:
@@ -923,7 +889,6 @@ def _resolve_and_validate_pdf(url: str) -> str:
         ct = (r.headers.get("content-type") or "").lower()
         if "application/pdf" in ct:
             return r.url
-        # sinon vérifie la signature %PDF
         head = r.raw.read(5)  # lit quelques octets
         if _looks_like_pdf_bytes(head):
             return r.url
@@ -940,7 +905,6 @@ def _extract_pdf_urls_from_any_html(html: str) -> List[str]:
         if u.startswith("//"):
             u = "https:" + u
         urls.append(u)
-    # dédoublonne
     out = []
     seen = set()
     for u in urls:
@@ -951,8 +915,6 @@ def _extract_pdf_urls_from_any_html(html: str) -> List[str]:
 
 def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     cand = []
-
-    # a href
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href:
@@ -960,16 +922,13 @@ def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
         href = urllib.parse.urljoin(base_url, href)
         txt = (a.get_text(" ", strip=True) or "").lower()
 
-        # garde les pdf directs
         if ".pdf" in href.lower():
             cand.append(href)
             continue
 
-        # garde les liens "vers le rcp et la notice" même si pas .pdf
         if ("rcp" in txt and "notice" in txt) or ("vers le rcp" in txt) or ("product-information" in href.lower()) or ("ema.europa.eu" in href.lower()):
             cand.append(href)
 
-    # iframe/embed/object src/data
     for tag in soup.find_all(["iframe", "embed", "object"]):
         for attr in ["src", "data"]:
             v = (tag.get(attr) or "").strip()
@@ -979,7 +938,6 @@ def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
             if ".pdf" in v.lower():
                 cand.append(v)
 
-    # dédoublonne
     out = []
     seen = set()
     for u in cand:
@@ -991,13 +949,12 @@ def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
 def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
     """
     Sur tab=rcp-et-notice, le lien est parfois chargé côté navigateur.
-    On cherche donc dans:
+    On cherche dans:
       - le HTML brut (regex .pdf)
       - les balises <a>, <iframe>, <embed>, <object>
       - si on trouve une page EMA HTML, on l'ouvre et on re-extrait un .pdf
       - on valide en vérifiant content-type ou signature %PDF
     """
-    # Si déjà un PDF
     if rcp_notice_url.lower().split("?")[0].endswith(".pdf"):
         return _resolve_and_validate_pdf(rcp_notice_url)
 
@@ -1006,25 +963,21 @@ def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
     except Exception:
         return ""
 
-    # 1) PDF dans le HTML brut (souvent dans JSON embarqué)
     pdfs = _extract_pdf_urls_from_any_html(html)
     for u in pdfs:
         ok_pdf = _resolve_and_validate_pdf(u)
         if ok_pdf:
             return ok_pdf
 
-    # 2) parsing DOM
     soup = BeautifulSoup(html, _bs_parser())
     candidates = _extract_candidate_links(soup, rcp_notice_url)
 
-    # 2a) si candidate finit par .pdf -> valide direct
     for u in candidates:
         if ".pdf" in u.lower():
             ok_pdf = _resolve_and_validate_pdf(u)
             if ok_pdf:
                 return ok_pdf
 
-    # 2b) si candidate est une page EMA (HTML) -> l'ouvrir et trouver le pdf dedans
     for u in candidates:
         low = u.lower()
         if "ema.europa.eu" in low or "product-information" in low:
@@ -1032,11 +985,9 @@ def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
                 r = requests.get(u, headers=HEADERS_WEB, timeout=(HTTP_CONNECT_TIMEOUT, 60), allow_redirects=True)
                 if r.status_code >= 400:
                     continue
-                # si c'est déjà un PDF
                 ct = (r.headers.get("content-type") or "").lower()
                 if "application/pdf" in ct:
                     return r.url
-                # sinon cherche .pdf dans cette page
                 inner_pdfs = _extract_pdf_urls_from_any_html(r.text)
                 for pu in inner_pdfs:
                     ok_pdf = _resolve_and_validate_pdf(pu)
@@ -1047,10 +998,44 @@ def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
 
     return ""
 
+def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
+    """
+    Extraction ATC robuste:
+    - PyMuPDF si dispo (page par page, rapide)
+    - fallback pypdf si dispo
+    """
+    if not pdf_bytes:
+        return ""
 
-def extract_atc_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=30)
-    return extract_atc_from_text_blob(text)
+    # 1) PyMuPDF (recommandé)
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            n = len(doc)
+            limit = min(n, max_pages if max_pages and max_pages > 0 else n)
+            for i in range(limit):
+                txt = doc.load_page(i).get_text("text") or ""
+                atc = extract_atc_from_text_blob(txt)
+                if atc:
+                    return atc
+        except Exception:
+            return ""
+
+    # 2) fallback pypdf
+    if PdfReader is not None:
+        try:
+            from io import BytesIO
+            reader = PdfReader(BytesIO(pdf_bytes))
+            limit = min(len(reader.pages), max_pages if max_pages and max_pages > 0 else len(reader.pages))
+            for i in range(limit):
+                txt = reader.pages[i].extract_text() or ""
+                atc = extract_atc_from_text_blob(txt)
+                if atc:
+                    return atc
+        except Exception:
+            return ""
+
+    return ""
 
 def get_atc_from_pdf_url(pdf_url: str) -> str:
     if not pdf_url:
@@ -1059,7 +1044,7 @@ def get_atc_from_pdf_url(pdf_url: str) -> str:
         b = download_bytes(pdf_url, timeout_s=160.0)
     except Exception:
         return ""
-    return extract_atc_from_pdf_bytes(b)
+    return normalize_atc7(extract_atc_from_pdf_bytes(b))
 
 # ============================================================
 # DISPONIBILITE
@@ -1183,8 +1168,8 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
-    if fitz is None and PdfReader is None:
-        warn("Ni PyMuPDF ni pypdf disponibles -> extraction ATC PDF IMPOSSIBLE (installe PyMuPDF).")
+    if fitz is None:
+        warn("PyMuPDF (fitz) indisponible -> extraction ATC PDF très limitée (installe PyMuPDF).")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
@@ -1322,12 +1307,13 @@ def main():
     start = time.time()
 
     rcp_checks = 0
+    pdf_checks = 0
     pdf_hits = 0
     pdf_atc_added = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}")
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}")
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1336,7 +1322,7 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ Composition depuis BDPM_COMPO + ajout version sans accent (si absente)
+        # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
@@ -1347,7 +1333,7 @@ def main():
             if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # ✅ Libellé ATC : on LIT le computed FIELD_ATC4 dans Airtable
+        # Libellé ATC via ATC4 computed
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1393,7 +1379,6 @@ def main():
         need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
-        # 1) fiche-info (CPD + dispo + ATC si présent)
         if need_fetch_fiche:
             try:
                 cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
@@ -1403,33 +1388,33 @@ def main():
 
                 atc_code_norm = normalize_atc7(atc_code)
 
-                # 2) fallback RCP HTML si fiche-info ne donne rien
+                # fallback RCP HTML
                 if not atc_code_norm and not cur_atc:
                     rcp_checks += 1
                     atc_from_rcp_html = analyze_rcp_html_for_atc(rcp_html_url)
                     atc_code_norm = normalize_atc7(atc_from_rcp_html)
 
-                # 3) fallback PDF si toujours rien (EMA)
+                # fallback PDF
                 pdf_url_used = ""
                 if not atc_code_norm and not cur_atc:
                     rcp_checks += 1
                     pdf_url = find_pdf_url_from_rcp_notice_page(rcp_notice_url)
                     if pdf_url:
+                        pdf_checks += 1
                         pdf_url_used = pdf_url
                         atc_from_pdf = get_atc_from_pdf_url(pdf_url)
                         atc_code_norm = normalize_atc7(atc_from_pdf)
                         if atc_code_norm:
                             pdf_hits += 1
 
-                # update ATC
+                # update ATC + report si PDF
                 if atc_code_norm and atc_code_norm != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code_norm
-                    # rapport si ça vient du PDF (on le détecte via pdf_url_used)
                     if pdf_url_used:
                         pdf_atc_added += 1
                         append_pdf_atc_report(cis=cis, atc=atc_code_norm, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
 
-                # Libellé ATC immédiat (sans écrire le computed ATC4)
+                # Libellé ATC immédiat
                 atc_for_label = atc_code_norm or cur_atc
                 if atc_for_label:
                     atc4_tmp = atc_level4_from_any(atc_for_label)
@@ -1472,7 +1457,7 @@ def main():
                 warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
         if upd_fields:
-            upd_fields.pop(FIELD_ATC4, None)  # sécurité
+            upd_fields.pop(FIELD_ATC4, None)
             updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
@@ -1486,7 +1471,7 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
-                f"| RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | reste ~{int(remaining)}s"
+                f"| RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1496,7 +1481,7 @@ def main():
     try_git_commit_report()
     ok(
         f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
-        f"RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
+        f"RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
         f"rapport PDF: {report_path_pdf_atc_today()}"
     )
 
