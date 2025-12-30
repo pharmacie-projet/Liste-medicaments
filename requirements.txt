@@ -1,18 +1,17 @@
 requests==2.32.3
 beautifulsoup4==4.12.3
-python-dotenv==1.0.1
 lxml==5.3.0
+python-dotenv==1.0.1
 
 # IMPORTANT : on évite numpy 2.x (source du crash)
 numpy==1.26.4
 pandas==2.2.3
+
 openpyxl==3.1.5
 
-# Lecture du .xls ANSM en "xlrd pur" (pas via pandas)
+# Lecture du .xls ANSM
 xlrd==2.0.1
 
-# Extraction texte des PDF (ATC dans RCP EMA/ANSM)
-pymupdf==1.24.10
-
-# Optionnel : fallback PDF si PyMuPDF échoue (tu peux le garder ou l'enlever)
+# Extraction texte PDF (RCP/EMA)
+PyMuPDF==1.24.10
 pypdf==5.1.0
