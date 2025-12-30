@@ -928,8 +928,7 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     atc_code = atc_from_class_line.strip()
 
     # Recherche "Code ATC" partout dans la page (fiche-info), pas uniquement sur la ligne de classe pharmaco.
-    full_text = soup.get_text("
-", strip=True)
+    full_text = soup.get_text("\n", strip=True)
     atc_any = extract_atc_from_text_blob(full_text).strip()
     if canonical_atc7(atc_any):
         atc_code = atc_any
