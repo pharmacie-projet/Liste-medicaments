@@ -673,6 +673,34 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
+# PDF (RCP) -> extraction texte (pour trouver le code ATC)
+# Dépendance: pdfminer.six
+# ============================================================
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 0) -> str:
+    """
+    Extrait le texte d'un PDF (bytes) avec pdfminer.six.
+    max_pages=0 => toutes les pages
+    """
+    if not pdf_bytes:
+        return ""
+
+    try:
+        from io import BytesIO
+        from pdfminer.high_level import extract_text as _extract_text
+
+        # pdfminer prend un "file-like"
+        bio = BytesIO(pdf_bytes)
+
+        # maxpages=0 => toutes les pages
+        text = _extract_text(bio, maxpages=max_pages if max_pages and max_pages > 0 else 0) or ""
+        return normalize_ws_keep_lines(text)
+
+    except Exception as e:
+        warn(f"PDF text extraction failed: {e}")
+        return ""
+
+# ============================================================
 # FICHE-INFO SCRAPING + ATC
 # ============================================================
 
