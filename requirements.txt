@@ -18,7 +18,9 @@ pdfminer.six==20231228
 # Recommandé (ton script le teste; ça évite l'avertissement)
 PyMuPDF==1.24.14
 
-# Fallback si tu veux (optionnel)
+# Fallback PDF texte
 pypdf==5.1.0
+
+# OCR (activé seulement si OCR_ENABLE=1)
 Pillow==10.4.0
 pytesseract==0.3.10
