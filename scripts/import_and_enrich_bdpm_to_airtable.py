@@ -3,32 +3,38 @@
 
 import os
 import re
+import io
+import sys
 import json
 import time
 import math
 import random
+import shutil
+import hashlib
 import logging
+import zipfile
+import subprocess
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
 
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# Excel read (xlrd) + parsing logic (pas via pandas pour éviter deps lourdes)
+# Excel read (xlrd) + parsing logic
 import xlrd  # type: ignore
 
-# PDF text extraction fallback (optionnel)
-try:
-    from pypdf import PdfReader  # type: ignore
-except Exception:  # pragma: no cover
-    PdfReader = None  # type: ignore
-
-# PDF extraction (recommandé)
+# PDF extraction: PyMuPDF (recommandé) + pypdf fallback
 try:
     import fitz  # PyMuPDF
 except Exception:  # pragma: no cover
     fitz = None  # type: ignore
+
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    PdfReader = None  # type: ignore
 
 # OCR fallback
 try:
@@ -100,6 +106,46 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger("import_bdpm")
+
+
+# ============================================================
+# UTIL / LOG
+# ============================================================
+
+def info(msg: str):
+    log.info(msg)
+
+def ok(msg: str):
+    log.info("✅ " + msg)
+
+def warn(msg: str):
+    log.warning("⚠️ " + msg)
+
+def err(msg: str):
+    log.error("❌ " + msg)
+
+def sha1_bytes(b: bytes) -> str:
+    h = hashlib.sha1()
+    h.update(b)
+    return h.hexdigest()
+
+def try_git_commit_report():
+    """
+    Si le repo est un checkout git et que reports/ a changé, commit + push (optionnel).
+    Ne plante jamais si git absent.
+    """
+    try:
+        if not os.path.isdir(".git"):
+            return
+        subprocess.run(["git", "status"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "add", REPORT_DIR], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
+        if r.returncode == 0:
+            return
+        subprocess.run(["git", "commit", "-m", f"update reports {time.strftime('%Y-%m-%d %H:%M:%S')}"], check=False)
+        subprocess.run(["git", "push"], check=False)
+    except Exception:
+        return
 
 
 # ============================================================
@@ -242,7 +288,6 @@ def analyze_rcp_html_for_atc(rcp_html_url: str) -> str:
         r = http_get(rcp_html_url)
         r.raise_for_status()
         html = r.text
-        # Text blob
         soup = BeautifulSoup(html, "lxml")
         txt = soup.get_text("\n", strip=True)
         return extract_atc_from_text_blob(txt)
@@ -294,11 +339,9 @@ def parse_bdpm_compo_dispo_atc_from_doc_page(html: str) -> Tuple[str, str, str]:
     compo = ""
     dispo = ""
 
-    # heuristiques
-    # Composition : section "Composition qualitative et quantitative"
     if "Composition" in text:
         compo = ""
-    # Disponibilité : on tente de récupérer un texte autour de "Statut" / "Commercialisation"
+
     for key in ("Commercialisation", "Statut", "Rupture", "Disponibilité"):
         if key.lower() in text.lower():
             dispo = key
@@ -398,66 +441,94 @@ def get_atc_from_pdf_url(pdf_url: str) -> Tuple[str, str]:
         return "", ""
     return extract_atc_from_pdf_bytes_with_method(b)
 
-
 # ============================================================
-# AIRTABLE API
+# AIRTABLE API (version complète utilisée par le projet)
 # ============================================================
 
-def airtable_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {AIRTABLE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+class AirtableClient:
+    def __init__(self, token: str, base_id: str, table_name: str):
+        self.token = token
+        self.base_id = base_id
+        self.table_name = table_name
 
-def airtable_url_table() -> str:
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_CIS_TABLE_NAME)}"
+    def headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
 
-def airtable_get_records_by_formula(formula: str, max_records: int = 100) -> List[Dict[str, Any]]:
-    """
-    Récupère des records Airtable via filterByFormula, gère pagination.
-    """
-    url = airtable_url_table()
-    params = {
-        "filterByFormula": formula,
-        "pageSize": min(max_records, 100),
-    }
-    out: List[Dict[str, Any]] = []
-    offset = None
-    for _ in range(50):
-        if offset:
-            params["offset"] = offset
-        r = requests.get(url, headers=airtable_headers(), params=params, timeout=HTTP_TIMEOUT)
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(1.2)
-            continue
-        r.raise_for_status()
-        data = r.json()
-        out.extend(data.get("records", []))
-        offset = data.get("offset")
-        if not offset:
-            break
-    return out
+    def table_url(self) -> str:
+        return f"https://api.airtable.com/v0/{self.base_id}/{requests.utils.quote(self.table_name)}"
 
-def airtable_update_record(record_id: str, fields: Dict[str, Any]) -> bool:
-    """
-    Update partiel.
-    """
-    url = f"{airtable_url_table()}/{record_id}"
-    payload = {"fields": fields}
-    last = None
-    for i in range(AIRTABLE_MAX_RETRY):
-        try:
-            r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=HTTP_TIMEOUT)
+    def list_records(self, filter_formula: Optional[str] = None, fields: Optional[List[str]] = None, page_size: int = 100) -> List[Dict[str, Any]]:
+        url = self.table_url()
+        params: Dict[str, Any] = {"pageSize": min(page_size, 100)}
+        if filter_formula:
+            params["filterByFormula"] = filter_formula
+        if fields:
+            for f in fields:
+                params.setdefault("fields[]", [])
+                params["fields[]"].append(f)
+
+        out: List[Dict[str, Any]] = []
+        offset = None
+        for _ in range(200):
+            if offset:
+                params["offset"] = offset
+            r = requests.get(url, headers=self.headers(), params=params, timeout=HTTP_TIMEOUT)
             if r.status_code in (429, 500, 502, 503, 504):
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
+                time.sleep(1.2)
+                continue
             r.raise_for_status()
-            return True
-        except Exception as e:
-            last = e
-            sleep = AIRTABLE_SLEEP_BASE * (2 ** i) + random.random() * 0.25
-            time.sleep(sleep)
-    log.error("Airtable update failed: %s (%s)", record_id, last)
-    return False
+            data = r.json()
+            out.extend(data.get("records", []))
+            offset = data.get("offset")
+            if not offset:
+                break
+        return out
+
+    def update_record(self, record_id: str, fields: Dict[str, Any]) -> bool:
+        url = f"{self.table_url()}/{record_id}"
+        payload = {"fields": fields}
+        last = None
+        for i in range(AIRTABLE_MAX_RETRY):
+            try:
+                r = requests.patch(url, headers=self.headers(), data=json.dumps(payload), timeout=HTTP_TIMEOUT)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:180]}")
+                r.raise_for_status()
+                return True
+            except Exception as e:
+                last = e
+                sleep = AIRTABLE_SLEEP_BASE * (2 ** i) + random.random() * 0.25
+                time.sleep(sleep)
+        err(f"Airtable update failed: {record_id} ({last})")
+        return False
+
+    def update_records(self, updates: List[Tuple[str, Dict[str, Any]]], chunk: int = 10):
+        """
+        Batch PATCH (Airtable accepte 10 max par requête)
+        """
+        if not updates:
+            return
+        url = self.table_url()
+        for i in range(0, len(updates), chunk):
+            batch = updates[i:i+chunk]
+            payload = {"records": [{"id": rid, "fields": fields} for rid, fields in batch]}
+            last = None
+            for attempt in range(AIRTABLE_MAX_RETRY):
+                try:
+                    r = requests.patch(url, headers=self.headers(), data=json.dumps(payload), timeout=HTTP_TIMEOUT)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:180]}")
+                    r.raise_for_status()
+                    break
+                except Exception as e:
+                    last = e
+                    sleep = AIRTABLE_SLEEP_BASE * (2 ** attempt) + random.random() * 0.25
+                    time.sleep(sleep)
+            else:
+                err(f"Batch update failed ({i}-{i+len(batch)}): {last}")
 
 
 # ============================================================
@@ -483,8 +554,6 @@ def read_cis_bdpm_txt(path: str) -> List[CisRow]:
             if not line:
                 continue
             parts = line.split("\t")
-            # structure habituelle BDPM:
-            # 0 CIS, 1 denom, 2 forme, 3 voie, 4 statut, 5 type, 6 state, 7 labo
             cis = (parts[0] if len(parts) > 0 else "").strip()
             denom = (parts[1] if len(parts) > 1 else "").strip()
             forme = (parts[2] if len(parts) > 2 else "").strip()
@@ -496,27 +565,64 @@ def read_cis_bdpm_txt(path: str) -> List[CisRow]:
 
 
 # ============================================================
-# MAIN ENRICHMENT
+# EQUIVALENCE ATC (xlsx) - utilitaire (si présent)
 # ============================================================
 
-def enrich_one_record(record: Dict[str, Any], force_refresh: bool = False) -> bool:
+def load_atc_equivalence_xlsx(path: str) -> Dict[str, str]:
+    """
+    Charge le fichier Excel d'équivalence ATC (si présent) pour mapping.
+    Retourne {CIS -> ATC}
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_excel(path)
+        # colonnes attendues possibles
+        # CIS / Code cis / cis ; ATC / Code ATC
+        cis_col = None
+        atc_col = None
+        for c in df.columns:
+            lc = str(c).strip().lower()
+            if lc in ("cis", "code cis", "codecis"):
+                cis_col = c
+            if lc in ("atc", "code atc", "codeatc"):
+                atc_col = c
+        if cis_col is None or atc_col is None:
+            return {}
+        out: Dict[str, str] = {}
+        for _, row in df.iterrows():
+            cis = str(row.get(cis_col, "")).strip()
+            atc = str(row.get(atc_col, "")).strip()
+            if cis and canonical_atc7(atc):
+                out[cis] = atc
+        return out
+    except Exception:
+        return {}
+
+
+# ============================================================
+# MAIN ENRICHMENT (version projet)
+# ============================================================
+
+def enrich_one_record(
+    at: AirtableClient,
+    record: Dict[str, Any],
+    force_refresh: bool = False,
+) -> Tuple[bool, int, int, int, int]:
     """
     Enrichit un record Airtable CIS:
     - composition / disponibilité / atc depuis BDPM (HTML)
     - fallback pdf text -> OCR si ATC vide
+    Retourne: (updated, rcp_checks, pdf_checks, pdf_hits, pdf_atc_added)
     """
     record_id = record.get("id", "")
     fields_cur = record.get("fields", {}) or {}
 
     cis = str(fields_cur.get(FIELD_CIS, "")).strip()
     if not cis:
-        return False
+        return False, 0, 0, 0, 0
 
     cur_spec = str(fields_cur.get(FIELD_SPEC, "")).strip()
-    cur_forme = str(fields_cur.get(FIELD_FORME, "")).strip()
-    cur_voie = str(fields_cur.get(FIELD_VOIE, "")).strip()
-    cur_labo = str(fields_cur.get(FIELD_LABO, "")).strip()
-
     cur_cpd = str(fields_cur.get(FIELD_COMPO, "")).strip()
     cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
     cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
@@ -525,10 +631,15 @@ def enrich_one_record(record: Dict[str, Any], force_refresh: bool = False) -> bo
     need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or atc_is_blank
 
     upd_fields: Dict[str, Any] = {}
+    rcp_checks = 0
+    pdf_checks = 0
+    pdf_hits = 0
+    pdf_atc_added = 0
 
     if need_fetch_fiche:
         html = fetch_bdpm_doc_page(cis)
         compo, dispo, atc_code = parse_bdpm_compo_dispo_atc_from_doc_page(html)
+        rcp_checks += 1
 
         if compo and (force_refresh or not cur_cpd):
             upd_fields[FIELD_COMPO] = compo
@@ -552,13 +663,16 @@ def enrich_one_record(record: Dict[str, Any], force_refresh: bool = False) -> bo
             if not canonical_atc7(atc_found):
                 rcp_notice_url = BDPM_RCP_NOTICE.format(cis=cis)
                 pdf_url = find_pdf_url_from_rcp_notice_page(rcp_notice_url)
+                pdf_checks += 1
                 if pdf_url:
+                    pdf_hits += 1
                     pdf_url_used = pdf_url
                     atc_from_pdf, pdf_method = get_atc_from_pdf_url(pdf_url)
                     atc_found = (atc_from_pdf or "").strip()
 
             if canonical_atc7(atc_found):
                 upd_fields[FIELD_ATC] = atc_found
+                pdf_atc_added += 1
                 if pdf_url_used:
                     append_pdf_atc_report(cis=cis, atc=atc_found, pdf_url=pdf_url_used, origin_url=BDPM_RCP_NOTICE.format(cis=cis))
                     if (pdf_method or "").upper() == "OCR":
@@ -571,46 +685,105 @@ def enrich_one_record(record: Dict[str, Any], force_refresh: bool = False) -> bo
                         )
 
     if not upd_fields:
-        return False
+        return False, rcp_checks, pdf_checks, pdf_hits, pdf_atc_added
 
-    return airtable_update_record(record_id, upd_fields)
+    ok_upd = at.update_record(record_id, upd_fields)
+    return ok_upd, rcp_checks, pdf_checks, pdf_hits, pdf_atc_added
 
 
 def main():
     if not AIRTABLE_API_TOKEN or not AIRTABLE_BASE_ID or not AIRTABLE_CIS_TABLE_NAME:
         raise RuntimeError("AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME manquants")
 
-    # Lecture du fichier BDPM CIS
+    at = AirtableClient(AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_CIS_TABLE_NAME)
+
+    # Lecture BDPM
     rows = read_cis_bdpm_txt(INPUT_FILE)
-    log.info("CIS rows read: %s", len(rows))
+    info(f"CIS rows read: {len(rows)}")
 
-    # Pour chaque CIS, on cherche le record et on enrichit
-    # (NB: on suppose que les records existent déjà; ce script est un enrichissement)
-    updates = 0
-    total = 0
+    # Index CIS -> row
+    all_cis = [r.cis for r in rows]
+    all_cis_set = set(all_cis)
 
-    for row in rows:
-        total += 1
-        formula = f"{{{FIELD_CIS}}}='{row.cis}'"
-        recs = airtable_get_records_by_formula(formula, max_records=5)
+    # Optionnel: mapping equivalence atc.xlsx (si dispo)
+    equiv_path = os.path.join("data", "equivalence atc.xlsx")
+    eq_map = load_atc_equivalence_xlsx(equiv_path)
+    if eq_map:
+        info(f"Equivalence ATC chargée: {len(eq_map)} lignes")
+
+    # Récup records Airtable (en une fois) pour accélérer
+    fields = [FIELD_CIS, FIELD_SPEC, FIELD_COMPO, FIELD_DISPO, FIELD_ATC]
+    records = at.list_records(fields=fields, page_size=100)
+    info(f"Airtable records fetched: {len(records)}")
+
+    # Index records par CIS
+    rec_by_cis: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records:
+        cis = str((rec.get("fields") or {}).get(FIELD_CIS, "")).strip()
+        if not cis:
+            continue
+        rec_by_cis.setdefault(cis, []).append(rec)
+
+    updates: List[Tuple[str, Dict[str, Any]]] = []
+    failures = 0
+    deleted_count = 0
+
+    rcp_checks = 0
+    pdf_checks = 0
+    pdf_hits = 0
+    pdf_atc_added = 0
+
+    t0 = time.time()
+
+    for idx, cis in enumerate(all_cis, start=1):
+        recs = rec_by_cis.get(cis, [])
         if not recs:
             continue
-        ok_any = False
+
+        # Si on a un mapping d'ATC et que le champ est vide, on peut remplir direct (avant OCR)
         for rec in recs:
-            ok = enrich_one_record(rec, force_refresh=FORCE_REFRESH)
-            if ok:
-                ok_any = True
-        if ok_any:
-            updates += 1
+            fields_cur = rec.get("fields", {}) or {}
+            cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
+            if cur_atc == "" and cis in eq_map and canonical_atc7(eq_map[cis]):
+                updates.append((rec["id"], {FIELD_ATC: eq_map[cis]}))
 
-        if total % 100 == 0:
-            log.info("Progress: %s/%s, updates=%s", total, len(rows), updates)
+        # Enrich BDPM/OCR
+        for rec in recs:
+            try:
+                updated, rcp_c, pdf_c, pdf_h, pdf_a = enrich_one_record(at, rec, force_refresh=FORCE_REFRESH)
+                rcp_checks += rcp_c
+                pdf_checks += pdf_c
+                pdf_hits += pdf_h
+                pdf_atc_added += pdf_a
+                if not updated:
+                    continue
+            except Exception:
+                failures += 1
 
-    log.info(
-        "Done. Records updated=%s | Reports: %s | OCR reports: %s",
-        updates,
-        report_path_pdf_atc_today(),
-        report_path_pdf_atc_ocr_today(),
+        # flush updates en batch
+        if len(updates) >= 50:
+            at.update_records(updates)
+            ok(f"Batch updates: {len(updates)}")
+            updates = []
+
+        if idx % 100 == 0:
+            elapsed = time.time() - t0
+            rate = idx / elapsed if elapsed > 0 else 0
+            remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
+            info(
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
+                f"| RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | reste ~{int(remaining)}s"
+            )
+
+    if updates:
+        at.update_records(updates)
+        ok(f"Updates finaux: {len(updates)}")
+
+    try_git_commit_report()
+    ok(
+        f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
+        f"RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
+        f"rapport PDF: {report_path_pdf_atc_today()} | rapport OCR: {report_path_pdf_atc_ocr_today()}"
     )
 
 if __name__ == "__main__":
