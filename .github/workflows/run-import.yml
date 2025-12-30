@@ -33,17 +33,18 @@ jobs:
         run: |
           python scripts/import_and_enrich_bdpm_to_airtable.py
 
-      # ✅ Nouveau : enrichissement ATC via téléchargement + lecture PDF (fallback)
-      - name: Enrich ATC from RCP PDF
+      - name: Enrich ATC from RCP PDF (normalize spaces)
         env:
           AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          # Le script atc attend AIRTABLE_TABLE_NAME -> on réutilise ton secret existant
-          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
-          # Noms des champs (si tes champs sont différents, adapte ici)
-          AIRTABLE_FIELD_CIS: "Code cis"
-          AIRTABLE_FIELD_ATC: "Code ATC"
-          AIRTABLE_FIELD_ATC_L4: "Code ATC (niveau 4)"
-          AIRTABLE_FIELD_RCP_LINK: "Lien vers RCP"
+          AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
         run: |
-          python -u src/enrich_atc_pdf.py
+          python scripts/enrich_atc_from_rcp_pdf.py
+
+      - name: Upload ATC PDF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atc-pdf-report
+          path: reports/atc_added_from_pdf.csv
+          if-no-files-found: warn
