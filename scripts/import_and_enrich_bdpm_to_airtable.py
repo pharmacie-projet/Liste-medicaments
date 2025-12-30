@@ -164,7 +164,6 @@ def append_pdf_atc_report(cis: str, atc: str, pdf_url: str, origin_url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-
 def report_path_pdf_atc_ocr_today() -> str:
     """Backup des ATC trouvés via OCR uniquement (inclut le nom de la spécialité)."""
     os.makedirs(REPORT_DIR, exist_ok=True)
@@ -271,7 +270,7 @@ def _bs_parser():
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
-# >>> NOUVEAU: pattern ultra tolérant (espaces entre chaque caractère)
+# pattern tolérant: espaces entre caractères
 ATC7_ANY_FLEX_PAT = re.compile(r"\b([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)\b", re.IGNORECASE)
 ATC7_NEAR_ATC_WORD = re.compile(
     r"(?:\bATC\b|code\s*ATC|ATC\s*code)\s*[:\-]?\s*([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)",
@@ -285,17 +284,6 @@ def canonical_atc7(raw: str) -> str:
     s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
     return s if ATC7_PAT.fullmatch(s) else ""
 
-def format_atc_like_found(found: str) -> str:
-    """
-    Si le texte trouvé contient au moins un espace/retour/ponctuation -> renvoie 'XXXX XXX' (format espace).
-    Sinon -> renvoie 'XXXXXXX'.
-    """
-    canon = canonical_atc7(found)
-    if not canon:
-        return ""
-    has_separator = bool(re.search(r"\s|\.", found))
-    return f"{canon[:4]} {canon[4:]}" if has_separator else canon
-
 def keep_atc_as_found(raw: str) -> str:
     """
     Conserve le code ATC tel qu'il apparaît (espaces conservés), mais vérifie qu'il
@@ -304,7 +292,6 @@ def keep_atc_as_found(raw: str) -> str:
     if not raw:
         return ""
     s = (raw or "").replace("\u00a0", " ").strip()
-    # On garde les espaces, mais on retire les ponctuations en bord (souvent ":" ";" ".")
     s = re.sub(r"^[\s:;\-–—]+", "", s)
     s = re.sub(r"[\s:;\-–—\.\,]+$", "", s)
     return s if canonical_atc7(s) else ""
@@ -312,10 +299,11 @@ def keep_atc_as_found(raw: str) -> str:
 def extract_atc_from_text_blob(text: str) -> str:
     """
     Extrait un code ATC depuis un blob texte (HTML->text, PDF->text, OCR->text).
-    Règle: si le code est écrit avec des espaces, on les conserve à l'identique.
+    Règle: si le code est écrit avec des espaces, on les conserve.
     """
     if not text:
         return ""
+
     t = (text or "").replace("\u00a0", " ")
 
     # 1) Priorité: lignes contenant "Code ATC" / "ATC"
@@ -332,25 +320,10 @@ def extract_atc_from_text_blob(text: str) -> str:
             if out:
                 return out
 
-    # 2) Fallback: chercher un ATC7 même sans libellé
+    # 2) Fallback: chercher un ATC7 n'importe où
     m2 = ATC7_ANY_FLEX_PAT.search(t)
     if m2:
         out = keep_atc_as_found(m2.group(1))
-        if out:
-            return out
-
-    return ""
-    t = (text or "").replace("\u00a0", " ")
-
-    m = ATC7_NEAR_ATC_WORD.search(t)
-    if m:
-        out = format_atc_like_found(m.group(1))
-        if out:
-            return out
-
-    m2 = ATC7_ANY_FLEX_PAT.search(t)
-    if m2:
-        out = format_atc_like_found(m2.group(1))
         if out:
             return out
 
@@ -404,8 +377,7 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     return mapping
 
 # ============================================================
-# COMPOSITION BDPM -> DCI principales (sans sels/formes, sans doublons)
-# (INCHANGÉ)
+# COMPOSITION BDPM -> DCI principales
 # ============================================================
 
 _NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
@@ -603,7 +575,7 @@ def download_bytes(url: str, timeout_s: float = 140.0) -> bytes:
     return r.content
 
 # ============================================================
-# ANSM retrocession (INCHANGÉ)
+# ANSM retrocession
 # ============================================================
 
 def find_ansm_retro_excel_link() -> str:
@@ -679,7 +651,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
     return cis_set
 
 # ============================================================
-# BDPM PARSE (CIS, CIP) (INCHANGÉ)
+# BDPM PARSE (CIS, CIP)
 # ============================================================
 
 @dataclass
@@ -775,7 +747,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING + ATC (INCHANGÉ sauf extraction ATC)
+# FICHE-INFO SCRAPING + ATC
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -791,7 +763,6 @@ NEGATION_PAT = re.compile(
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
 PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
 
-# >>> MODIF: capture flex (espaces possibles)
 CODE_ATC_INLINE_PAT = re.compile(
     r"code\s+ATC\s*[:\-]?\s*([A-Z]\s*\d\s*\d\s*[A-Z]\s*[A-Z]\s*\d\s*\d)",
     re.IGNORECASE
@@ -903,7 +874,7 @@ def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[st
         atc = ""
         m_atc = CODE_ATC_INLINE_PAT.search(ln)
         if m_atc:
-                        atc = keep_atc_as_found(m_atc.group(1)) or ""
+            atc = keep_atc_as_found(m_atc.group(1)) or ""
 
         s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
         s = s.lstrip(":").strip()
@@ -925,11 +896,11 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     cpd_text = capitalize_each_line(cpd_text)
 
     _pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
-    atc_code = atc_from_class_line.strip()
+    atc_code = (atc_from_class_line or "").strip()
 
-    # Recherche "Code ATC" partout dans la page (fiche-info), pas uniquement sur la ligne de classe pharmaco.
+    # Recherche "Code ATC" partout dans la page
     full_text = soup.get_text("\n", strip=True)
-    atc_any = extract_atc_from_text_blob(full_text).strip()
+    atc_any = (extract_atc_from_text_blob(full_text) or "").strip()
     if canonical_atc7(atc_any):
         atc_code = atc_any
 
@@ -951,9 +922,6 @@ def analyze_rcp_html_for_atc(rcp_url: str) -> str:
         html = fetch_html_checked(rcp_url, max_retries=2)
     except Exception:
         return ""
-    atc = extract_atc_from_text_blob(html)
-    if atc:
-        return atc
     soup = BeautifulSoup(html, _bs_parser())
     text = soup.get_text("\n", strip=True)
     return extract_atc_from_text_blob(text)
@@ -964,8 +932,8 @@ def analyze_notice_html_for_atc(notice_url: str) -> str:
 
 def analyze_bdpm_doc_for_atc(cis: str, doc: str) -> str:
     """
-    Fallback robuste: endpoints "affichageDoc.php" (souvent plus "statique" que /extrait).
-    doc: "R"=RCP, "N"=Notice.
+    Fallback robuste: endpoints "affichageDoc.php"
+    doc: "R"=RCP, "N"=Notice
     """
     if not cis:
         return ""
@@ -978,10 +946,8 @@ def analyze_bdpm_doc_for_atc(cis: str, doc: str) -> str:
     txt = soup.get_text("\n", strip=True)
     return extract_atc_from_text_blob(txt)
 
-
-
 # ============================================================
-# PDF (RCP/EMA) -> trouver URL PDF + extraire ATC (INCHANGÉ sauf extraction ATC)
+# PDF (RCP/EMA) -> trouver URL PDF + extraire ATC
 # ============================================================
 
 PDF_URL_RE = re.compile(r'(https?:\/\/[^\s"\'<>]+\.pdf)', re.IGNORECASE)
@@ -1001,7 +967,7 @@ def _resolve_and_validate_pdf(url: str) -> str:
         ct = (r.headers.get("content-type") or "").lower()
         if "application/pdf" in ct:
             return r.url
-        head = r.raw.read(5)  # lit quelques octets
+        head = r.raw.read(5)
         if _looks_like_pdf_bytes(head):
             return r.url
     except Exception:
@@ -1038,7 +1004,8 @@ def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
             cand.append(href)
             continue
 
-        if ("rcp" in txt and "notice" in txt) or ("vers le rcp" in txt) or ("product-information" in href.lower()) or ("ema.europa.eu" in href.lower()):
+        # heuristiques "documents / rcp / ema"
+        if ("vers le rcp" in txt) or ("rcp" in txt) or ("notice" in txt) or ("product-information" in href.lower()) or ("ema.europa.eu" in href.lower()):
             cand.append(href)
 
     for tag in soup.find_all(["iframe", "embed", "object"]):
@@ -1183,16 +1150,8 @@ def get_atc_from_pdf_url_with_method(pdf_url: str) -> Tuple[str, str]:
         return "", ""
     return extract_atc_from_pdf_bytes_with_method(b)
 
-def extract_atc_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
-    atc, _m = extract_atc_from_pdf_bytes_with_method(pdf_bytes, max_pages_text=max_pages)
-    return atc
-
-def get_atc_from_pdf_url(pdf_url: str) -> str:
-    atc, _m = get_atc_from_pdf_url_with_method(pdf_url)
-    return atc
-
 # ============================================================
-# DISPONIBILITE (INCHANGÉ)
+# DISPONIBILITE
 # ============================================================
 
 def compute_disponibilite(
@@ -1220,7 +1179,7 @@ def compute_disponibilite(
     return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
-# AIRTABLE CLIENT (INCHANGÉ)
+# AIRTABLE CLIENT
 # ============================================================
 
 class AirtableClient:
@@ -1298,7 +1257,7 @@ class AirtableClient:
             self._request("DELETE", self.table_url, params=params)
 
 # ============================================================
-# MAIN (MODIF: n’écrit ATC QUE si champ Airtable vide)
+# MAIN
 # ============================================================
 
 def main():
@@ -1447,7 +1406,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) + fallback RCP HTML + fallback PDF + libellé ATC + composition ...")
+    info("Enrichissement (fiche-info) + fallback RCP + fallback Notice + fallback PDF/OCR + libellé ATC + composition ...")
 
     updates = []
     failures = 0
@@ -1471,7 +1430,7 @@ def main():
             continue
 
         fields_cur = rec.get("fields", {}) or {}
-        upd_fields = {}
+        upd_fields: Dict[str, str] = {}
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1522,12 +1481,12 @@ def main():
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         rcp_html_url = set_tab(link_rcp, cis, "rcp")
         rcp_notice_url = set_tab(link_rcp, cis, "rcp-et-notice")
-        notice_url = set_tab(link_rcp, cis, \"notice\")
+        notice_url = set_tab(link_rcp, cis, "notice")
 
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
 
-        # >>> MODIF: ATC est "vide" si aucun contenu (on ne compare pas/écrase pas si déjà présent)
+        # ATC vide ?
         cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
         atc_is_blank = (cur_atc_raw == "")
 
@@ -1536,52 +1495,70 @@ def main():
 
         if need_fetch_fiche:
             try:
-                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
+                cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_from_fiche = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
-                # >>> MODIF: on ne cherche/écrit l’ATC QUE si champ Airtable vide
-                atc_found = ""
+                # ----------------------------
+                # ATC : ordre demandé
+                # fiche-info -> RCP -> Notice -> PDF -> OCR
+                # ----------------------------
                 if atc_is_blank:
-             # fallback RCP/Notice (ordre demandé) : fiche-info -> RCP -> notice -> PDF -> OCR
+                    atc_found = (atc_from_fiche or "").strip()
+
+                    # 1) RCP HTML
                     if not canonical_atc7(atc_found):
                         rcp_checks += 1
-                        atc_found = analyze_rcp_html_for_atc(rcp_html_url).strip()
+                        atc_found = (analyze_rcp_html_for_atc(rcp_html_url) or "").strip()
 
-                    # fallback robuste via affichageDoc.php (RCP)
+                    # 1bis) RCP affichageDoc (robuste)
                     if not canonical_atc7(atc_found):
-                        atc_found = analyze_bdpm_doc_for_atc(cis, "R").strip()
+                        atc_found = (analyze_bdpm_doc_for_atc(cis, "R") or "").strip()
 
-                    # fallback notice (HTML)
+                    # 2) Notice HTML
                     if not canonical_atc7(atc_found):
-                        atc_found = analyze_notice_html_for_atc(notice_url).strip()
+                        atc_found = (analyze_notice_html_for_atc(notice_url) or "").strip()
 
-                    # fallback robuste via affichageDoc.php (Notice)
+                    # 2bis) Notice affichageDoc
                     if not canonical_atc7(atc_found):
-                        atc_found = analyze_bdpm_doc_for_atc(cis, "N").strip()
+                        atc_found = (analyze_bdpm_doc_for_atc(cis, "N") or "").strip()
 
-html_for_atc(rcp_html_url).strip()
-
-                    # fallback PDF
+                    # 3) PDF + OCR si besoin
                     pdf_url_used = ""
                     if not canonical_atc7(atc_found):
-                        pdf_url = (find_pdf_url_from_rcp_notice_page(rcp_notice_url) or find_pdf_url_from_rcp_notice_page(rcp_html_url) or find_pdf_url_from_rcp_notice_page(notice_url) or find_pdf_url_from_rcp_notice_page(BDPM_DOC_URL.format(cis=cis, doc='R')) or find_pdf_url_from_rcp_notice_page(BDPM_DOC_URL.format(cis=cis, doc='N')))
+                        pdf_url = (
+                            find_pdf_url_from_rcp_notice_page(rcp_notice_url)
+                            or find_pdf_url_from_rcp_notice_page(rcp_html_url)
+                            or find_pdf_url_from_rcp_notice_page(notice_url)
+                            or find_pdf_url_from_rcp_notice_page(BDPM_DOC_URL.format(cis=cis, doc="R"))
+                            or find_pdf_url_from_rcp_notice_page(BDPM_DOC_URL.format(cis=cis, doc="N"))
+                        )
+
                         if pdf_url:
                             pdf_checks += 1
                             pdf_url_used = pdf_url
                             atc_from_pdf, pdf_method = get_atc_from_pdf_url_with_method(pdf_url)
                             atc_found = (atc_from_pdf or "").strip()
+
                             if canonical_atc7(atc_found):
                                 pdf_hits += 1
-                                # Backup OCR uniquement
+
+                                # backup OCR uniquement
                                 if (pdf_method or "").upper() == "OCR":
                                     med_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
-                                    append_pdf_atc_ocr_report(cis=cis, specialite=med_name, atc=atc_found, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
+                                    append_pdf_atc_ocr_report(
+                                        cis=cis,
+                                        specialite=med_name,
+                                        atc=atc_found,
+                                        pdf_url=pdf_url_used,
+                                        origin_url=rcp_notice_url,
+                                    )
 
                     # écriture si valide
                     if canonical_atc7(atc_found):
                         upd_fields[FIELD_ATC] = atc_found
+
                         if pdf_url_used:
                             pdf_atc_added += 1
                             append_pdf_atc_report(cis=cis, atc=atc_found, pdf_url=pdf_url_used, origin_url=rcp_notice_url)
@@ -1652,7 +1629,7 @@ html_for_atc(rcp_html_url).strip()
     ok(
         f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
         f"RCP checks: {rcp_checks} | PDF checks: {pdf_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
-        f"rapport PDF: {report_path_pdf_atc_today()}"
+        f"rapport PDF: {report_path_pdf_atc_today()} | rapport OCR: {report_path_pdf_atc_ocr_today()}"
     )
 
 if __name__ == "__main__":
