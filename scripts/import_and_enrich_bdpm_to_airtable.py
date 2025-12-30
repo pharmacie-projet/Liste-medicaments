@@ -9,20 +9,11 @@ import random
 import urllib.parse
 import subprocess
 import unicodedata
-import io
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
 import requests
-
-try:
-    from bs4 import BeautifulSoup  # type: ignore
-except Exception as e:
-    raise SystemExit(
-        "❌ Dépendance manquante: beautifulsoup4 (bs4). "
-        "Ajoute `beautifulsoup4` à tes dépendances (pip install beautifulsoup4). "
-        f"Détail: {e}"
-    )
+from bs4 import BeautifulSoup
 
 # Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
 try:
@@ -66,7 +57,7 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
-# Champs Airtable
+# Champs Airtable (adapte ici si besoin)
 FIELD_CIS = "Code cis"
 FIELD_RCP = "Lien vers RCP"
 FIELD_CIP13 = "CIP 13"
@@ -83,7 +74,7 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
-    FIELD_ATC4,
+    FIELD_ATC4,  # computed Airtable -> interdiction totale d'écriture
 }
 
 # ============================================================
@@ -110,7 +101,7 @@ def sleep_throttle():
     time.sleep(AIRTABLE_MIN_DELAY_S)
 
 def retry_sleep(attempt: int):
-    time.sleep(min(8, 0.6 * (2 ** (attempt - 1))) + random.random() * 0.2)
+    time.sleep(min(10, 0.7 * (2 ** (attempt - 1))) + random.random() * 0.2)
 
 # ============================================================
 # REPORTING (GitHub workspace)
@@ -132,32 +123,26 @@ def report_path_today_pdf_atc() -> str:
     fname = f"atc_added_from_pdf_{time.strftime('%Y-%m-%d')}.tsv"
     return os.path.join(REPORT_DIR, fname)
 
-def append_pdf_atc_report(
-    cis: str,
-    specialite: str,
-    old_atc: str,
-    new_atc: str,
-    rcp_page_url: str,
-    pdf_url: str,
-):
+def append_pdf_atc_report(cis: str, atc: str, pdf_url: str, rcp_url: str, specialite: str):
     p = report_path_today_pdf_atc()
-    if not os.path.exists(p):
-        with open(p, "w", encoding="utf-8") as f:
-            f.write("timestamp\tcis\tspecialite\told_atc\tnew_atc\trcp_page_url\tpdf_url\n")
-    line = f"{_ts()}\t{cis}\t{specialite}\t{old_atc}\t{new_atc}\t{rcp_page_url}\t{pdf_url}\n"
+    header_needed = not os.path.exists(p)
     with open(p, "a", encoding="utf-8") as f:
-        f.write(line)
+        if header_needed:
+            f.write("timestamp\tcis\tatc\tpdf_url\trcp_url\tspecialite\n")
+        f.write(
+            f"{_ts()}\t{cis}\t{atc}\t{pdf_url}\t{rcp_url}\t{(specialite or '').replace(chr(9),' ')}\n"
+        )
 
 def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        # commit tout ce qu'il y a dans REPORT_DIR
-        if not os.path.isdir(REPORT_DIR):
+        # commit tout ce qui est dans reports/ du jour
+        if not os.path.exists(REPORT_DIR):
             return
         subprocess.run(["git", "status"], check=False)
         subprocess.run(["git", "add", REPORT_DIR], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report(s): {time.strftime('%Y-%m-%d')}"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: enrich logs ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
         ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
@@ -236,22 +221,22 @@ def _bs_parser():
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
 ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
-def _normalize_atc_code(raw: str) -> str:
-    """
-    Normalise un code ATC qui peut être écrit avec espaces dans un PDF:
-      - "L02B G03" -> "L02BG03"
-      - "N03AX14." -> "N03AX14"
-    """
+def normalize_atc_code(raw: str) -> str:
+    """Accepte 'C10A A07', 'C10AA07.', 'Code ATC : C10AA07' etc -> 'C10AA07'."""
     s = safe_text(raw).upper()
+    if not s:
+        return ""
     s = s.replace("\u00A0", " ")
-    s = re.sub(r"[^A-Z0-9 ]", "", s)
-    s = re.sub(r"\s+", "", s)
-    # garde uniquement 7 chars si ça match
-    if len(s) >= 7:
-        s7 = s[:7]
-        if ATC7_PAT.fullmatch(s7):
-            return s7
-    return s if ATC7_PAT.fullmatch(s) else ""
+    # garde uniquement lettres/chiffres/espace
+    s2 = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    # cherche ATC 7 avec espaces possibles entre les 5 et les 2 derniers chiffres
+    m = re.search(r"\b([A-Z]\d{2}[A-Z]{2})\s*([0-9]{2})\b", s2)
+    if m:
+        return (m.group(1) + m.group(2)).strip()
+    # fallback strict
+    m2 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", s2)
+    return m2.group(1).strip() if m2 else ""
 
 def atc_level4_from_any(atc: str) -> str:
     a = (atc or "").strip().upper()
@@ -259,6 +244,10 @@ def atc_level4_from_any(atc: str) -> str:
         return a[:5]
     if ATC5_PAT.fullmatch(a):
         return a
+    # tolère espaces
+    a2 = normalize_atc_code(a)
+    if ATC7_PAT.fullmatch(a2):
+        return a2[:5]
     m7 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", a)
     if m7:
         return m7.group(1)[:5]
@@ -432,14 +421,6 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
             cis_to_set.setdefault(cis, {})
             cis_to_set[cis][key] = dci
 
-    for cis, kv in cis_to_set.items():
-        keys = set(kv.keys())
-        if "hydroxyde ferrique" in keys and "saccharose" in keys:
-            kv.pop("hydroxyde ferrique", None)
-            kv.pop("saccharose", None)
-            kv.pop("fer", None)
-            kv["fer saccharose"] = "Fer saccharose"
-
     out: Dict[str, str] = {}
     for cis, kv in cis_to_set.items():
         values = list(kv.values())
@@ -456,37 +437,33 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
 def base_extrait_url_from_cis(cis: str) -> str:
     return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
-def normalize_to_fiche_info(url: str, cis_fallback: str) -> str:
+def normalize_with_tab(url: str, cis_fallback: str, tab: str) -> str:
     if not url or not url.startswith("http"):
-        return f"{base_extrait_url_from_cis(cis_fallback)}?tab=fiche-info"
+        return f"{base_extrait_url_from_cis(cis_fallback)}?tab={urllib.parse.quote(tab)}"
     parts = urllib.parse.urlsplit(url)
     qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-    qs["tab"] = ["fiche-info"]
+    qs["tab"] = [tab]
     new_query = urllib.parse.urlencode(qs, doseq=True)
     cleaned = parts._replace(query=new_query, fragment="")
     return urllib.parse.urlunsplit(cleaned)
 
-def normalize_to_rcp_notice(url: str, cis_fallback: str) -> str:
-    """
-    Page "Résumé des caractéristiques du produit et Notice" : là où se trouve souvent le lien PDF.
-    """
-    if not url or not url.startswith("http"):
-        return f"{base_extrait_url_from_cis(cis_fallback)}?tab=rcp-et-notice"
-    parts = urllib.parse.urlsplit(url)
-    qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-    qs["tab"] = ["rcp-et-notice"]
-    new_query = urllib.parse.urlencode(qs, doseq=True)
-    cleaned = parts._replace(query=new_query, fragment="")
-    return urllib.parse.urlunsplit(cleaned)
+def normalize_to_fiche_info(url: str, cis_fallback: str) -> str:
+    return normalize_with_tab(url, cis_fallback, "fiche-info")
+
+def normalize_to_rcp(url: str, cis_fallback: str) -> str:
+    return normalize_with_tab(url, cis_fallback, "rcp")
+
+def normalize_to_rcp_et_notice(url: str, cis_fallback: str) -> str:
+    return normalize_with_tab(url, cis_fallback, "rcp-et-notice")
 
 def rcp_link_default(cis: str) -> str:
-    return f"{base_extrait_url_from_cis(cis)}?tab=rcp-et-notice"
+    return f"{base_extrait_url_from_cis(cis)}?tab=rcp"
 
 # ============================================================
 # DOWNLOAD
 # ============================================================
 
-def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.0)) -> requests.Response:
+def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 30.0)) -> requests.Response:
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -498,14 +475,14 @@ def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.
     raise RuntimeError(f"GET failed: {url} / {last_err}")
 
 def download_text(url: str, encoding: str = "latin-1") -> str:
-    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 40.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} for {url}")
     r.encoding = encoding
     return r.text
 
 def download_bytes(url: str) -> bytes:
-    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 80.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} for {url}")
     return r.content
@@ -515,7 +492,7 @@ def download_bytes(url: str) -> bytes:
 # ============================================================
 
 def find_ansm_retro_excel_link() -> str:
-    r = http_get(ANSM_RETRO_PAGE, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
+    r = http_get(ANSM_RETRO_PAGE, timeout=(HTTP_CONNECT_TIMEOUT, 30.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {ANSM_RETRO_PAGE}")
     soup = BeautifulSoup(r.text, _bs_parser())
@@ -550,6 +527,7 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
         ext = url_hint.lower().split("?")[0].split("#")[0]
         ext = os.path.splitext(ext)[1].lower()
 
+    import io
     if ext == ".xlsx":
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
@@ -565,10 +543,11 @@ def parse_ansm_retrocession_cis(excel_bytes: bytes, url_hint: str = "") -> Set[s
                 cis_set.add(v)
         return cis_set
 
+    # xlrd 2.0.1 lit uniquement .xls
     try:
         import xlrd  # type: ignore
     except Exception:
-        raise RuntimeError("Le fichier ANSM est en .xls mais 'xlrd' n'est pas installé. pip install xlrd==1.2.0")
+        raise RuntimeError("Le fichier ANSM est en .xls mais 'xlrd' n'est pas installé. pip install xlrd==2.0.1")
 
     book = xlrd.open_workbook(file_contents=excel_bytes)
     sheet = book.sheet_by_index(0)
@@ -696,14 +675,8 @@ NEGATION_PAT = re.compile(
 )
 
 GLOSSARY_PAT = re.compile(r"\baller\s+au\s+glossaire\b", flags=re.IGNORECASE)
-ATC_PAT = re.compile(r"\b[A-Z]\d{2}[A-Z]{2}\d{2}\b")
-PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
 
-# "code ATC : L02B G03" (avec espace)
-CODE_ATC_INLINE_PAT = re.compile(
-    r"(?:code\s*ATC|ATC\s*code)\s*[:\-]?\s*([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})",
-    re.IGNORECASE
-)
+PHARM_CLASS_LINE_PAT = re.compile(r"^Classe\s+pharmacoth[ée]rapeutique\b", re.IGNORECASE)
 
 class PageUnavailable(Exception):
     def __init__(self, url: str, status: Optional[int], detail: str):
@@ -730,7 +703,7 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout)
+            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout, allow_redirects=True)
             if r.status_code == 404:
                 raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
@@ -799,34 +772,28 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
 
     return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
-def extract_atc_from_fiche_info(soup: BeautifulSoup) -> str:
-    text = soup.get_text("\n", strip=True)
-    m = CODE_ATC_INLINE_PAT.search(text or "")
-    if m:
-        return _normalize_atc_code(m.group(1))
-    m2 = ATC_PAT.search(text or "")
-    return m2.group(0).strip() if m2 else ""
-
-def extract_pharm_class_and_atc_from_fiche_info(soup: BeautifulSoup) -> Tuple[str, str]:
-    lines = [ln.strip() for ln in soup.get_text("\n", strip=True).split("\n") if ln.strip()]
-    for ln in lines:
-        if not PHARM_CLASS_LINE_PAT.search(ln):
-            continue
-
-        atc = ""
-        m_atc = CODE_ATC_INLINE_PAT.search(ln)
-        if m_atc:
-            atc = _normalize_atc_code(m_atc.group(1))
-
-        s = re.sub(PHARM_CLASS_LINE_PAT, "", ln).strip()
-        s = s.lstrip(":").strip()
-        return s, atc
-
-    return "", ""
-
 def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
+
+def extract_atc_from_text_any(text: str) -> str:
+    """Cherche un ATC dans du texte (html ou pdf), tolère espaces."""
+    if not text:
+        return ""
+    t = text.replace("\u00A0", " ")
+    # cas le plus fiable : "Code ATC : ..."
+    m = re.search(r"(?:code\s*)?ATC\s*(?:code)?\s*[:\-]\s*([A-Z]\d{2}[A-Z]{2}\s*\d{2})", t, flags=re.IGNORECASE)
+    if m:
+        return normalize_atc_code(m.group(1))
+    # fallback : trouve un motif ATC autour du mot ATC
+    m2 = re.search(r"ATC.{0,60}?([A-Z]\d{2}[A-Z]{2}\s*\d{2})", t, flags=re.IGNORECASE | re.DOTALL)
+    if m2:
+        return normalize_atc_code(m2.group(1))
+    # dernier fallback : code ATC brut (rare en pdf)
+    m3 = re.search(r"\b([A-Z]\d{2}[A-Z]{2})\s*([0-9]{2})\b", t)
+    if m3:
+        return normalize_atc_code(m3.group(0))
+    return ""
 
 def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     html = fetch_html_checked(fiche_url)
@@ -837,8 +804,8 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     cpd_text = extract_cpd_from_fiche_info(soup)
     cpd_text = capitalize_each_line(cpd_text)
 
-    _pharm_class, atc_from_class_line = extract_pharm_class_and_atc_from_fiche_info(soup)
-    atc_code = (atc_from_class_line.strip() or extract_atc_from_fiche_info(soup)).strip()
+    # ATC (souvent absent dans fiche-info)
+    atc_code = extract_atc_from_text_any(soup.get_text("\n", strip=True))
 
     badge_usage = extract_badge_usage_hospitalier_only(soup)
 
@@ -877,132 +844,106 @@ def compute_disponibilite(
     return "Pas d'information sur la disponibilité mentionnée"
 
 # ============================================================
-# PDF RCP -> EXTRACTION ATC
+# RCP (HTML + PDF) ATC FALLBACK
 # ============================================================
 
-ATC_PDF_PAT = re.compile(
-    r"(?:code\s*ATC|ATC\s*code)\s*[:\-]?\s*([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})",
-    re.IGNORECASE
-)
-
-def _abs_url(href: str, base_url: str) -> str:
-    href = (href or "").strip()
-    if not href:
-        return ""
-    return urllib.parse.urljoin(base_url, href)
-
-def find_pdf_url_on_rcp_notice_page(rcp_page_url: str) -> str:
-    html = fetch_html_checked(rcp_page_url)
-    soup = BeautifulSoup(html, _bs_parser())
-
-    candidates: List[str] = []
-
+def find_pdf_links_in_soup(soup: BeautifulSoup, base_url: str) -> List[str]:
+    urls: List[str] = []
     for a in soup.find_all("a", href=True):
-        href = _abs_url(a.get("href", ""), rcp_page_url)
+        href = (a.get("href") or "").strip()
         if not href:
             continue
+        # absolute
+        if href.startswith("/"):
+            href = urllib.parse.urljoin(base_url, href)
+        if not href.startswith("http"):
+            continue
         low = href.lower()
-        txt = (a.get_text(" ", strip=True) or "").lower()
-
-        # liens directs PDF
-        if low.endswith(".pdf"):
-            candidates.append(href)
+        if ".pdf" in low:
+            urls.append(href)
+            continue
+        # EMA product-information souvent sans .pdf évident au début : mais généralement oui
+        if "ema.europa.eu" in low and "product-information" in low and ("pdf" in low):
+            urls.append(href)
             continue
 
-        # EMA / documents/product-information/...pdf
-        if ("ema.europa.eu" in low or "documents/product-information" in low) and ".pdf" in low:
-            candidates.append(href)
-            continue
-
-        # lien texte "vers le rcp" ou "rcp et notice"
-        if ("rcp" in txt or "notice" in txt) and (".pdf" in low):
-            candidates.append(href)
-            continue
-
-    # fallback: parfois le PDF est dans un attribut data-*
-    if not candidates:
-        for el in soup.find_all(attrs=True):
-            for k, v in list(el.attrs.items()):
-                if not isinstance(v, str):
-                    continue
-                vv = v.strip()
-                if vv.lower().endswith(".pdf"):
-                    candidates.append(_abs_url(vv, rcp_page_url))
-
-    # dédoublonnage, conserve ordre
+    # dédoublonne en gardant l'ordre
     seen = set()
-    dedup = []
-    for c in candidates:
-        if c in seen:
+    out = []
+    for u in urls:
+        if u in seen:
             continue
-        seen.add(c)
-        dedup.append(c)
+        seen.add(u)
+        out.append(u)
+    return out
 
-    # Heuristique : préfère EMA si présent
-    for c in dedup:
-        if "ema.europa.eu" in c.lower():
-            return c
-    return dedup[0] if dedup else ""
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Extraction robuste:
-      1) pdfminer.six si dispo (meilleur)
-      2) pypdf fallback
-    """
-    # 1) pdfminer
+def extract_atc_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    # 1) PyMuPDF si dispo (rapide)
     try:
-        from pdfminer.high_level import extract_text  # type: ignore
-        return extract_text(io.BytesIO(pdf_bytes)) or ""
+        import fitz  # type: ignore  # pymupdf
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            text = page.get_text("text") or ""
+            atc = extract_atc_from_text_any(text)
+            if atc:
+                return atc
+        return ""
     except Exception:
         pass
 
-    # 2) pypdf
+    # 2) pypdf fallback (plus lent)
     try:
         from pypdf import PdfReader  # type: ignore
+        import io
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        texts = []
-        for page in reader.pages:
-            try:
-                t = page.extract_text() or ""
-            except Exception:
-                t = ""
-            if t:
-                texts.append(t)
-        return "\n".join(texts)
+        for p in reader.pages:
+            text = p.extract_text() or ""
+            atc = extract_atc_from_text_any(text)
+            if atc:
+                return atc
+        return ""
     except Exception:
         return ""
 
-def extract_atc_from_pdf_text(text: str) -> str:
-    if not text:
-        return ""
-    m = ATC_PDF_PAT.search(text)
-    if m:
-        return _normalize_atc_code(m.group(1))
-
-    # fallback: attrape un ATC "nu" proche de "ATC"
-    # ex "... Code ATC : N03AX14." déjà géré, mais on garde un backup
-    idx = text.lower().find("atc")
-    if idx != -1:
-        window = text[max(0, idx-200): idx+200]
-        m2 = re.search(r"\b([A-Z]\s*\d{2}\s*[A-Z]{2}\s*\d{2})\b", window)
-        if m2:
-            return _normalize_atc_code(m2.group(1))
-
-    return ""
-
-def get_atc_from_rcp_pdf(rcp_page_url: str) -> Tuple[str, str]:
+def extract_atc_from_rcp_html_or_pdf(rcp_url: str, cis: str) -> Tuple[str, str, str]:
     """
-    Retourne (atc_code, pdf_url)
+    Retourne (atc, source, pdf_url)
+    source in {"rcp_html", "pdf", ""}
     """
-    pdf_url = find_pdf_url_on_rcp_notice_page(rcp_page_url)
-    if not pdf_url:
-        return "", ""
+    # essaie 2 tabs possibles
+    candidate_urls = [
+        normalize_to_rcp(rcp_url, cis),
+        normalize_to_rcp_et_notice(rcp_url, cis),
+    ]
+    tried = set()
 
-    pdf_bytes = download_bytes(pdf_url)
-    txt = extract_text_from_pdf(pdf_bytes)
-    atc = extract_atc_from_pdf_text(txt)
-    return atc, pdf_url
+    for url in candidate_urls:
+        if url in tried:
+            continue
+        tried.add(url)
+        try:
+            html = fetch_html_checked(url)
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(html, _bs_parser())
+        text = soup.get_text("\n", strip=True)
+
+        atc_html = extract_atc_from_text_any(text)
+        if atc_html:
+            return atc_html, "rcp_html", ""
+
+        pdf_links = find_pdf_links_in_soup(soup, base_url=url)
+        for pdf_url in pdf_links:
+            try:
+                pdf_bytes = download_bytes(pdf_url)
+            except Exception:
+                continue
+            atc_pdf = extract_atc_from_pdf_bytes(pdf_bytes)
+            if atc_pdf:
+                return atc_pdf, "pdf", pdf_url
+
+    return "", "", ""
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -1139,7 +1080,7 @@ def main():
         FIELD_VOIE,
         FIELD_ATC,
         FIELD_ATC4,        # lecture
-        FIELD_ATC_LABEL,   # écriture
+        FIELD_ATC_LABEL,   # écriture possible
         FIELD_COMPOSITION, # écriture
     ]
 
@@ -1190,7 +1131,8 @@ def main():
                 else:
                     fields[FIELD_COMPOSITION] = compo
 
-            fields.pop(FIELD_ATC4, None)
+            fields.pop(FIELD_ATC4, None)  # sécurité
+
             new_recs.append({"fields": fields})
 
         at.create_records(new_recs)
@@ -1226,28 +1168,20 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) + fallback PDF RCP si ATC manquant ...")
+    info("Enrichissement (fiche-info) + fallback RCP/ PDF ATC + libellé ATC + composition ...")
 
     updates = []
     failures = 0
     deleted_count = 0
     start = time.time()
 
-    # stats PDF
     rcp_checks = 0
     pdf_hits = 0
     pdf_atc_added = 0
 
-    # cache pour éviter de retélécharger 50 fois le même PDF EMA
-    pdf_atc_cache: Dict[str, str] = {}  # pdf_url -> atc_code
-    rcp_page_pdf_cache: Dict[str, str] = {}  # rcp_page_url -> pdf_url (peut être vide)
-
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | "
-                f"RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}"
-            )
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added}")
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1256,7 +1190,7 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields = {}
 
-        # ✅ Composition depuis BDPM_COMPO + ajout version sans accent
+        # ✅ Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
@@ -1267,7 +1201,7 @@ def main():
             if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # ✅ Libellé ATC via computed FIELD_ATC4
+        # ✅ Libellé ATC depuis computed ATC4
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1278,7 +1212,6 @@ def main():
 
         # infos BDPM CIS
         row = cis_map.get(cis)
-        specialite_bdpm = safe_text(row.specialite) if row else ""
         if row:
             labo = normalize_lab_name(row.titulaire)
             if labo and str(fields_cur.get(FIELD_LABO, "")).strip() != labo:
@@ -1303,7 +1236,6 @@ def main():
             upd_fields[FIELD_RCP] = link_rcp
 
         fiche_url = normalize_to_fiche_info(link_rcp, cis)
-        rcp_page_url = normalize_to_rcp_notice(link_rcp, cis)
 
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
@@ -1312,8 +1244,6 @@ def main():
         need_fetch = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_atc)
         is_retro = cis in ansm_retro_cis
 
-        # 1) FICHE-INFO d'abord
-        atc_found = cur_atc
         if need_fetch:
             try:
                 cpd_text, is_homeo, reserved_hosp, usage_hosp, atc_code = analyze_fiche_info(fiche_url)
@@ -1321,13 +1251,35 @@ def main():
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
+                # ATC depuis fiche-info si dispo
+                atc_code = normalize_atc_code(atc_code)
                 if atc_code and atc_code != cur_atc:
                     upd_fields[FIELD_ATC] = atc_code
-                    atc_found = atc_code
 
-                # libellé ATC si on a un code
-                if atc_code:
-                    atc4_tmp = atc_level4_from_any(atc_code)
+                # ✅ Fallback RCP/PDF si ATC absent
+                final_atc = normalize_atc_code(upd_fields.get(FIELD_ATC, "") or cur_atc)
+                if not final_atc:
+                    rcp_checks += 1
+                    atc2, src, pdf_url = extract_atc_from_rcp_html_or_pdf(link_rcp, cis)
+                    atc2 = normalize_atc_code(atc2)
+                    if atc2:
+                        if atc2 != cur_atc:
+                            upd_fields[FIELD_ATC] = atc2
+                        if src == "pdf":
+                            pdf_hits += 1
+                            pdf_atc_added += 1
+                            append_pdf_atc_report(
+                                cis=cis,
+                                atc=atc2,
+                                pdf_url=pdf_url or "",
+                                rcp_url=normalize_to_rcp(link_rcp, cis),
+                                specialite=safe_text(fields_cur.get(FIELD_SPEC, "")),
+                            )
+
+                # Libellé ATC via calcul local si ATC ok
+                final_atc_now = normalize_atc_code(upd_fields.get(FIELD_ATC, "") or cur_atc)
+                if final_atc_now:
+                    atc4_tmp = atc_level4_from_any(final_atc_now)
                     if atc4_tmp:
                         label = atc_labels.get(atc4_tmp, "")
                         if label and label != cur_label:
@@ -1363,57 +1315,10 @@ def main():
 
             except Exception as e:
                 failures += 1
-                warn(f"Fiche-info KO CIS={cis}: {e} (on continue)")
-
-        # 2) FALLBACK PDF: si ATC toujours manquant
-        # (aucune limitation de nombre de checks)
-        if not (atc_found or "").strip():
-            try:
-                rcp_checks += 1
-
-                # récupère (ou retrouve) l'URL PDF depuis la page RCP
-                pdf_url = rcp_page_pdf_cache.get(rcp_page_url, None)
-                if pdf_url is None:
-                    pdf_url = find_pdf_url_on_rcp_notice_page(rcp_page_url)
-                    rcp_page_pdf_cache[rcp_page_url] = pdf_url or ""
-
-                if pdf_url:
-                    # cache: si déjà téléchargé
-                    if pdf_url in pdf_atc_cache:
-                        atc_pdf = pdf_atc_cache[pdf_url]
-                    else:
-                        pdf_bytes = download_bytes(pdf_url)
-                        txt = extract_text_from_pdf(pdf_bytes)
-                        atc_pdf = extract_atc_from_pdf_text(txt)
-                        pdf_atc_cache[pdf_url] = atc_pdf or ""
-
-                    if atc_pdf:
-                        pdf_hits += 1
-                        if atc_pdf != cur_atc:
-                            upd_fields[FIELD_ATC] = atc_pdf
-                            pdf_atc_added += 1
-                            append_pdf_atc_report(
-                                cis=cis,
-                                specialite=specialite_bdpm,
-                                old_atc=cur_atc,
-                                new_atc=atc_pdf,
-                                rcp_page_url=rcp_page_url,
-                                pdf_url=pdf_url,
-                            )
-
-                        # libellé ATC si on peut
-                        atc4_tmp = atc_level4_from_any(atc_pdf)
-                        if atc4_tmp:
-                            label = atc_labels.get(atc4_tmp, "")
-                            if label and label != cur_label:
-                                upd_fields[FIELD_ATC_LABEL] = label
-
-            except Exception as e:
-                failures += 1
-                warn(f"PDF RCP KO CIS={cis}: {e} (on continue)")
+                warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
         if upd_fields:
-            upd_fields.pop(FIELD_ATC4, None)
+            upd_fields.pop(FIELD_ATC4, None)  # sécurité
             updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
@@ -1426,9 +1331,8 @@ def main():
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | "
-                f"RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
-                f"reste ~{int(remaining)}s"
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
+                f"| RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1437,10 +1341,9 @@ def main():
 
     try_git_commit_report()
     ok(
-        "Terminé. "
-        f"échecs: {failures} | supprimés: {deleted_count} | "
+        f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
         f"RCP checks: {rcp_checks} | PDF hits: {pdf_hits} | PDF ATC added: {pdf_atc_added} | "
-        f"rapport deletions: {report_path_today_deleted()} | rapport PDF ATC: {report_path_today_pdf_atc()}"
+        f"rapport_pdf_atc: {report_path_today_pdf_atc()}"
     )
 
 if __name__ == "__main__":
