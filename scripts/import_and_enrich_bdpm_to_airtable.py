@@ -857,91 +857,168 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
     return cpd_text, is_homeo, reserved, usage, atc_code
 
 def analyze_rcp_html_for_atc(rcp_url: str) -> str:
-    """Récupère ATC depuis la page RCP HTML (quand dispo)."""
+    """Récupère ATC depuis la page RCP (même si le texte est dans du HTML/JSON embarqué)."""
     try:
         html = fetch_html_checked(rcp_url, max_retries=2)
     except Exception:
         return ""
+
+    # 1) cherche dans le HTML brut (au cas où ATC est dans un JSON embarqué)
+    atc = extract_atc_from_text_blob(html)
+    if atc:
+        return atc
+
+    # 2) cherche dans le texte rendu
     soup = BeautifulSoup(html, _bs_parser())
     text = soup.get_text("\n", strip=True)
     return extract_atc_from_text_blob(text)
+
 
 # ============================================================
 # PDF (RCP/EMA) -> extraction ATC
 # ============================================================
 
-def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
-    """
-    Sur tab=rcp-et-notice, la BDPM met souvent un lien "Vers le RCP et la notice"
-    qui pointe vers un PDF EMA. On récupère l'URL du PDF.
-    """
-    # si déjà un PDF
-    if rcp_notice_url.lower().split("?")[0].endswith(".pdf"):
-        return rcp_notice_url
+PDF_URL_RE = re.compile(r'(https?:\/\/[^\s"\'<>]+\.pdf)', re.IGNORECASE)
+PDF_URL_RE2 = re.compile(r'(\/\/[^\s"\'<>]+\.pdf)', re.IGNORECASE)
 
-    html = fetch_html_checked(rcp_notice_url, max_retries=2)
-    soup = BeautifulSoup(html, _bs_parser())
+def _looks_like_pdf_bytes(b: bytes) -> bool:
+    return b.startswith(b"%PDF")
 
-    candidates: List[str] = []
+def _resolve_and_validate_pdf(url: str) -> str:
+    """Retourne url si c'est bien un PDF (content-type ou %PDF). Sinon ''. """
+    if not url:
+        return ""
+    try:
+        r = requests.get(url, headers=HEADERS_WEB, timeout=(HTTP_CONNECT_TIMEOUT, 60), stream=True, allow_redirects=True)
+        if r.status_code >= 400:
+            return ""
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/pdf" in ct:
+            return r.url
+        # sinon vérifie la signature %PDF
+        head = r.raw.read(5)  # lit quelques octets
+        if _looks_like_pdf_bytes(head):
+            return r.url
+    except Exception:
+        return ""
+    return ""
+
+def _extract_pdf_urls_from_any_html(html: str) -> List[str]:
+    urls = []
+    for m in PDF_URL_RE.findall(html or ""):
+        urls.append(m.strip())
+    for m in PDF_URL_RE2.findall(html or ""):
+        u = m.strip()
+        if u.startswith("//"):
+            u = "https:" + u
+        urls.append(u)
+    # dédoublonne
+    out = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def _extract_candidate_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+    cand = []
+
+    # a href
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href:
             continue
-        # absolutiser
-        href = urllib.parse.urljoin(rcp_notice_url, href)
-        low = href.lower()
-        if ".pdf" in low:
-            candidates.append(href)
+        href = urllib.parse.urljoin(base_url, href)
+        txt = (a.get_text(" ", strip=True) or "").lower()
 
-    if not candidates:
+        # garde les pdf directs
+        if ".pdf" in href.lower():
+            cand.append(href)
+            continue
+
+        # garde les liens "vers le rcp et la notice" même si pas .pdf
+        if ("rcp" in txt and "notice" in txt) or ("vers le rcp" in txt) or ("product-information" in href.lower()) or ("ema.europa.eu" in href.lower()):
+            cand.append(href)
+
+    # iframe/embed/object src/data
+    for tag in soup.find_all(["iframe", "embed", "object"]):
+        for attr in ["src", "data"]:
+            v = (tag.get(attr) or "").strip()
+            if not v:
+                continue
+            v = urllib.parse.urljoin(base_url, v)
+            if ".pdf" in v.lower():
+                cand.append(v)
+
+    # dédoublonne
+    out = []
+    seen = set()
+    for u in cand:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def find_pdf_url_from_rcp_notice_page(rcp_notice_url: str) -> str:
+    """
+    Sur tab=rcp-et-notice, le lien est parfois chargé côté navigateur.
+    On cherche donc dans:
+      - le HTML brut (regex .pdf)
+      - les balises <a>, <iframe>, <embed>, <object>
+      - si on trouve une page EMA HTML, on l'ouvre et on re-extrait un .pdf
+      - on valide en vérifiant content-type ou signature %PDF
+    """
+    # Si déjà un PDF
+    if rcp_notice_url.lower().split("?")[0].endswith(".pdf"):
+        return _resolve_and_validate_pdf(rcp_notice_url)
+
+    try:
+        html = fetch_html_checked(rcp_notice_url, max_retries=2)
+    except Exception:
         return ""
 
-    # scoring: prioriser EMA product-information, sinon juste pdf
-    def score(u: str) -> Tuple[int, int]:
+    # 1) PDF dans le HTML brut (souvent dans JSON embarqué)
+    pdfs = _extract_pdf_urls_from_any_html(html)
+    for u in pdfs:
+        ok_pdf = _resolve_and_validate_pdf(u)
+        if ok_pdf:
+            return ok_pdf
+
+    # 2) parsing DOM
+    soup = BeautifulSoup(html, _bs_parser())
+    candidates = _extract_candidate_links(soup, rcp_notice_url)
+
+    # 2a) si candidate finit par .pdf -> valide direct
+    for u in candidates:
+        if ".pdf" in u.lower():
+            ok_pdf = _resolve_and_validate_pdf(u)
+            if ok_pdf:
+                return ok_pdf
+
+    # 2b) si candidate est une page EMA (HTML) -> l'ouvrir et trouver le pdf dedans
+    for u in candidates:
         low = u.lower()
-        s = 0
-        if "ema.europa.eu" in low:
-            s += 5
-        if "documents/product-information" in low:
-            s += 5
-        if low.endswith(".pdf"):
-            s += 2
-        return (s, len(u))
-
-    candidates.sort(key=score, reverse=True)
-    return candidates[0]
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 25) -> str:
-    """
-    Extrait texte PDF (priorité PyMuPDF, fallback pypdf).
-    max_pages limite le coût (souvent ATC est dans les premières ~15 pages du RCP EMA).
-    """
-    # PyMuPDF
-    if fitz is not None:
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            n = min(len(doc), max_pages)
-            parts = []
-            for i in range(n):
-                parts.append(doc.load_page(i).get_text("text"))
-            return "\n".join(parts)
-        except Exception:
-            pass
-
-    # fallback pypdf
-    if PdfReader is not None:
-        try:
-            import io
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            n = min(len(reader.pages), max_pages)
-            parts = []
-            for i in range(n):
-                parts.append(reader.pages[i].extract_text() or "")
-            return "\n".join(parts)
-        except Exception:
-            pass
+        if "ema.europa.eu" in low or "product-information" in low:
+            try:
+                r = requests.get(u, headers=HEADERS_WEB, timeout=(HTTP_CONNECT_TIMEOUT, 60), allow_redirects=True)
+                if r.status_code >= 400:
+                    continue
+                # si c'est déjà un PDF
+                ct = (r.headers.get("content-type") or "").lower()
+                if "application/pdf" in ct:
+                    return r.url
+                # sinon cherche .pdf dans cette page
+                inner_pdfs = _extract_pdf_urls_from_any_html(r.text)
+                for pu in inner_pdfs:
+                    ok_pdf = _resolve_and_validate_pdf(pu)
+                    if ok_pdf:
+                        return ok_pdf
+            except Exception:
+                continue
 
     return ""
+
 
 def extract_atc_from_pdf_bytes(pdf_bytes: bytes) -> str:
     text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=30)
