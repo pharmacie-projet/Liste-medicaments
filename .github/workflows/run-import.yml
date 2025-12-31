@@ -1,26 +1,19 @@
-name: run-import
+name: Sync IPP
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # Hiver (CET): 01:00 Paris = 00:00 UTC
-    - cron: "0 0 4 11,12,1,2,3 *"
-    # Été (CEST): 01:00 Paris = 23:00 UTC la veille
-    - cron: "0 23 3 4,5,6,7,8,9,10 *"
+    # Tous les 1, 8, 15, 22, 29 à 01:00 UTC
+    - cron: "0 1 1,8,15,22,29 * *"
+  workflow_dispatch:
 
 jobs:
-  run-import:
+  sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (OCR + PDF rendering)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra poppler-utils
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -30,21 +23,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run import (download + inventory + enrich + OCR fallback)
+      - name: Run sync
         env:
           AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
-          # OCR controls (optionnels)
-          OCR_ENABLE: "1"
-          OCR_MAX_PAGES: "25"
-          OCR_DPI: "200"
+          AIRTABLE_MIN_DELAY_S: "0.25"
+          UPDATE_FLUSH_THRESHOLD: "200"
+          GITHUB_COMMIT_REPORT: "0"
         run: |
-          python scripts/import_and_enrich_bdpm_to_airtable.py
-
-      - name: Upload reports (PDF/OCR)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports
-          path: reports/*
+          python scripts/process_and_upload_combined.py
