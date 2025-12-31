@@ -2,7 +2,6 @@ name: Sync IPP
 
 on:
   schedule:
-    # Tous les 1, 8, 15, 22, 29 à 01:00 UTC
     - cron: "0 1 1,8,15,22,29 * *"
   workflow_dispatch:
 
@@ -30,6 +29,5 @@ jobs:
           AIRTABLE_CIS_TABLE_NAME: ${{ secrets.AIRTABLE_CIS_TABLE_NAME }}
           AIRTABLE_MIN_DELAY_S: "0.25"
           UPDATE_FLUSH_THRESHOLD: "200"
-          GITHUB_COMMIT_REPORT: "0"
         run: |
-          python scripts/process_and_upload_combined.py
+          python scripts/import_and_enrich_bdpm_to_airtable.py
