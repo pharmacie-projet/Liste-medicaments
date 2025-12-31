@@ -21,36 +21,35 @@ try:
 except Exception:
     pd = None  # noqa
 
-
 # ============================================================
 # CONFIG
 # ============================================================
 
+# BDPM (TXT)
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
-# Page de téléchargement BDPM (pour récupérer dynamiquement le fichier "médicaments d'intérêt thérapeutique majeur")
-BDPM_DOWNLOAD_PAGE = "https://base-donnees-publique.medicaments.gouv.fr/telechargement"
+# BDPM "Médicaments d'intérêt thérapeutique majeur" (CIS -> ATC)
+BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
 
+# BDPM "Informations importantes" (génération en direct) (CIS -> URL info importante)
+BDPM_INFO_IMPORTANTES_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/CIS_InfoImportantes.txt"
+
+# Page BDPM pour fiche-info (HTML)
+BDPM_DOC_EXTRACT_URL = "https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
+
+# ANSM rétrocession
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
-AIRTABLE_API_BASE = "https://api.airtable.com/v0"
-
-HEADERS_WEB = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.7",
-}
-
 # Airtable
+AIRTABLE_API_BASE = "https://api.airtable.com/v0"
 AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))
 AIRTABLE_BATCH_SIZE = 10
 UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
 
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
 HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "25"))
-
 REQUEST_TIMEOUT = 35
 MAX_RETRIES = 4
 
@@ -62,7 +61,16 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
-# Champs Airtable (adapte ici si besoin)
+HEADERS_WEB = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.7",
+}
+
+# ============================================================
+# AIRTABLE FIELDS (adapte ici si besoin)
+# ============================================================
+
 FIELD_CIS = "Code cis"
 FIELD_RCP = "Lien vers RCP"
 FIELD_CIP13 = "CIP 13"
@@ -75,9 +83,9 @@ FIELD_VOIE = "Voie d'administration"
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
-FIELD_COMPOSITION = "Composition"        # champ à écrire (accentué + ligne sans accents)
-FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (accentué uniquement)
-FIELD_INDICATIONS = "Indications thérapeutiques"   # champ à écrire (bullets)
+FIELD_COMPOSITION = "Composition"        # champ à écrire
+FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
+FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
@@ -114,11 +122,8 @@ def retry_sleep(attempt: int):
 # REPORTING
 # ============================================================
 
-def _ensure_report_dir():
-    os.makedirs(REPORT_DIR, exist_ok=True)
-
 def report_path_deleted_today() -> str:
-    _ensure_report_dir()
+    os.makedirs(REPORT_DIR, exist_ok=True)
     fname = f"deleted_records_{time.strftime('%Y-%m-%d')}.txt"
     return os.path.join(REPORT_DIR, fname)
 
@@ -128,37 +133,20 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def report_path_indications_today() -> str:
-    _ensure_report_dir()
-    fname = f"indications_from_fiche_info_{time.strftime('%Y-%m-%d')}.tsv"
-    return os.path.join(REPORT_DIR, fname)
-
-def append_indications_report(cis: str, found: bool, fiche_url: str, added: bool, empty: bool):
-    p = report_path_indications_today()
-    header = "timestamp\tcis\tfound\tadded\tempty\tfiche_url\n"
-    if not os.path.exists(p):
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(header)
-    line = f"{_ts()}\t{cis}\t{int(found)}\t{int(added)}\t{int(empty)}\t{fiche_url}\n"
-    with open(p, "a", encoding="utf-8") as f:
-        f.write(line)
-
 def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        paths = [report_path_deleted_today(), report_path_indications_today()]
-        existing = [p for p in paths if os.path.exists(p)]
-        if not existing:
+        p = report_path_deleted_today()
+        if not os.path.exists(p):
             return
         subprocess.run(["git", "status"], check=False)
-        for p in existing:
-            subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: enrich indications ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "add", p], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: deleted records ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
-        ok("Rapports commit/push sur GitHub effectués.")
+        ok("Rapport (suppressions) commit/push sur GitHub effectué.")
     except Exception as e:
-        warn(f"Commit/push des rapports impossible (on continue): {e}")
+        warn(f"Commit/push du rapport impossible (on continue): {e}")
 
 # ============================================================
 # TEXT UTIL
@@ -215,20 +203,6 @@ def capitalize_each_line(text: str) -> str:
             out_lines.append(line)
     return "\n".join(out_lines)
 
-def to_bullets_each_line(text: str) -> str:
-    """
-    Convertit chaque saut de ligne en puce.
-    - supprime les lignes vides
-    - normalise les espaces
-    """
-    t = normalize_ws_keep_lines(text)
-    if not t:
-        return ""
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    return "\n".join([f"• {ln}" for ln in lines])
-
 def chunked(lst: List, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
@@ -241,7 +215,7 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC HELPERS
+# ATC HELPERS (pour lecture fichiers)
 # ============================================================
 
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
@@ -300,176 +274,6 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     return mapping
 
 # ============================================================
-# COMPOSITION BDPM -> DCI principales
-# ============================================================
-
-_NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
-_COMPLEX_PREFIX_RE = re.compile(r"^\s*complexe\s+d['’]\s*", flags=re.IGNORECASE)
-
-_SALT_WORDS = (
-    r"chlorhydrate|dichlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
-    r"citrate|fumarate|succinate|tartrate|mal[eé]ate|m[eé]silate|mesilate|"
-    r"tosylate|benzoate|gluconate|lactate|carbonate|phosphate|sulfate|sulphate|"
-    r"ac[eé]tate|oxalate|nitrate|nitrite|hydrog[eé]nosuccinate|"
-    r"b[eé]silate|besilate|besylate"
-)
-
-_SALT_PREFIX_RE = re.compile(rf"\b({_SALT_WORDS})\s+(?:de|d['’])\s*", flags=re.IGNORECASE)
-_SALT_LEADING_RE = re.compile(rf"^\s*({_SALT_WORDS})\s+", flags=re.IGNORECASE)
-_SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE)
-
-_PREFIX_GLUE_RES = [
-    re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(dioxyd(e|e)\s*|dioxyde)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(dioxyde)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(peroxyde)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
-]
-
-_HYDRATE_RE = re.compile(
-    r"\b("
-    r"anhydre|base|"
-    r"sesquihydrat[ée]?|"
-    r"monohydrat[ée]?|dihydrat[ée]?|trihydrat[ée]?|t[ée]trahydrat[ée]?|"
-    r"pentahydrat[ée]?|h[ée]mihydrat[ée]?|hydrat[ée]?"
-    r")\b",
-    flags=re.IGNORECASE
-)
-
-_COUNTERION_TAIL_RE = re.compile(
-    r"\b("
-    r"arginine|sodique|sodium|potassique|potassium|calcique|calcium|magnesium|magn[eé]sium|lithium|ammonium|"
-    r"zinc|cuivre|aluminium|manganese|manganèse"
-    r")\b",
-    flags=re.IGNORECASE
-)
-
-_DESC_TAIL_RE = re.compile(
-    r"\b("
-    r"humain|humaine|biog[eé]n[eé]tique|recombinant|recombinante|"
-    r"biosynth[eé]tique|biotechnologique|analogue|synthetique|synth[eé]tique"
-    r")\b",
-    flags=re.IGNORECASE
-)
-
-def _pretty_segment(s: str) -> str:
-    s = safe_text(s)
-    if not s:
-        return ""
-    s = s.lower()
-    return s[0].upper() + s[1:] if s else ""
-
-def clean_to_main_dci(raw: str) -> str:
-    s = safe_text(raw)
-    if not s:
-        return ""
-
-    s = re.sub(r"\[[^\]]*\]", " ", s)
-    s = re.sub(r"\([^)]*\)", " ", s)
-
-    s = s.replace("\\", " ")
-    s = s.replace("/", " / ")
-    s = re.sub(r"\s+", " ", s).strip()
-
-    s = _COMPLEX_PREFIX_RE.sub("", s)
-    s = _NOISE_RE.sub(" ", s)
-
-    for rgx in _PREFIX_GLUE_RES:
-        s = rgx.sub(r"\1 \2", s)
-
-    s = _SALT_GLUE_RE.sub(r"\1 \2", s)
-
-    if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
-        return ""
-
-    s = _SALT_PREFIX_RE.sub("", s)
-    s = _SALT_LEADING_RE.sub("", s)
-    s = _HYDRATE_RE.sub(" ", s)
-    s = _DESC_TAIL_RE.sub(" ", s)
-
-    s = re.sub(r"[;,:]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        return ""
-
-    tokens = s.split()
-    while tokens and _COUNTERION_TAIL_RE.fullmatch(tokens[-1]):
-        tokens.pop()
-    s = " ".join(tokens).strip()
-    if not s:
-        return ""
-
-    return _pretty_segment(s)
-
-def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
-    cis_to_set: Dict[str, Dict[str, str]] = {}
-
-    for line in txt.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-
-        cis = re.sub(r"\D", "", parts[0].strip())
-        if len(cis) != 8:
-            continue
-
-        denom = safe_text(parts[3])
-        if not denom:
-            continue
-
-        denom_norm = denom.replace("\\|", "|").replace("|", "|")
-        denom_norm = denom_norm.replace("/", "|")
-        pieces = [p.strip() for p in denom_norm.split("|") if p.strip()]
-
-        for piece in pieces:
-            dci = clean_to_main_dci(piece)
-            if not dci:
-                continue
-            key = dci.lower().strip()
-            cis_to_set.setdefault(cis, {})
-            cis_to_set[cis][key] = dci
-
-    out: Dict[str, str] = {}
-    for cis, kv in cis_to_set.items():
-        values = list(kv.values())
-        values.sort(key=lambda x: x.lower())
-        out[cis] = " - ".join(values)
-
-    ok(f"Compositions (DCI principales) chargées: {len(out)} CIS")
-    return out
-
-# ============================================================
-# URL HELPERS
-# ============================================================
-
-def base_extrait_url_from_cis(cis: str) -> str:
-    return f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
-
-def set_tab(url: str, cis_fallback: str, tab: str) -> str:
-    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
-    if not url or not url.startswith("http"):
-        url = base_extrait_url_from_cis(cis_fallback)
-    parts = urllib.parse.urlsplit(url)
-    qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-    qs["tab"] = [tab]
-    new_query = urllib.parse.urlencode(qs, doseq=True)
-
-    frag = parts.fragment or ""
-    if re.search(r"\btab=", frag):
-        frag = re.sub(r"tab=[^&]+", f"tab={tab}", frag)
-    else:
-        frag = f"tab={tab}"
-
-    cleaned = parts._replace(query=new_query, fragment=frag)
-    return urllib.parse.urlunsplit(cleaned)
-
-def rcp_link_default(cis: str) -> str:
-    return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
-
-# ============================================================
 # DOWNLOAD
 # ============================================================
 
@@ -485,7 +289,7 @@ def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.
     raise RuntimeError(f"GET failed: {url} / {last_err}")
 
 def download_text(url: str, encoding: str = "latin-1") -> str:
-    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} for {url}")
     r.encoding = encoding
@@ -670,137 +474,238 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# BDPM - fichier "médicaments d'intérêt thérapeutique majeur" -> ATC
+# COMPOSITION BDPM -> DCI principales
 # ============================================================
 
-def find_bdpm_itm_file_link() -> str:
-    """
-    Récupère dynamiquement le lien du "Fichier des médicaments d'intérêt thérapeutique majeur"
-    depuis la page /telechargement.
-    """
-    r = http_get(BDPM_DOWNLOAD_PAGE, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} {BDPM_DOWNLOAD_PAGE}")
-    soup = BeautifulSoup(r.text, _bs_parser())
+_NOISE_RE = re.compile(r"\b(pour\s+pr[ée]parations?\s+hom[ée]opathiques)\b", flags=re.IGNORECASE)
+_COMPLEX_PREFIX_RE = re.compile(r"^\s*complexe\s+d['’]\s*", flags=re.IGNORECASE)
 
-    # match texte "intérêt thérapeutique majeur" (tolérant accents)
-    def norm(s: str) -> str:
-        return strip_accents(safe_text(s)).lower()
+_SALT_WORDS = (
+    r"chlorhydrate|dichlorhydrate|bromhydrate|chlorure|bromure|iodure|fluorure|"
+    r"citrate|fumarate|succinate|tartrate|mal[eé]ate|m[eé]silate|mesilate|"
+    r"tosylate|benzoate|gluconate|lactate|carbonate|phosphate|sulfate|sulphate|"
+    r"ac[eé]tate|oxalate|nitrate|nitrite|hydrog[eé]nosuccinate|"
+    r"b[eé]silate|besilate|besylate"
+)
 
-    candidates: List[str] = []
-    for a in soup.find_all("a", href=True):
-        label = norm(a.get_text(" ", strip=True) or "")
-        href = (a.get("href") or "").strip()
-        if not href:
+_SALT_PREFIX_RE = re.compile(rf"\b({_SALT_WORDS})\s+(?:de|d['’])\s*", flags=re.IGNORECASE)
+_SALT_LEADING_RE = re.compile(rf"^\s*({_SALT_WORDS})\s+", flags=re.IGNORECASE)
+_SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE)
+
+_PREFIX_GLUE_RES = [
+    re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyd(e|e)\s*|dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(peroxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
+]
+
+_HYDRATE_RE = re.compile(
+    r"\b("
+    r"anhydre|base|"
+    r"sesquihydrat[ée]?|"
+    r"monohydrat[ée]?|dihydrat[ée]?|trihydrat[ée]?|t[ée]trahydrat[ée]?|"
+    r"pentahydrat[ée]?|h[ée]mihydrat[ée]?|hydrat[ée]?"
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+_COUNTERION_TAIL_RE = re.compile(
+    r"\b("
+    r"arginine|sodique|sodium|potassique|potassium|calcique|calcium|magnesium|magn[eé]sium|lithium|ammonium|"
+    r"zinc|cuivre|aluminium|manganese|manganèse"
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+_DESC_TAIL_RE = re.compile(
+    r"\b("
+    r"humain|humaine|biog[eé]n[eé]tique|recombinant|recombinante|"
+    r"biosynth[eé]tique|biotechnologique|analogue|synthetique|synth[eé]tique"
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+def _pretty_segment(s: str) -> str:
+    s = safe_text(s)
+    if not s:
+        return ""
+    s = s.lower()
+    return s[0].upper() + s[1:] if s else ""
+
+def clean_to_main_dci(raw: str) -> str:
+    s = safe_text(raw)
+    if not s:
+        return ""
+
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+
+    s = s.replace("\\", " ")
+    s = s.replace("/", " / ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    s = _COMPLEX_PREFIX_RE.sub("", s)
+    s = _NOISE_RE.sub(" ", s)
+
+    for rgx in _PREFIX_GLUE_RES:
+        s = rgx.sub(r"\1 \2", s)
+
+    s = _SALT_GLUE_RE.sub(r"\1 \2", s)
+
+    if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
+        return ""
+
+    s = _SALT_PREFIX_RE.sub("", s)
+    s = _SALT_LEADING_RE.sub("", s)
+    s = _HYDRATE_RE.sub(" ", s)
+    s = _DESC_TAIL_RE.sub(" ", s)
+
+    s = re.sub(r"[;,:]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    tokens = s.split()
+    while tokens and _COUNTERION_TAIL_RE.fullmatch(tokens[-1]):
+        tokens.pop()
+    s = " ".join(tokens).strip()
+    if not s:
+        return ""
+
+    return _pretty_segment(s)
+
+def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
+    cis_to_set: Dict[str, Dict[str, str]] = {}
+
+    for line in txt.splitlines():
+        if not line.strip():
             continue
-        if "interet therapeutique majeur" in label or "interet thérapeutique majeur" in label:
-            u = urllib.parse.urljoin(BDPM_DOWNLOAD_PAGE, href)
-            candidates.append(u)
+        parts = line.split("\t")
+        if len(parts) < 4:
             continue
-        # parfois le texte est court, on check aussi href
-        if "interet" in href.lower() and "therapeutique" in href.lower() and "majeur" in href.lower():
-            u = urllib.parse.urljoin(BDPM_DOWNLOAD_PAGE, href)
-            candidates.append(u)
 
-    if not candidates:
-        raise RuntimeError("Lien du fichier 'médicaments d'intérêt thérapeutique majeur' introuvable sur /telechargement")
-
-    # Déduplique
-    out = []
-    seen = set()
-    for u in candidates:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-
-    # Heuristique: préférer un lien /download/file/... si présent
-    out.sort(key=lambda u: (0 if "/download/file/" in u else 1, len(u)))
-    return out[0]
-
-def detect_delimiter(sample: str) -> str:
-    # Détecte grossièrement ; \t | ,
-    counts = {
-        "\t": sample.count("\t"),
-        ";": sample.count(";"),
-        "|": sample.count("|"),
-        ",": sample.count(","),
-    }
-    # favorise tab et ;
-    best = sorted(counts.items(), key=lambda kv: (kv[1], 1 if kv[0] == "\t" else 0, 1 if kv[0] == ";" else 0), reverse=True)[0][0]
-    return best if counts[best] > 0 else "\t"
-
-def parse_itm_cis_to_atc(file_bytes: bytes) -> Dict[str, str]:
-    """
-    Parse un fichier texte/csv/tsv et tente d'en déduire une correspondance CIS -> ATC7.
-    Très tolérant: cherche une colonne CIS (8 chiffres) et une colonne ATC (ATC7).
-    """
-    # essaie encodages
-    text = ""
-    for enc in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            text = file_bytes.decode(enc)
-            if text and len(text) > 100:
-                break
-        except Exception:
+        cis = re.sub(r"\D", "", parts[0].strip())
+        if len(cis) != 8:
             continue
-    if not text:
-        return {}
 
-    # coupe les premières lignes vides
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return {}
+        denom = safe_text(parts[3])
+        if not denom:
+            continue
 
-    delim = detect_delimiter("\n".join(lines[:5]))
-    header = lines[0]
-    cols = [safe_text(c) for c in header.split(delim)]
+        denom_norm = denom.replace("\\|", "|").replace("|", "|")
+        denom_norm = denom_norm.replace("/", "|")
+        pieces = [p.strip() for p in denom_norm.split("|") if p.strip()]
 
-    # index potentiels
-    def n(s: str) -> str:
-        return strip_accents(s).lower().replace(" ", "").replace("_", "")
-
-    cis_idx = None
-    atc_idx = None
-
-    for i, c in enumerate(cols):
-        cn = n(c)
-        if cis_idx is None and ("cis" == cn or cn.endswith("cis") or "codeciss" in cn or "codecis" in cn):
-            cis_idx = i
-        if atc_idx is None and ("atc" == cn or "codeatc" in cn or cn.endswith("atc")):
-            atc_idx = i
-
-    # fallback: pas de header fiable -> scan
-    mapping: Dict[str, str] = {}
-
-    if cis_idx is not None and atc_idx is not None:
-        for ln in lines[1:]:
-            parts = ln.split(delim)
-            if len(parts) <= max(cis_idx, atc_idx):
+        for piece in pieces:
+            dci = clean_to_main_dci(piece)
+            if not dci:
                 continue
-            cis = re.sub(r"\D", "", parts[cis_idx])
-            if len(cis) != 8:
-                continue
-            atc = canonical_atc7(parts[atc_idx])
-            if not atc:
-                # parfois ATC est ailleurs dans la ligne
-                m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", ln.upper())
-                atc = m.group(1) if m else ""
-            if atc:
-                mapping[cis] = atc
-        return mapping
+            key = dci.lower().strip()
+            cis_to_set.setdefault(cis, {})
+            cis_to_set[cis][key] = dci
 
-    # fallback total: chaque ligne -> cherche CIS et ATC7 n'importe où
-    for ln in lines[1:]:
-        cis_m = re.search(r"\b(\d{8})\b", ln)
-        atc_m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", ln.upper())
-        if not cis_m or not atc_m:
-            continue
-        mapping[cis_m.group(1)] = atc_m.group(1)
+    out: Dict[str, str] = {}
+    for cis, kv in cis_to_set.items():
+        values = list(kv.values())
+        values.sort(key=lambda x: x.lower())
+        out[cis] = " - ".join(values)
 
-    return mapping
+    ok(f"Compositions (DCI principales) chargées: {len(out)} CIS")
+    return out
 
 # ============================================================
-# FICHE-INFO SCRAPING (CPD, homeo, usage hosp) + INDICATIONS
+# BDPM MITM (CIS -> ATC)
+# ============================================================
+
+def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
+    """
+    Parse le fichier CIS_MITM.txt.
+    Format exact susceptible de varier : on fait du robuste :
+    - on récupère le premier CIS (8 chiffres) sur la ligne
+    - on récupère le premier ATC7 valide sur la ligne
+    """
+    cis_to_atc: Dict[str, str] = {}
+    for line in (txt or "").splitlines():
+        if not line.strip():
+            continue
+        cis_m = re.search(r"\b(\d{8})\b", line)
+        if not cis_m:
+            continue
+        cis = cis_m.group(1)
+        # chercher un ATC7
+        # (on tolère des séparateurs éventuels)
+        atc_m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", line.upper())
+        if not atc_m:
+            continue
+        atc = canonical_atc7(atc_m.group(1))
+        if atc:
+            cis_to_atc[cis] = atc
+    ok(f"MITM (ATC) chargé: {len(cis_to_atc)} correspondances CIS->ATC")
+    return cis_to_atc
+
+# ============================================================
+# BDPM Informations importantes (CIS -> URL)
+# ============================================================
+
+_URL_PAT = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
+
+def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
+    """
+    Parse CIS_InfoImportantes.txt (génération en direct).
+    Robuste:
+    - trouve un CIS (8 chiffres)
+    - trouve une URL (http/https) quelque part dans la ligne
+    """
+    cis_to_url: Dict[str, str] = {}
+    for line in (txt or "").splitlines():
+        if not line.strip():
+            continue
+        cis_m = re.search(r"\b(\d{8})\b", line)
+        if not cis_m:
+            continue
+        cis = cis_m.group(1)
+        um = _URL_PAT.search(line)
+        if not um:
+            continue
+        url = um.group(1).strip().rstrip(").,;")
+        # normalisation minimale
+        if url.startswith("http"):
+            cis_to_url[cis] = url
+    ok(f"Infos importantes chargées: {len(cis_to_url)} correspondances CIS->URL")
+    return cis_to_url
+
+# ============================================================
+# URL HELPERS
+# ============================================================
+
+def base_extrait_url_from_cis(cis: str) -> str:
+    return BDPM_DOC_EXTRACT_URL.format(cis=cis)
+
+def set_tab(url: str, cis_fallback: str, tab: str) -> str:
+    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
+    if not url or not url.startswith("http"):
+        url = base_extrait_url_from_cis(cis_fallback)
+    parts = urllib.parse.urlsplit(url)
+    qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+    qs["tab"] = [tab]
+    new_query = urllib.parse.urlencode(qs, doseq=True)
+
+    frag = parts.fragment or ""
+    if re.search(r"\btab=", frag):
+        frag = re.sub(r"tab=[^&]+", f"tab={tab}", frag)
+    else:
+        frag = f"tab={tab}"
+
+    cleaned = parts._replace(query=new_query, fragment=frag)
+    return urllib.parse.urlunsplit(cleaned)
+
+def rcp_link_default(cis: str) -> str:
+    return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
+
+# ============================================================
+# FICHE-INFO SCRAPING (sans recueil d'indications thérapeutiques)
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -845,9 +750,6 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
                 raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
                 raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
-            ct = (r.headers.get("content-type") or "").lower()
-            if "application/pdf" in ct:
-                raise PageUnavailable(url, r.status_code, "Page renvoie un PDF (pas HTML)")
             if not r.text or len(r.text) < 200:
                 raise PageUnavailable(url, r.status_code, "HTML vide/trop court")
             return r.text
@@ -857,6 +759,10 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
             last_err = e
             time.sleep(1.0 * attempt)
     raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
+
+def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
+    text = soup.get_text("\n", strip=True)
+    return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
 def extract_badge_usage_hospitalier_only(soup: BeautifulSoup) -> bool:
     for el in soup.find_all(["span", "div", "a", "p", "li"]):
@@ -912,107 +818,7 @@ def extract_cpd_from_fiche_info(soup: BeautifulSoup) -> str:
 
     return clean_cpd_text_keep_useful(normalize_ws_keep_lines("\n".join(collected)))
 
-def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
-    text = soup.get_text("\n", strip=True)
-    return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
-
-def extract_indications_from_fiche_info(soup: BeautifulSoup) -> str:
-    """
-    Récupère tout le contenu de la section "Indications thérapeutiques" (fiche-info),
-    jusqu'à la section suivante.
-    """
-    # repère un titre contenant "Indications thérapeutiques"
-    target = None
-    for tag in soup.find_all(["h1", "h2", "h3", "button", "a", "div", "span"]):
-        txt = safe_text(tag.get_text(" ", strip=True))
-        if not txt:
-            continue
-        if "Indications thérapeutiques" in txt:
-            target = tag
-            break
-    if target is None:
-        return ""
-
-    stop_titles = {
-        "Groupe(s) générique(s)",
-        "Composition en substances actives",
-        "Présentations",
-        "Résumé des caractéristiques du produit",
-        "Notice",
-        "Bon usage",
-        "Autres informations",
-    }
-
-    # collecte le texte suivant le titre jusqu'au prochain titre
-    collected: List[str] = []
-
-    # 1) éléments dans le même bloc parent (souvent la section est dans un container)
-    parent = target.parent
-    if parent:
-        # on parcourt les éléments après target dans l'ordre
-        seen_target = False
-        for el in parent.descendants:
-            if el == target:
-                seen_target = True
-                continue
-            if not seen_target:
-                continue
-            # stop si on retrouve une autre section
-            if getattr(el, "name", None) in {"h1", "h2", "h3"}:
-                t = safe_text(el.get_text(" ", strip=True))
-                if t in stop_titles:
-                    break
-            if getattr(el, "name", None) in {"script", "style"}:
-                continue
-            if hasattr(el, "get_text"):
-                continue  # on laisse les NavigableString gérer ci-dessous
-
-    # 2) méthode robuste: on itère sur les "siblings" du bloc du titre
-    #    (cela marche bien même si la structure HTML varie)
-    def is_stop(tag) -> bool:
-        if not tag or not getattr(tag, "name", None):
-            return False
-        if tag.name in {"h1", "h2", "h3"}:
-            t = safe_text(tag.get_text(" ", strip=True))
-            return t in stop_titles
-        return False
-
-    for sib in target.next_siblings:
-        if is_stop(sib):
-            break
-        # certains siblings sont des strings
-        try:
-            text = ""
-            if getattr(sib, "get_text", None):
-                text = sib.get_text("\n", strip=True)
-            else:
-                text = safe_text(str(sib))
-            text = normalize_ws_keep_lines(text)
-            if text:
-                collected.append(text)
-        except Exception:
-            continue
-
-    # 3) fallback: si rien trouvé via siblings, on prend un extrait global autour du titre
-    if not collected:
-        full = soup.get_text("\n", strip=True)
-        # segment entre "Indications thérapeutiques" et "Groupe(s) générique(s)" si possible
-        m = re.search(r"Indications thérapeutiques\s*(.*?)\s*(Groupe\(s\) générique\(s\)|Composition en substances actives|Présentations)\b", full, flags=re.S)
-        if m:
-            seg = normalize_ws_keep_lines(m.group(1))
-            if seg:
-                collected.append(seg)
-
-    combined = normalize_ws_keep_lines("\n".join(collected))
-    # retire répétitions éventuelles du titre
-    combined = re.sub(r"^\s*Indications thérapeutiques\s*", "", combined, flags=re.IGNORECASE).strip()
-
-    return combined
-
-def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
-    """
-    Retourne: (cpd_text, is_homeo, reserved_hosp, usage_hosp, indications_text)
-    """
+def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -1031,10 +837,7 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
         reserved = bool(RESERVED_HOSP_PAT.search(zone_text))
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
-    indications_raw = extract_indications_from_fiche_info(soup)
-    indications_raw = normalize_ws_keep_lines(indications_raw)
-
-    return cpd_text, is_homeo, reserved, usage, indications_raw
+    return cpd_text, is_homeo, reserved, usage
 
 # ============================================================
 # DISPONIBILITE
@@ -1101,22 +904,42 @@ class AirtableClient:
         raise RuntimeError(f"Airtable request failed: {method} {url} / {last_err}")
 
     def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
-        out = []
-        params = {}
-        if fields:
-            params["fields[]"] = fields
+        """
+        ⚠️ Airtable renvoie HTTP 422 si un nom de champ est inconnu dans fields[].
+        Ici: on tente avec fields, et si 422 UNKNOWN_FIELD_NAME, on retire ce champ et on réessaie.
+        """
+        requested_fields = list(fields) if fields else None
 
-        offset = None
         while True:
-            if offset:
-                params["offset"] = offset
-            r = self._request("GET", self.table_url, params=params)
-            data = r.json()
-            out.extend(data.get("records", []))
-            offset = data.get("offset")
-            if not offset:
-                break
-        return out
+            out: List[dict] = []
+            params = {}
+            if requested_fields:
+                params["fields[]"] = requested_fields
+
+            offset = None
+            try:
+                while True:
+                    if offset:
+                        params["offset"] = offset
+                    r = self._request("GET", self.table_url, params=params)
+                    data = r.json()
+                    out.extend(data.get("records", []))
+                    offset = data.get("offset")
+                    if not offset:
+                        break
+                return out
+            except Exception as e:
+                msg = str(e)
+                # exemple: {"error":{"type":"UNKNOWN_FIELD_NAME","message":"Unknown field name: \"Durée de conservation\""}}
+                m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*\\"([^\\"]+)\\"', msg)
+                if not m:
+                    m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*"([^"]+)"', msg)
+                if requested_fields and m:
+                    bad = m.group(1)
+                    warn(f"Airtable: champ inconnu '{bad}' -> retrait du filtre fields[] et retry")
+                    requested_fields = [f for f in requested_fields if f != bad]
+                    continue
+                raise
 
     def _strip_forbidden_fields(self, recs: List[dict]) -> None:
         for rec in recs:
@@ -1173,16 +996,15 @@ def main():
     ok(f"BDPM COMPO OK ({len(compo_txt)} chars)")
     compo_map = parse_bdpm_compositions(compo_txt)
 
-    info("Récupération du lien 'médicaments d'intérêt thérapeutique majeur' ...")
-    itm_link = find_bdpm_itm_file_link()
-    ok(f"Lien ITM trouvé: {itm_link}")
+    info("Téléchargement BDPM MITM (ATC) ...")
+    mitm_txt = download_text(BDPM_MITM_URL, encoding="latin-1")
+    ok(f"BDPM MITM OK ({len(mitm_txt)} chars)")
+    cis_to_atc = parse_mitm_cis_to_atc(mitm_txt)
 
-    info("Téléchargement du fichier ITM ...")
-    itm_bytes = download_bytes(itm_link, timeout_s=140.0)
-    ok(f"Fichier ITM OK ({len(itm_bytes)} bytes)")
-
-    cis_to_atc = parse_itm_cis_to_atc(itm_bytes)
-    ok(f"Correspondances CIS->ATC depuis ITM: {len(cis_to_atc)}")
+    info("Téléchargement BDPM Informations importantes (génération en direct) ...")
+    info_imp_txt = download_text(BDPM_INFO_IMPORTANTES_URL, encoding="latin-1")
+    ok(f"BDPM Infos importantes OK ({len(info_imp_txt)} chars)")
+    cis_to_info_url = parse_info_importantes_cis_to_url(info_imp_txt)
 
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
@@ -1212,8 +1034,8 @@ def main():
         FIELD_ATC4,        # lecture
         FIELD_ATC_LABEL,   # écriture possible
         FIELD_COMPOSITION, # écriture
-        FIELD_COMPOSITION_DETAILS,  # écriture
-        FIELD_INDICATIONS, # écriture
+        FIELD_COMPOSITION_DETAILS, # écriture
+        FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
     ]
 
     info("Inventaire Airtable ...")
@@ -1252,31 +1074,33 @@ def main():
                 FIELD_LABO: labo,
                 FIELD_RCP: rcp_link_default(cis),
             }
-
-            # ATC via fichier ITM
-            atc = cis_to_atc.get(cis, "")
-            if atc:
-                fields[FIELD_ATC] = atc
-                atc4_tmp = atc_level4_from_any(atc)
-                if atc4_tmp:
-                    label = atc_labels.get(atc4_tmp, "")
-                    if label:
-                        fields[FIELD_ATC_LABEL] = label
-
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # Composition (2 colonnes)
+            # Composition
             compo = compo_map.get(cis, "").strip()
             if compo:
-                compo_no_acc = strip_accents(compo).strip()
-                # Composition = accentué + (si différent) version sans accents
+                fields[FIELD_COMPOSITION_DETAILS] = compo  # accents uniquement
+                compo_no_acc = strip_accents(compo)
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
                 else:
                     fields[FIELD_COMPOSITION] = compo
-                # Composition détails = accentué uniquement
-                fields[FIELD_COMPOSITION_DETAILS] = compo
+
+            # ATC depuis MITM (si dispo)
+            atc = cis_to_atc.get(cis, "").strip()
+            if atc:
+                fields[FIELD_ATC] = atc
+                atc4 = atc_level4_from_any(atc)
+                if atc4:
+                    label = atc_labels.get(atc4, "")
+                    if label:
+                        fields[FIELD_ATC_LABEL] = label
+
+            # URL info importante (si dispo)
+            iu = cis_to_info_url.get(cis, "").strip()
+            if iu:
+                fields[FIELD_LIEN_INFO_IMPORTANTE] = iu
 
             fields.pop(FIELD_ATC4, None)  # sécurité
             new_recs.append({"fields": fields})
@@ -1314,25 +1138,22 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info) + libellé ATC + composition + indications thérapeutiques ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ...")
 
     updates = []
     failures = 0
     deleted_count = 0
     start = time.time()
 
-    indications_checks = 0
-    indications_found = 0
-    indications_added = 0
-    indications_empty = 0
-    window_checks = 0
-    window_found_any = 0
+    fiche_checks = 0
+    info_added = 0
+    atc_added = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | "
-                f"Indications checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty}"
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
+                f"ATC added={atc_added} | info importante added={info_added}"
             )
 
         rec = airtable_by_cis.get(cis)
@@ -1341,35 +1162,6 @@ def main():
 
         fields_cur = rec.get("fields", {}) or {}
         upd_fields: Dict[str, str] = {}
-
-        # Composition (2 colonnes)
-        cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
-        cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
-
-        new_compo = compo_map.get(cis, "").strip()
-        if new_compo:
-            new_no_acc = strip_accents(new_compo).strip()
-
-            # Composition
-            final_compo = new_compo
-            if new_no_acc and new_no_acc.lower() not in new_compo.lower():
-                final_compo = f"{new_compo}\n{new_no_acc}"
-
-            if final_compo and final_compo != cur_compo:
-                upd_fields[FIELD_COMPOSITION] = final_compo
-
-            # Composition détails = accentué uniquement
-            if new_compo and new_compo != cur_compo_details:
-                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
-
-        # Libellé ATC via ATC4 computed
-        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
-        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
-        if cur_atc4:
-            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
-            label = atc_labels.get(atc4_norm, "")
-            if label and label != cur_label:
-                upd_fields[FIELD_ATC_LABEL] = label
 
         # infos BDPM CIS
         row = cis_map.get(cis)
@@ -1396,36 +1188,70 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # ATC via fichier ITM (si vide)
+        # Composition
+        cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
+        cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
+        new_compo = compo_map.get(cis, "").strip()
+        if new_compo:
+            # détails = accents uniquement
+            if new_compo != cur_compo_details:
+                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
+
+            # composition = accents + (option) sans accents
+            new_no_acc = strip_accents(new_compo).strip()
+            final_compo = new_compo
+            if new_no_acc and new_no_acc.lower() not in new_compo.lower():
+                final_compo = f"{new_compo}\n{new_no_acc}"
+            if final_compo != cur_compo:
+                upd_fields[FIELD_COMPOSITION] = final_compo
+
+        # ATC: uniquement via MITM si vide
         cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
         if not cur_atc_raw:
-            atc = cis_to_atc.get(cis, "")
+            atc = cis_to_atc.get(cis, "").strip()
             if atc:
                 upd_fields[FIELD_ATC] = atc
+                atc_added += 1
                 atc4_tmp = atc_level4_from_any(atc)
                 if atc4_tmp:
                     label = atc_labels.get(atc4_tmp, "")
-                    if label and label != cur_label:
-                        upd_fields[FIELD_ATC_LABEL] = label
+                    if label:
+                        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
+                        if label != cur_label:
+                            upd_fields[FIELD_ATC_LABEL] = label
 
-        # fiche-info
+        # Libellé ATC via ATC4 computed (si la formule existe déjà côté Airtable)
+        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
+        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
+        if cur_atc4:
+            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
+            label = atc_labels.get(atc4_norm, "")
+            if label and label != cur_label:
+                upd_fields[FIELD_ATC_LABEL] = label
+
+        # Lien vers information importante (URL) via fichier dédié
+        cur_info_url = str(fields_cur.get(FIELD_LIEN_INFO_IMPORTANTE, "")).strip()
+        new_info_url = cis_to_info_url.get(cis, "").strip()
+        if new_info_url and new_info_url != cur_info_url:
+            upd_fields[FIELD_LIEN_INFO_IMPORTANTE] = new_info_url
+            info_added += 1
+
+        # CPD + dispo via fiche-info (sans ATC / sans indications)
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
-        cur_indications = str(fields_cur.get(FIELD_INDICATIONS, "")).strip()
 
+        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo)
         is_retro = cis in ansm_retro_cis
-
-        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_indications)
 
         if need_fetch_fiche:
             try:
-                cpd_text, is_homeo, reserved_hosp, usage_hosp, indications_raw = analyze_fiche_info(fiche_url)
+                fiche_checks += 1
+                cpd_text, is_homeo, reserved_hosp, usage_hosp = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
-                # dispo
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
                     has_taux_ville=has_taux,
@@ -1436,40 +1262,6 @@ def main():
                 )
                 if dispo != cur_dispo:
                     upd_fields[FIELD_DISPO] = dispo
-
-                # indications thérapeutiques (puces)
-                indications_checks += 1
-                window_checks += 1
-
-                indications_bullets = to_bullets_each_line(indications_raw)
-                found = bool(indications_bullets)
-                if found:
-                    indications_found += 1
-                    window_found_any += 1
-                else:
-                    indications_empty += 1
-
-                added = False
-                if found and (force_refresh or not cur_indications) and indications_bullets != cur_indications:
-                    upd_fields[FIELD_INDICATIONS] = indications_bullets
-                    indications_added += 1
-                    added = True
-
-                append_indications_report(
-                    cis=cis,
-                    found=found,
-                    fiche_url=fiche_url,
-                    added=added,
-                    empty=(not found),
-                )
-
-                # log fenêtre 200 checks
-                if window_checks >= 200:
-                    info(
-                        f"Indications - fenêtre 200 checks: checks=200 | correspondances(any)={window_found_any}"
-                    )
-                    window_checks = 0
-                    window_found_any = 0
 
             except PageUnavailable as e:
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
@@ -1493,7 +1285,7 @@ def main():
                 warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
         if upd_fields:
-            upd_fields.pop(FIELD_ATC4, None)
+            upd_fields.pop(FIELD_ATC4, None)  # sécurité
             updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
@@ -1506,9 +1298,8 @@ def main():
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
-                f"| indications: checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty} "
-                f"| reste ~{int(remaining)}s"
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
+                f"| fiche checks={fiche_checks} | ATC added={atc_added} | info importante added={info_added} | reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1517,9 +1308,9 @@ def main():
 
     try_git_commit_report()
     ok(
-        f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
-        f"indications: checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty} | "
-        f"rapport indications: {report_path_indications_today()}"
+        f"Terminé. échecs={failures} | supprimés={deleted_count} | "
+        f"fiche checks={fiche_checks} | ATC added={atc_added} | info importante added={info_added} | "
+        f"rapport suppressions: {report_path_deleted_today()}"
     )
 
 if __name__ == "__main__":
