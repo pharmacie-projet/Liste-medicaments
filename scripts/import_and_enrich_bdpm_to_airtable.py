@@ -21,6 +21,7 @@ try:
 except Exception:
     pd = None  # noqa
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -29,8 +30,8 @@ BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
-# RCP/Notice en HTML "texte" (fiable)
-BDPM_DOC_URL = "https://base-donnees-publique.medicaments.gouv.fr/affichageDoc.php?specid={cis}&typedoc={doc}"
+# Page de téléchargement BDPM (pour récupérer dynamiquement le fichier "médicaments d'intérêt thérapeutique majeur")
+BDPM_DOWNLOAD_PAGE = "https://base-donnees-publique.medicaments.gouv.fr/telechargement"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
@@ -61,7 +62,7 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
-# Champs Airtable
+# Champs Airtable (adapte ici si besoin)
 FIELD_CIS = "Code cis"
 FIELD_RCP = "Lien vers RCP"
 FIELD_CIP13 = "CIP 13"
@@ -71,16 +72,12 @@ FIELD_LABO = "Laboratoire"
 FIELD_SPEC = "Spécialité"
 FIELD_FORME = "Forme"
 FIELD_VOIE = "Voie d'administration"
-
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
-
-FIELD_COMPOSITION = "Composition"                  # champ à écrire (avec ajout éventuel sans accents)
-FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ajout "sans accents")
-
-FIELD_DUREE_CONSERVATION = "Durée de conservation"
-FIELD_PRECAUTIONS_CONSERVATION = "Précautions particulières de conservation"
+FIELD_COMPOSITION = "Composition"        # champ à écrire (accentué + ligne sans accents)
+FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (accentué uniquement)
+FIELD_INDICATIONS = "Indications thérapeutiques"   # champ à écrire (bullets)
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
@@ -117,8 +114,11 @@ def retry_sleep(attempt: int):
 # REPORTING
 # ============================================================
 
-def report_path_deleted_today() -> str:
+def _ensure_report_dir():
     os.makedirs(REPORT_DIR, exist_ok=True)
+
+def report_path_deleted_today() -> str:
+    _ensure_report_dir()
     fname = f"deleted_records_{time.strftime('%Y-%m-%d')}.txt"
     return os.path.join(REPORT_DIR, fname)
 
@@ -128,28 +128,18 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def report_path_conservation_today() -> str:
-    """
-    Rapport des ajouts de 6.3 / 6.4.
-    """
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    fname = f"rcp_conservation_{time.strftime('%Y-%m-%d')}.tsv"
+def report_path_indications_today() -> str:
+    _ensure_report_dir()
+    fname = f"indications_from_fiche_info_{time.strftime('%Y-%m-%d')}.tsv"
     return os.path.join(REPORT_DIR, fname)
 
-def append_conservation_report(
-    cis: str,
-    specialite: str,
-    forme: str,
-    section: str,
-    value: str,
-    rcp_url: str
-):
-    p = report_path_conservation_today()
-    header = "timestamp\tcis\tspecialite\tforme\tsection\tvalue\trcp_url\n"
+def append_indications_report(cis: str, found: bool, fiche_url: str, added: bool, empty: bool):
+    p = report_path_indications_today()
+    header = "timestamp\tcis\tfound\tadded\tempty\tfiche_url\n"
     if not os.path.exists(p):
         with open(p, "w", encoding="utf-8") as f:
             f.write(header)
-    line = f"{_ts()}\t{cis}\t{specialite}\t{forme}\t{section}\t{value}\t{rcp_url}\n"
+    line = f"{_ts()}\t{cis}\t{int(found)}\t{int(added)}\t{int(empty)}\t{fiche_url}\n"
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -157,14 +147,14 @@ def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        paths = [report_path_deleted_today(), report_path_conservation_today()]
+        paths = [report_path_deleted_today(), report_path_indications_today()]
         existing = [p for p in paths if os.path.exists(p)]
         if not existing:
             return
         subprocess.run(["git", "status"], check=False)
         for p in existing:
             subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: RCP conservation ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: enrich indications ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
         ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
@@ -225,6 +215,20 @@ def capitalize_each_line(text: str) -> str:
             out_lines.append(line)
     return "\n".join(out_lines)
 
+def to_bullets_each_line(text: str) -> str:
+    """
+    Convertit chaque saut de ligne en puce.
+    - supprime les lignes vides
+    - normalise les espaces
+    """
+    t = normalize_ws_keep_lines(text)
+    if not t:
+        return ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return "\n".join([f"• {ln}" for ln in lines])
+
 def chunked(lst: List, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
@@ -237,11 +241,24 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC LABEL (OPTIONNEL)
+# ATC HELPERS
 # ============================================================
+
+ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
+ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
+
+def canonical_atc7(raw: str) -> str:
+    if not raw:
+        return ""
+    s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    return s if ATC7_PAT.fullmatch(s) else ""
 
 def atc_level4_from_any(atc: str) -> str:
     a = (atc or "").strip().upper().replace(" ", "")
+    if ATC7_PAT.fullmatch(a):
+        return a[:5]
+    if ATC5_PAT.fullmatch(a):
+        return a
     m7 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", a)
     if m7:
         return m7.group(1)[:5]
@@ -304,6 +321,10 @@ _SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE
 _PREFIX_GLUE_RES = [
     re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
     re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyd(e|e)\s*|dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(dioxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(peroxyde)([a-zà-ÿ])", re.IGNORECASE),
+    re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
 ]
 
 _HYDRATE_RE = re.compile(
@@ -358,6 +379,9 @@ def clean_to_main_dci(raw: str) -> str:
         s = rgx.sub(r"\1 \2", s)
 
     s = _SALT_GLUE_RE.sub(r"\1 \2", s)
+
+    if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
+        return ""
 
     s = _SALT_PREFIX_RE.sub("", s)
     s = _SALT_LEADING_RE.sub("", s)
@@ -646,7 +670,137 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO (CPD/Dispo) - sans dépendre du RCP
+# BDPM - fichier "médicaments d'intérêt thérapeutique majeur" -> ATC
+# ============================================================
+
+def find_bdpm_itm_file_link() -> str:
+    """
+    Récupère dynamiquement le lien du "Fichier des médicaments d'intérêt thérapeutique majeur"
+    depuis la page /telechargement.
+    """
+    r = http_get(BDPM_DOWNLOAD_PAGE, timeout=(HTTP_CONNECT_TIMEOUT, 60.0))
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code} {BDPM_DOWNLOAD_PAGE}")
+    soup = BeautifulSoup(r.text, _bs_parser())
+
+    # match texte "intérêt thérapeutique majeur" (tolérant accents)
+    def norm(s: str) -> str:
+        return strip_accents(safe_text(s)).lower()
+
+    candidates: List[str] = []
+    for a in soup.find_all("a", href=True):
+        label = norm(a.get_text(" ", strip=True) or "")
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if "interet therapeutique majeur" in label or "interet thérapeutique majeur" in label:
+            u = urllib.parse.urljoin(BDPM_DOWNLOAD_PAGE, href)
+            candidates.append(u)
+            continue
+        # parfois le texte est court, on check aussi href
+        if "interet" in href.lower() and "therapeutique" in href.lower() and "majeur" in href.lower():
+            u = urllib.parse.urljoin(BDPM_DOWNLOAD_PAGE, href)
+            candidates.append(u)
+
+    if not candidates:
+        raise RuntimeError("Lien du fichier 'médicaments d'intérêt thérapeutique majeur' introuvable sur /telechargement")
+
+    # Déduplique
+    out = []
+    seen = set()
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    # Heuristique: préférer un lien /download/file/... si présent
+    out.sort(key=lambda u: (0 if "/download/file/" in u else 1, len(u)))
+    return out[0]
+
+def detect_delimiter(sample: str) -> str:
+    # Détecte grossièrement ; \t | ,
+    counts = {
+        "\t": sample.count("\t"),
+        ";": sample.count(";"),
+        "|": sample.count("|"),
+        ",": sample.count(","),
+    }
+    # favorise tab et ;
+    best = sorted(counts.items(), key=lambda kv: (kv[1], 1 if kv[0] == "\t" else 0, 1 if kv[0] == ";" else 0), reverse=True)[0][0]
+    return best if counts[best] > 0 else "\t"
+
+def parse_itm_cis_to_atc(file_bytes: bytes) -> Dict[str, str]:
+    """
+    Parse un fichier texte/csv/tsv et tente d'en déduire une correspondance CIS -> ATC7.
+    Très tolérant: cherche une colonne CIS (8 chiffres) et une colonne ATC (ATC7).
+    """
+    # essaie encodages
+    text = ""
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            if text and len(text) > 100:
+                break
+        except Exception:
+            continue
+    if not text:
+        return {}
+
+    # coupe les premières lignes vides
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+
+    delim = detect_delimiter("\n".join(lines[:5]))
+    header = lines[0]
+    cols = [safe_text(c) for c in header.split(delim)]
+
+    # index potentiels
+    def n(s: str) -> str:
+        return strip_accents(s).lower().replace(" ", "").replace("_", "")
+
+    cis_idx = None
+    atc_idx = None
+
+    for i, c in enumerate(cols):
+        cn = n(c)
+        if cis_idx is None and ("cis" == cn or cn.endswith("cis") or "codeciss" in cn or "codecis" in cn):
+            cis_idx = i
+        if atc_idx is None and ("atc" == cn or "codeatc" in cn or cn.endswith("atc")):
+            atc_idx = i
+
+    # fallback: pas de header fiable -> scan
+    mapping: Dict[str, str] = {}
+
+    if cis_idx is not None and atc_idx is not None:
+        for ln in lines[1:]:
+            parts = ln.split(delim)
+            if len(parts) <= max(cis_idx, atc_idx):
+                continue
+            cis = re.sub(r"\D", "", parts[cis_idx])
+            if len(cis) != 8:
+                continue
+            atc = canonical_atc7(parts[atc_idx])
+            if not atc:
+                # parfois ATC est ailleurs dans la ligne
+                m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", ln.upper())
+                atc = m.group(1) if m else ""
+            if atc:
+                mapping[cis] = atc
+        return mapping
+
+    # fallback total: chaque ligne -> cherche CIS et ATC7 n'importe où
+    for ln in lines[1:]:
+        cis_m = re.search(r"\b(\d{8})\b", ln)
+        atc_m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", ln.upper())
+        if not cis_m or not atc_m:
+            continue
+        mapping[cis_m.group(1)] = atc_m.group(1)
+
+    return mapping
+
+# ============================================================
+# FICHE-INFO SCRAPING (CPD, homeo, usage hosp) + INDICATIONS
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -762,7 +916,103 @@ def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
 
-def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
+def extract_indications_from_fiche_info(soup: BeautifulSoup) -> str:
+    """
+    Récupère tout le contenu de la section "Indications thérapeutiques" (fiche-info),
+    jusqu'à la section suivante.
+    """
+    # repère un titre contenant "Indications thérapeutiques"
+    target = None
+    for tag in soup.find_all(["h1", "h2", "h3", "button", "a", "div", "span"]):
+        txt = safe_text(tag.get_text(" ", strip=True))
+        if not txt:
+            continue
+        if "Indications thérapeutiques" in txt:
+            target = tag
+            break
+    if target is None:
+        return ""
+
+    stop_titles = {
+        "Groupe(s) générique(s)",
+        "Composition en substances actives",
+        "Présentations",
+        "Résumé des caractéristiques du produit",
+        "Notice",
+        "Bon usage",
+        "Autres informations",
+    }
+
+    # collecte le texte suivant le titre jusqu'au prochain titre
+    collected: List[str] = []
+
+    # 1) éléments dans le même bloc parent (souvent la section est dans un container)
+    parent = target.parent
+    if parent:
+        # on parcourt les éléments après target dans l'ordre
+        seen_target = False
+        for el in parent.descendants:
+            if el == target:
+                seen_target = True
+                continue
+            if not seen_target:
+                continue
+            # stop si on retrouve une autre section
+            if getattr(el, "name", None) in {"h1", "h2", "h3"}:
+                t = safe_text(el.get_text(" ", strip=True))
+                if t in stop_titles:
+                    break
+            if getattr(el, "name", None) in {"script", "style"}:
+                continue
+            if hasattr(el, "get_text"):
+                continue  # on laisse les NavigableString gérer ci-dessous
+
+    # 2) méthode robuste: on itère sur les "siblings" du bloc du titre
+    #    (cela marche bien même si la structure HTML varie)
+    def is_stop(tag) -> bool:
+        if not tag or not getattr(tag, "name", None):
+            return False
+        if tag.name in {"h1", "h2", "h3"}:
+            t = safe_text(tag.get_text(" ", strip=True))
+            return t in stop_titles
+        return False
+
+    for sib in target.next_siblings:
+        if is_stop(sib):
+            break
+        # certains siblings sont des strings
+        try:
+            text = ""
+            if getattr(sib, "get_text", None):
+                text = sib.get_text("\n", strip=True)
+            else:
+                text = safe_text(str(sib))
+            text = normalize_ws_keep_lines(text)
+            if text:
+                collected.append(text)
+        except Exception:
+            continue
+
+    # 3) fallback: si rien trouvé via siblings, on prend un extrait global autour du titre
+    if not collected:
+        full = soup.get_text("\n", strip=True)
+        # segment entre "Indications thérapeutiques" et "Groupe(s) générique(s)" si possible
+        m = re.search(r"Indications thérapeutiques\s*(.*?)\s*(Groupe\(s\) générique\(s\)|Composition en substances actives|Présentations)\b", full, flags=re.S)
+        if m:
+            seg = normalize_ws_keep_lines(m.group(1))
+            if seg:
+                collected.append(seg)
+
+    combined = normalize_ws_keep_lines("\n".join(collected))
+    # retire répétitions éventuelles du titre
+    combined = re.sub(r"^\s*Indications thérapeutiques\s*", "", combined, flags=re.IGNORECASE).strip()
+
+    return combined
+
+def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool, str]:
+    """
+    Retourne: (cpd_text, is_homeo, reserved_hosp, usage_hosp, indications_text)
+    """
     html = fetch_html_checked(fiche_url)
     soup = BeautifulSoup(html, _bs_parser())
 
@@ -781,7 +1031,10 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
         reserved = bool(RESERVED_HOSP_PAT.search(zone_text))
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
-    return cpd_text, is_homeo, reserved, usage
+    indications_raw = extract_indications_from_fiche_info(soup)
+    indications_raw = normalize_ws_keep_lines(indications_raw)
+
+    return cpd_text, is_homeo, reserved, usage, indications_raw
 
 # ============================================================
 # DISPONIBILITE
@@ -810,108 +1063,6 @@ def compute_disponibilite(
         return "Disponible en pharmacie de ville"
 
     return "Pas d'information sur la disponibilité mentionnée"
-
-# ============================================================
-# RCP 6.3 / 6.4 (Durée / Précautions) - EXTRACTION ROBUSTE
-# ============================================================
-
-def should_skip_duree_conservation(forme: str) -> bool:
-    """
-    Règle : si la forme contient 'comprimé' ou 'gélule' => ne pas incrémenter 6.3/6.4.
-    """
-    f = strip_accents(forme).lower()
-    return ("comprime" in f) or ("gelule" in f)
-
-def format_bullets(text: str) -> str:
-    """
-    Met une puce '•' entre chaque saut de ligne (une puce par ligne non vide).
-    """
-    text = normalize_ws_keep_lines(text)
-    if not text:
-        return ""
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    if not lines:
-        return ""
-    return "• " + "\n• ".join(lines)
-
-def _section_heading_pat(num: str) -> re.Pattern:
-    """
-    Regex tolérante pour titres de type:
-    6.3 Durée...
-    6.3. Durée...
-    6 - 3 Durée...
-    """
-    a, b = num.split(".")
-    return re.compile(
-        rf"^\s*{re.escape(a)}\s*[\.\-]?\s*{re.escape(b)}\s*[\.\-]?\s+",
-        re.IGNORECASE
-    )
-
-def extract_rcp_section(html: str, start_num: str, stop_num: str) -> str:
-    """
-    Extrait le contenu entre le titre start_num (ex 6.3) et stop_num (ex 6.4).
-    """
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, _bs_parser())
-    raw_lines = soup.get_text("\n", strip=True).splitlines()
-    lines = [ln.strip() for ln in raw_lines if ln and ln.strip()]
-
-    start_pat = _section_heading_pat(start_num)
-    stop_pat = _section_heading_pat(stop_num)
-
-    start_idx = None
-    inline_rest = ""
-
-    for i, ln in enumerate(lines):
-        if start_pat.search(ln):
-            start_idx = i
-            ln2 = re.sub(start_pat, "", ln).strip()
-            ln2 = ln2.lstrip(":").strip()
-
-            # éviter de stocker juste l'intitulé sans contenu
-            if ln2 and strip_accents(ln2).lower() not in {
-                "duree de conservation",
-                "precautions particulieres de conservation",
-            }:
-                inline_rest = ln2
-            break
-
-    if start_idx is None:
-        return ""
-
-    collected: List[str] = []
-    if inline_rest:
-        collected.append(inline_rest)
-
-    for ln in lines[start_idx + 1:]:
-        if stop_pat.search(ln):
-            break
-        if start_pat.search(ln):
-            continue
-        collected.append(ln)
-
-    return normalize_ws_keep_lines("\n".join(collected)).strip()
-
-def fetch_rcp_html_best(cis: str, link_rcp: str) -> str:
-    """
-    Priorité: affichageDoc.php (RCP texte fiable) -> fallback extrait#tab=rcp
-    """
-    url_doc = BDPM_DOC_URL.format(cis=cis, doc="R")
-    try:
-        html = fetch_html_checked(url_doc, max_retries=2)
-        if html and len(html) > 200:
-            return html
-    except Exception:
-        pass
-
-    try:
-        rcp_html_url = set_tab(link_rcp, cis, "rcp")
-        html = fetch_html_checked(rcp_html_url, max_retries=2)
-        return html
-    except Exception:
-        return ""
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -1022,6 +1173,17 @@ def main():
     ok(f"BDPM COMPO OK ({len(compo_txt)} chars)")
     compo_map = parse_bdpm_compositions(compo_txt)
 
+    info("Récupération du lien 'médicaments d'intérêt thérapeutique majeur' ...")
+    itm_link = find_bdpm_itm_file_link()
+    ok(f"Lien ITM trouvé: {itm_link}")
+
+    info("Téléchargement du fichier ITM ...")
+    itm_bytes = download_bytes(itm_link, timeout_s=140.0)
+    ok(f"Fichier ITM OK ({len(itm_bytes)} bytes)")
+
+    cis_to_atc = parse_itm_cis_to_atc(itm_bytes)
+    ok(f"Correspondances CIS->ATC depuis ITM: {len(cis_to_atc)}")
+
     info("Recherche lien Excel ANSM (rétrocession) ...")
     ansm_link = find_ansm_retro_excel_link()
     ok(f"Lien ANSM trouvé: {ansm_link}")
@@ -1049,10 +1211,9 @@ def main():
         FIELD_ATC,
         FIELD_ATC4,        # lecture
         FIELD_ATC_LABEL,   # écriture possible
-        FIELD_COMPOSITION,
-        FIELD_COMPOSITION_DETAILS,
-        FIELD_DUREE_CONSERVATION,
-        FIELD_PRECAUTIONS_CONSERVATION,
+        FIELD_COMPOSITION, # écriture
+        FIELD_COMPOSITION_DETAILS,  # écriture
+        FIELD_INDICATIONS, # écriture
     ]
 
     info("Inventaire Airtable ...")
@@ -1091,18 +1252,31 @@ def main():
                 FIELD_LABO: labo,
                 FIELD_RCP: rcp_link_default(cis),
             }
+
+            # ATC via fichier ITM
+            atc = cis_to_atc.get(cis, "")
+            if atc:
+                fields[FIELD_ATC] = atc
+                atc4_tmp = atc_level4_from_any(atc)
+                if atc4_tmp:
+                    label = atc_labels.get(atc4_tmp, "")
+                    if label:
+                        fields[FIELD_ATC_LABEL] = label
+
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # composition
+            # Composition (2 colonnes)
             compo = compo_map.get(cis, "").strip()
             if compo:
-                fields[FIELD_COMPOSITION_DETAILS] = compo  # sans doublon "sans accents"
                 compo_no_acc = strip_accents(compo).strip()
+                # Composition = accentué + (si différent) version sans accents
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
                 else:
                     fields[FIELD_COMPOSITION] = compo
+                # Composition détails = accentué uniquement
+                fields[FIELD_COMPOSITION_DETAILS] = compo
 
             fields.pop(FIELD_ATC4, None)  # sécurité
             new_recs.append({"fields": fields})
@@ -1140,31 +1314,25 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement (fiche-info: CPD/Dispo) + composition + libellé ATC + RCP 6.3/6.4 ...")
+    info("Enrichissement (fiche-info) + libellé ATC + composition + indications thérapeutiques ...")
 
     updates = []
     failures = 0
     deleted_count = 0
     start = time.time()
 
-    # conservation stats + “fenêtre 200 checks”
-    duree_checks = 0
-    duree_added_63 = 0
-    prec_added_64 = 0
-    duree_skipped_forme = 0
-    rcp_html_empty = 0
-
+    indications_checks = 0
+    indications_found = 0
+    indications_added = 0
+    indications_empty = 0
     window_checks = 0
     window_found_any = 0
-    window_found_63 = 0
-    window_found_64 = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | "
-                f"Durée checks={duree_checks} | Durée(6.3) added={duree_added_63} | "
-                f"Précautions(6.4) added={prec_added_64} | skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty}"
+                f"Indications checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty}"
             )
 
         rec = airtable_by_cis.get(cis)
@@ -1180,19 +1348,21 @@ def main():
 
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
-            # détails = sans ajout sans-accents
-            if new_compo != cur_compo_details:
-                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
-
-            # composition = éventuellement + version sans accents
             new_no_acc = strip_accents(new_compo).strip()
+
+            # Composition
             final_compo = new_compo
             if new_no_acc and new_no_acc.lower() not in new_compo.lower():
                 final_compo = f"{new_compo}\n{new_no_acc}"
-            if final_compo != cur_compo:
+
+            if final_compo and final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # Libellé ATC via ATC4 computed (si vous l'utilisez)
+            # Composition détails = accentué uniquement
+            if new_compo and new_compo != cur_compo_details:
+                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
+
+        # Libellé ATC via ATC4 computed
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1226,23 +1396,36 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # URLs fiche info
-        fiche_url = set_tab(link_rcp, cis, "fiche-info")
+        # ATC via fichier ITM (si vide)
+        cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
+        if not cur_atc_raw:
+            atc = cis_to_atc.get(cis, "")
+            if atc:
+                upd_fields[FIELD_ATC] = atc
+                atc4_tmp = atc_level4_from_any(atc)
+                if atc4_tmp:
+                    label = atc_labels.get(atc4_tmp, "")
+                    if label and label != cur_label:
+                        upd_fields[FIELD_ATC_LABEL] = label
 
+        # fiche-info
+        fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
+        cur_indications = str(fields_cur.get(FIELD_INDICATIONS, "")).strip()
 
-        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo)
         is_retro = cis in ansm_retro_cis
 
-        # 1) CPD/Dispo via fiche-info (pas RCP)
+        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo) or (not cur_indications)
+
         if need_fetch_fiche:
             try:
-                cpd_text, is_homeo, reserved_hosp, usage_hosp = analyze_fiche_info(fiche_url)
+                cpd_text, is_homeo, reserved_hosp, usage_hosp, indications_raw = analyze_fiche_info(fiche_url)
 
                 if cpd_text and cpd_text != cur_cpd:
                     upd_fields[FIELD_CPD] = cpd_text
 
+                # dispo
                 has_taux = cip.has_taux if cip else False
                 dispo = compute_disponibilite(
                     has_taux_ville=has_taux,
@@ -1253,6 +1436,40 @@ def main():
                 )
                 if dispo != cur_dispo:
                     upd_fields[FIELD_DISPO] = dispo
+
+                # indications thérapeutiques (puces)
+                indications_checks += 1
+                window_checks += 1
+
+                indications_bullets = to_bullets_each_line(indications_raw)
+                found = bool(indications_bullets)
+                if found:
+                    indications_found += 1
+                    window_found_any += 1
+                else:
+                    indications_empty += 1
+
+                added = False
+                if found and (force_refresh or not cur_indications) and indications_bullets != cur_indications:
+                    upd_fields[FIELD_INDICATIONS] = indications_bullets
+                    indications_added += 1
+                    added = True
+
+                append_indications_report(
+                    cis=cis,
+                    found=found,
+                    fiche_url=fiche_url,
+                    added=added,
+                    empty=(not found),
+                )
+
+                # log fenêtre 200 checks
+                if window_checks >= 200:
+                    info(
+                        f"Indications - fenêtre 200 checks: checks=200 | correspondances(any)={window_found_any}"
+                    )
+                    window_checks = 0
+                    window_found_any = 0
 
             except PageUnavailable as e:
                 warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
@@ -1273,103 +1490,11 @@ def main():
 
             except Exception as e:
                 failures += 1
-                warn(f"Enrich fiche-info KO CIS={cis}: {e} (on continue)")
+                warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
-        # 2) RCP 6.3 + 6.4
-        forme_effective = (
-            str(upd_fields.get(FIELD_FORME, "")).strip()
-            or str(fields_cur.get(FIELD_FORME, "")).strip()
-            or (safe_text(row.forme) if row else "")
-        )
-
-        cur_duree = str(fields_cur.get(FIELD_DUREE_CONSERVATION, "")).strip()
-        cur_prec = str(fields_cur.get(FIELD_PRECAUTIONS_CONSERVATION, "")).strip()
-
-        if should_skip_duree_conservation(forme_effective):
-            duree_skipped_forme += 1
-        else:
-            need_63 = force_refresh or not cur_duree
-            need_64 = force_refresh or not cur_prec
-
-            if need_63 or need_64:
-                duree_checks += 1
-                window_checks += 1
-
-                rcp_html = fetch_rcp_html_best(cis=cis, link_rcp=link_rcp)
-                if not rcp_html or len(rcp_html) < 200:
-                    rcp_html_empty += 1
-                else:
-                    found_any = False
-
-                    # 6.3 (jusqu'à 6.4)
-                    if need_63:
-                        sec63 = extract_rcp_section(rcp_html, "6.3", "6.4")
-                        sec63 = format_bullets(sec63)
-                        if sec63 and sec63 != cur_duree:
-                            upd_fields[FIELD_DUREE_CONSERVATION] = sec63
-                            duree_added_63 += 1
-                            found_any = True
-                            window_found_63 += 1
-
-                            spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
-                            append_conservation_report(
-                                cis=cis,
-                                specialite=spec_name,
-                                forme=forme_effective,
-                                section="6.3",
-                                value=sec63,
-                                rcp_url=BDPM_DOC_URL.format(cis=cis, doc="R"),
-                            )
-
-                    # 6.4 (jusqu'à 6.5)
-                    if need_64:
-                        sec64 = extract_rcp_section(rcp_html, "6.4", "6.5")
-                        sec64 = format_bullets(sec64)
-                        if sec64 and sec64 != cur_prec:
-                            upd_fields[FIELD_PRECAUTIONS_CONSERVATION] = sec64
-                            prec_added_64 += 1
-                            found_any = True
-                            window_found_64 += 1
-
-                            spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
-                            append_conservation_report(
-                                cis=cis,
-                                specialite=spec_name,
-                                forme=forme_effective,
-                                section="6.4",
-                                value=sec64,
-                                rcp_url=BDPM_DOC_URL.format(cis=cis, doc="R"),
-                            )
-
-                    if found_any:
-                        window_found_any += 1
-
-                # Log toutes les 200 lignes “checkées” (au sens: tentatives RCP)
-                if window_checks >= 200:
-                    info(
-                        f"RCP(6.3/6.4) — fenêtre 200 checks: "
-                        f"checks={window_checks} | correspondances(any)={window_found_any} | "
-                        f"6.3_trouvées={window_found_63} | 6.4_trouvées={window_found_64}"
-                    )
-                    window_checks = 0
-                    window_found_any = 0
-                    window_found_63 = 0
-                    window_found_64 = 0
-
-        # Push update
         if upd_fields:
             upd_fields.pop(FIELD_ATC4, None)
             updates.append({"id": rec["id"], "fields": upd_fields})
-
-            # Pour éviter “repérage OK mais pas visible”, flush immédiat si 6.3/6.4 ajoutés
-            if (FIELD_DUREE_CONSERVATION in upd_fields) or (FIELD_PRECAUTIONS_CONSERVATION in upd_fields):
-                try:
-                    at.update_records([{"id": rec["id"], "fields": upd_fields}])
-                except Exception as e:
-                    failures += 1
-                    warn(f"Update immédiat Airtable KO CIS={cis}: {e} (on continue)")
-                # éviter double envoi dans le batch
-                updates.pop()
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
@@ -1381,10 +1506,9 @@ def main():
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | "
-                f"Durée checks={duree_checks} | 6.3 added={duree_added_63} | 6.4 added={prec_added_64} | "
-                f"skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty} | "
-                f"reste ~{int(remaining)}s"
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
+                f"| indications: checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty} "
+                f"| reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1394,9 +1518,8 @@ def main():
     try_git_commit_report()
     ok(
         f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
-        f"Durée checks={duree_checks} | 6.3 added={duree_added_63} | 6.4 added={prec_added_64} | "
-        f"skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty} | "
-        f"rapport conservation: {report_path_conservation_today()}"
+        f"indications: checks={indications_checks} found={indications_found} added={indications_added} empty={indications_empty} | "
+        f"rapport indications: {report_path_indications_today()}"
     )
 
 if __name__ == "__main__":
