@@ -29,8 +29,8 @@ BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
-# Équivalence CIS -> ATC (médicaments d'intérêt thérapeutique majeur)
-BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
+# RCP/Notice en HTML "texte" (fiable)
+BDPM_DOC_URL = "https://base-donnees-publique.medicaments.gouv.fr/affichageDoc.php?specid={cis}&typedoc={doc}"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
@@ -71,14 +71,16 @@ FIELD_LABO = "Laboratoire"
 FIELD_SPEC = "Spécialité"
 FIELD_FORME = "Forme"
 FIELD_VOIE = "Voie d'administration"
+
 FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
-FIELD_COMPOSITION = "Composition"        # champ à écrire (avec accents + parfois sans accents en 2e ligne)
-FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (avec accents uniquement)
 
-# NOUVEAU
-FIELD_DUREE_CONSERVATION = "Durée de conservation"  # champ à écrire
+FIELD_COMPOSITION = "Composition"                  # champ à écrire (avec ajout éventuel sans accents)
+FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ajout "sans accents")
+
+FIELD_DUREE_CONSERVATION = "Durée de conservation"
+FIELD_PRECAUTIONS_CONSERVATION = "Précautions particulières de conservation"
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
@@ -126,23 +128,28 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def report_path_duree_conservation_today() -> str:
+def report_path_conservation_today() -> str:
+    """
+    Rapport des ajouts de 6.3 / 6.4.
+    """
     os.makedirs(REPORT_DIR, exist_ok=True)
-    fname = f"duree_conservation_added_{time.strftime('%Y-%m-%d')}.tsv"
+    fname = f"rcp_conservation_{time.strftime('%Y-%m-%d')}.tsv"
     return os.path.join(REPORT_DIR, fname)
 
-def append_duree_conservation_report(cis: str, specialite: str, forme: str, duree: str, rcp_url: str):
-    """
-    Trace uniquement les AJOUTS/MAJ de la durée de conservation.
-    """
-    p = report_path_duree_conservation_today()
-    header = "timestamp\tcis\tspecialite\tforme\tduree_conservation\trcp_url\n"
+def append_conservation_report(
+    cis: str,
+    specialite: str,
+    forme: str,
+    section: str,
+    value: str,
+    rcp_url: str
+):
+    p = report_path_conservation_today()
+    header = "timestamp\tcis\tspecialite\tforme\tsection\tvalue\trcp_url\n"
     if not os.path.exists(p):
         with open(p, "w", encoding="utf-8") as f:
             f.write(header)
-    # éviter les retours ligne dans la cellule TSV
-    duree_one_line = normalize_ws_keep_lines(duree).replace("\n", " | ")
-    line = f"{_ts()}\t{cis}\t{specialite}\t{forme}\t{duree_one_line}\t{rcp_url}\n"
+    line = f"{_ts()}\t{cis}\t{specialite}\t{forme}\t{section}\t{value}\t{rcp_url}\n"
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -150,17 +157,14 @@ def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        paths = [
-            report_path_deleted_today(),
-            report_path_duree_conservation_today(),
-        ]
+        paths = [report_path_deleted_today(), report_path_conservation_today()]
         existing = [p for p in paths if os.path.exists(p)]
         if not existing:
             return
         subprocess.run(["git", "status"], check=False)
         for p in existing:
             subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: enrich (deleted + duree) ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: RCP conservation ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
         ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
@@ -233,25 +237,11 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# ATC HELPERS (MITM)
+# ATC LABEL (OPTIONNEL)
 # ============================================================
 
-ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
-ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
-
-def canonical_atc7(raw: str) -> str:
-    if not raw:
-        return ""
-    s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-    return s if ATC7_PAT.fullmatch(s) else ""
-
 def atc_level4_from_any(atc: str) -> str:
-    a = (atc or "").strip().upper()
-    a = a.replace(" ", "")
-    if ATC7_PAT.fullmatch(a):
-        return a[:5]
-    if ATC5_PAT.fullmatch(a):
-        return a
+    a = (atc or "").strip().upper().replace(" ", "")
     m7 = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", a)
     if m7:
         return m7.group(1)[:5]
@@ -292,28 +282,6 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
     ok(f"Équivalence ATC chargée: {len(mapping)} entrées")
     return mapping
 
-def parse_bdpm_mitm_cis_atc(txt: str) -> Dict[str, str]:
-    """
-    Fichier CIS_MITM.txt (tab):
-      col0 = CIS (8 chiffres)
-      col1 = ATC (souvent ATC7)
-    """
-    out: Dict[str, str] = {}
-    for line in (txt or "").splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        cis = re.sub(r"\D", "", parts[0].strip())
-        if len(cis) != 8:
-            continue
-        atc = canonical_atc7(parts[1].strip())
-        if atc:
-            out[cis] = atc
-    ok(f"MITM CIS->ATC chargés: {len(out)}")
-    return out
-
 # ============================================================
 # COMPOSITION BDPM -> DCI principales
 # ============================================================
@@ -336,9 +304,6 @@ _SALT_GLUE_RE = re.compile(rf"^({_SALT_WORDS})([a-zà-ÿ])", flags=re.IGNORECASE
 _PREFIX_GLUE_RES = [
     re.compile(r"^(dichlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
     re.compile(r"^(chlorhydrate)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(dioxyde)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(peroxyde)([a-zà-ÿ])", re.IGNORECASE),
-    re.compile(r"^(oxyde)([a-zà-ÿ])", re.IGNORECASE),
 ]
 
 _HYDRATE_RE = re.compile(
@@ -393,9 +358,6 @@ def clean_to_main_dci(raw: str) -> str:
         s = rgx.sub(r"\1 \2", s)
 
     s = _SALT_GLUE_RE.sub(r"\1 \2", s)
-
-    if re.match(r"^\s*(dioxyde|oxyde|peroxyde)\b", s, flags=re.IGNORECASE):
-        return ""
 
     s = _SALT_PREFIX_RE.sub("", s)
     s = _SALT_LEADING_RE.sub("", s)
@@ -684,7 +646,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO (CPD/DISPO) + RCP (Durée de conservation)
+# FICHE-INFO (CPD/Dispo) - sans dépendre du RCP
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -729,6 +691,9 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
                 raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
                 raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
+            ct = (r.headers.get("content-type") or "").lower()
+            if "application/pdf" in ct:
+                raise PageUnavailable(url, r.status_code, "Page renvoie un PDF (pas HTML)")
             if not r.text or len(r.text) < 200:
                 raise PageUnavailable(url, r.status_code, "HTML vide/trop court")
             return r.text
@@ -818,85 +783,6 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
 
     return cpd_text, is_homeo, reserved, usage
 
-# --- Durée de conservation (RCP section 6.3) ---
-# Tolère: "6.3 Durée..." / "6.3. Durée..." / "6 - 3 Durée..." etc.
-_DUREE_63_PAT_NA = re.compile(
-    r"^\s*6\s*[\.\-]?\s*3\s*[\.\-]?\s*duree\s+de\s+conservation\b",
-    re.IGNORECASE
-)
-
-# Stop à la section suivante: 6.4 / 6.5 ... ou chapitre 7
-_NEXT_SECTION_PAT_NA = re.compile(
-    r"^\s*(?:"
-    r"6\s*[\.\-]?\s*(?:4|5|6|7|8|9)\b"
-    r"|7\s*[\.\-]?\s*\d\b"
-    r")",
-    re.IGNORECASE
-)
-
-def extract_duree_conservation_from_rcp_html(html: str) -> str:
-    """
-    Extrait le contenu de la rubrique '6.3 Durée de conservation' depuis le HTML du RCP.
-    Renvoie '' si introuvable.
-    """
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, _bs_parser())
-    raw_lines = soup.get_text("\n", strip=True).splitlines()
-    lines = [ln.strip() for ln in raw_lines if ln and ln.strip()]
-
-    start_idx = None
-    inline_rest = ""
-
-    for i, ln in enumerate(lines):
-        ln_na = strip_accents(ln).lower()
-        if _DUREE_63_PAT_NA.search(ln_na):
-            start_idx = i
-            # si le titre contient déjà une valeur sur la même ligne
-            if ":" in ln:
-                inline_rest = ln.split(":", 1)[1].strip()
-            else:
-                # parfois: "6.3. Durée de conservation 2 ans"
-                # on tente de retirer le titre et garder le reste
-                m = re.search(r"(6\s*[\.\-]?\s*3\s*[\.\-]?\s*dur[ée]e\s+de\s+conservation)\s*(.*)$", ln, flags=re.IGNORECASE)
-                if m:
-                    inline_rest = (m.group(2) or "").strip()
-            break
-
-    if start_idx is None:
-        return ""
-
-    collected: List[str] = []
-    if inline_rest:
-        collected.append(inline_rest)
-
-    for ln in lines[start_idx + 1:]:
-        ln_na = strip_accents(ln).lower()
-        if _NEXT_SECTION_PAT_NA.search(ln_na):
-            break
-        # éviter d'accrocher des répétitions d'en-tête (rare)
-        if _DUREE_63_PAT_NA.search(ln_na):
-            continue
-        collected.append(ln)
-
-    return normalize_ws_keep_lines("\n".join(collected)).strip()
-
-def fetch_duree_conservation_from_rcp(rcp_url: str) -> str:
-    try:
-        html = fetch_html_checked(rcp_url, max_retries=2)
-    except Exception:
-        return ""
-    return extract_duree_conservation_from_rcp_html(html)
-
-def should_skip_duree_conservation(forme: str) -> bool:
-    """
-    Règle :
-    Si le champ Forme contient "comprimé" ou "gélule" => ne pas incrémenter.
-    """
-    f = strip_accents(forme).lower()
-    return ("comprime" in f) or ("gelule" in f)
-
 # ============================================================
 # DISPONIBILITE
 # ============================================================
@@ -924,6 +810,108 @@ def compute_disponibilite(
         return "Disponible en pharmacie de ville"
 
     return "Pas d'information sur la disponibilité mentionnée"
+
+# ============================================================
+# RCP 6.3 / 6.4 (Durée / Précautions) - EXTRACTION ROBUSTE
+# ============================================================
+
+def should_skip_duree_conservation(forme: str) -> bool:
+    """
+    Règle : si la forme contient 'comprimé' ou 'gélule' => ne pas incrémenter 6.3/6.4.
+    """
+    f = strip_accents(forme).lower()
+    return ("comprime" in f) or ("gelule" in f)
+
+def format_bullets(text: str) -> str:
+    """
+    Met une puce '•' entre chaque saut de ligne (une puce par ligne non vide).
+    """
+    text = normalize_ws_keep_lines(text)
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return ""
+    return "• " + "\n• ".join(lines)
+
+def _section_heading_pat(num: str) -> re.Pattern:
+    """
+    Regex tolérante pour titres de type:
+    6.3 Durée...
+    6.3. Durée...
+    6 - 3 Durée...
+    """
+    a, b = num.split(".")
+    return re.compile(
+        rf"^\s*{re.escape(a)}\s*[\.\-]?\s*{re.escape(b)}\s*[\.\-]?\s+",
+        re.IGNORECASE
+    )
+
+def extract_rcp_section(html: str, start_num: str, stop_num: str) -> str:
+    """
+    Extrait le contenu entre le titre start_num (ex 6.3) et stop_num (ex 6.4).
+    """
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, _bs_parser())
+    raw_lines = soup.get_text("\n", strip=True).splitlines()
+    lines = [ln.strip() for ln in raw_lines if ln and ln.strip()]
+
+    start_pat = _section_heading_pat(start_num)
+    stop_pat = _section_heading_pat(stop_num)
+
+    start_idx = None
+    inline_rest = ""
+
+    for i, ln in enumerate(lines):
+        if start_pat.search(ln):
+            start_idx = i
+            ln2 = re.sub(start_pat, "", ln).strip()
+            ln2 = ln2.lstrip(":").strip()
+
+            # éviter de stocker juste l'intitulé sans contenu
+            if ln2 and strip_accents(ln2).lower() not in {
+                "duree de conservation",
+                "precautions particulieres de conservation",
+            }:
+                inline_rest = ln2
+            break
+
+    if start_idx is None:
+        return ""
+
+    collected: List[str] = []
+    if inline_rest:
+        collected.append(inline_rest)
+
+    for ln in lines[start_idx + 1:]:
+        if stop_pat.search(ln):
+            break
+        if start_pat.search(ln):
+            continue
+        collected.append(ln)
+
+    return normalize_ws_keep_lines("\n".join(collected)).strip()
+
+def fetch_rcp_html_best(cis: str, link_rcp: str) -> str:
+    """
+    Priorité: affichageDoc.php (RCP texte fiable) -> fallback extrait#tab=rcp
+    """
+    url_doc = BDPM_DOC_URL.format(cis=cis, doc="R")
+    try:
+        html = fetch_html_checked(url_doc, max_retries=2)
+        if html and len(html) > 200:
+            return html
+    except Exception:
+        pass
+
+    try:
+        rcp_html_url = set_tab(link_rcp, cis, "rcp")
+        html = fetch_html_checked(rcp_html_url, max_retries=2)
+        return html
+    except Exception:
+        return ""
 
 # ============================================================
 # AIRTABLE CLIENT
@@ -1021,11 +1009,6 @@ def main():
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
-    info("Téléchargement BDPM MITM (CIS -> ATC) ...")
-    mitm_txt = download_text(BDPM_MITM_URL, encoding="latin-1")
-    ok(f"BDPM MITM OK ({len(mitm_txt)} chars)")
-    mitm_atc_map = parse_bdpm_mitm_cis_atc(mitm_txt)
-
     info("Téléchargement BDPM CIS ...")
     cis_txt = download_text(BDPM_CIS_URL, encoding="latin-1")
     ok(f"BDPM CIS OK ({len(cis_txt)} chars)")
@@ -1064,11 +1047,12 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,                 # lecture
-        FIELD_ATC_LABEL,            # écriture possible
-        FIELD_COMPOSITION,          # écriture
-        FIELD_COMPOSITION_DETAILS,  # écriture
-        FIELD_DUREE_CONSERVATION,   # écriture
+        FIELD_ATC4,        # lecture
+        FIELD_ATC_LABEL,   # écriture possible
+        FIELD_COMPOSITION,
+        FIELD_COMPOSITION_DETAILS,
+        FIELD_DUREE_CONSERVATION,
+        FIELD_PRECAUTIONS_CONSERVATION,
     ]
 
     info("Inventaire Airtable ...")
@@ -1110,21 +1094,11 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # ATC via MITM
-            atc_val = mitm_atc_map.get(cis, "")
-            if atc_val:
-                fields[FIELD_ATC] = atc_val
-                atc4_tmp = atc_level4_from_any(atc_val)
-                if atc4_tmp:
-                    label = atc_labels.get(atc4_tmp, "")
-                    if label:
-                        fields[FIELD_ATC_LABEL] = label
-
-            # Composition + Composition détails
+            # composition
             compo = compo_map.get(cis, "").strip()
             if compo:
-                fields[FIELD_COMPOSITION_DETAILS] = compo
-                compo_no_acc = strip_accents(compo)
+                fields[FIELD_COMPOSITION_DETAILS] = compo  # sans doublon "sans accents"
+                compo_no_acc = strip_accents(compo).strip()
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
                 else:
@@ -1166,23 +1140,31 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: ATC via MITM + fiche-info (CPD/dispo) + Durée de conservation (RCP 6.3) + libellé ATC + compositions ...")
+    info("Enrichissement (fiche-info: CPD/Dispo) + composition + libellé ATC + RCP 6.3/6.4 ...")
 
     updates = []
     failures = 0
     deleted_count = 0
-
-    # Counters durée de conservation
-    duree_checks = 0
-    duree_added = 0
-    duree_skipped_forme = 0
-
     start = time.time()
+
+    # conservation stats + “fenêtre 200 checks”
+    duree_checks = 0
+    duree_added_63 = 0
+    prec_added_64 = 0
+    duree_skipped_forme = 0
+    rcp_html_empty = 0
+
+    window_checks = 0
+    window_found_any = 0
+    window_found_63 = 0
+    window_found_64 = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme}"
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | "
+                f"Durée checks={duree_checks} | Durée(6.3) added={duree_added_63} | "
+                f"Précautions(6.4) added={prec_added_64} | skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty}"
             )
 
         rec = airtable_by_cis.get(cis)
@@ -1192,37 +1174,25 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields: Dict[str, str] = {}
 
-        # 1) ATC depuis MITM
-        atc_mitm = mitm_atc_map.get(cis, "")
-        cur_atc = str(fields_cur.get(FIELD_ATC, "")).strip()
-        if atc_mitm and (force_refresh or not cur_atc or canonical_atc7(cur_atc) != atc_mitm):
-            upd_fields[FIELD_ATC] = atc_mitm
-
-            cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
-            atc4_tmp = atc_level4_from_any(atc_mitm)
-            if atc4_tmp:
-                label = atc_labels.get(atc4_tmp, "")
-                if label and label != cur_label:
-                    upd_fields[FIELD_ATC_LABEL] = label
-
-        # 2) Composition + Composition détails
+        # Composition (2 colonnes)
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
-        new_compo = compo_map.get(cis, "").strip()
 
+        new_compo = compo_map.get(cis, "").strip()
         if new_compo:
-            if force_refresh or (not cur_compo_details) or (cur_compo_details != new_compo):
+            # détails = sans ajout sans-accents
+            if new_compo != cur_compo_details:
                 upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
 
+            # composition = éventuellement + version sans accents
             new_no_acc = strip_accents(new_compo).strip()
             final_compo = new_compo
             if new_no_acc and new_no_acc.lower() not in new_compo.lower():
                 final_compo = f"{new_compo}\n{new_no_acc}"
-
-            if force_refresh or (not cur_compo) or (cur_compo != final_compo):
+            if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # 3) Libellé ATC via ATC4 computed
+        # Libellé ATC via ATC4 computed (si vous l'utilisez)
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1231,7 +1201,7 @@ def main():
             if label and label != cur_label:
                 upd_fields[FIELD_ATC_LABEL] = label
 
-        # 4) infos BDPM CIS
+        # infos BDPM CIS
         row = cis_map.get(cis)
         if row:
             labo = normalize_lab_name(row.titulaire)
@@ -1244,56 +1214,28 @@ def main():
             if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
                 upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
 
-        # 5) CIP
+        # CIP
         cip = cip_map.get(cis)
-        if cip and cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
-            upd_fields[FIELD_CIP13] = cip.cip13
+        if cip:
+            if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
+                upd_fields[FIELD_CIP13] = cip.cip13
 
-        # 6) Lien RCP (si vide)
+        # Lien RCP (si vide)
         link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # 7) Durée de conservation (RCP 6.3) sauf comprimé/gélule
-        forme_effective = (
-            str(upd_fields.get(FIELD_FORME, "")).strip()
-            or str(fields_cur.get(FIELD_FORME, "")).strip()
-            or (safe_text(row.forme) if row else "")
-        )
-
-        cur_duree = str(fields_cur.get(FIELD_DUREE_CONSERVATION, "")).strip()
-        skip_duree = should_skip_duree_conservation(forme_effective)
-        if skip_duree:
-            duree_skipped_forme += 1
-        else:
-            if force_refresh or not cur_duree:
-                rcp_html_url = set_tab(link_rcp, cis, "rcp")
-                duree_checks += 1
-                duree = fetch_duree_conservation_from_rcp(rcp_html_url)
-                duree = normalize_ws_keep_lines(duree)
-                if duree and duree != cur_duree:
-                    upd_fields[FIELD_DUREE_CONSERVATION] = duree
-                    duree_added += 1
-
-                    # Rapport des AJOUTS durée
-                    spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
-                    append_duree_conservation_report(
-                        cis=cis,
-                        specialite=spec_name,
-                        forme=forme_effective,
-                        duree=duree,
-                        rcp_url=rcp_html_url,
-                    )
-
-        # 8) fiche-info (CPD/dispo)
+        # URLs fiche info
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
+
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
 
         need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo)
         is_retro = cis in ansm_retro_cis
 
+        # 1) CPD/Dispo via fiche-info (pas RCP)
         if need_fetch_fiche:
             try:
                 cpd_text, is_homeo, reserved_hosp, usage_hosp = analyze_fiche_info(fiche_url)
@@ -1331,11 +1273,103 @@ def main():
 
             except Exception as e:
                 failures += 1
-                warn(f"Enrich KO CIS={cis}: {e} (on continue)")
+                warn(f"Enrich fiche-info KO CIS={cis}: {e} (on continue)")
 
+        # 2) RCP 6.3 + 6.4
+        forme_effective = (
+            str(upd_fields.get(FIELD_FORME, "")).strip()
+            or str(fields_cur.get(FIELD_FORME, "")).strip()
+            or (safe_text(row.forme) if row else "")
+        )
+
+        cur_duree = str(fields_cur.get(FIELD_DUREE_CONSERVATION, "")).strip()
+        cur_prec = str(fields_cur.get(FIELD_PRECAUTIONS_CONSERVATION, "")).strip()
+
+        if should_skip_duree_conservation(forme_effective):
+            duree_skipped_forme += 1
+        else:
+            need_63 = force_refresh or not cur_duree
+            need_64 = force_refresh or not cur_prec
+
+            if need_63 or need_64:
+                duree_checks += 1
+                window_checks += 1
+
+                rcp_html = fetch_rcp_html_best(cis=cis, link_rcp=link_rcp)
+                if not rcp_html or len(rcp_html) < 200:
+                    rcp_html_empty += 1
+                else:
+                    found_any = False
+
+                    # 6.3 (jusqu'à 6.4)
+                    if need_63:
+                        sec63 = extract_rcp_section(rcp_html, "6.3", "6.4")
+                        sec63 = format_bullets(sec63)
+                        if sec63 and sec63 != cur_duree:
+                            upd_fields[FIELD_DUREE_CONSERVATION] = sec63
+                            duree_added_63 += 1
+                            found_any = True
+                            window_found_63 += 1
+
+                            spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
+                            append_conservation_report(
+                                cis=cis,
+                                specialite=spec_name,
+                                forme=forme_effective,
+                                section="6.3",
+                                value=sec63,
+                                rcp_url=BDPM_DOC_URL.format(cis=cis, doc="R"),
+                            )
+
+                    # 6.4 (jusqu'à 6.5)
+                    if need_64:
+                        sec64 = extract_rcp_section(rcp_html, "6.4", "6.5")
+                        sec64 = format_bullets(sec64)
+                        if sec64 and sec64 != cur_prec:
+                            upd_fields[FIELD_PRECAUTIONS_CONSERVATION] = sec64
+                            prec_added_64 += 1
+                            found_any = True
+                            window_found_64 += 1
+
+                            spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
+                            append_conservation_report(
+                                cis=cis,
+                                specialite=spec_name,
+                                forme=forme_effective,
+                                section="6.4",
+                                value=sec64,
+                                rcp_url=BDPM_DOC_URL.format(cis=cis, doc="R"),
+                            )
+
+                    if found_any:
+                        window_found_any += 1
+
+                # Log toutes les 200 lignes “checkées” (au sens: tentatives RCP)
+                if window_checks >= 200:
+                    info(
+                        f"RCP(6.3/6.4) — fenêtre 200 checks: "
+                        f"checks={window_checks} | correspondances(any)={window_found_any} | "
+                        f"6.3_trouvées={window_found_63} | 6.4_trouvées={window_found_64}"
+                    )
+                    window_checks = 0
+                    window_found_any = 0
+                    window_found_63 = 0
+                    window_found_64 = 0
+
+        # Push update
         if upd_fields:
             upd_fields.pop(FIELD_ATC4, None)
             updates.append({"id": rec["id"], "fields": upd_fields})
+
+            # Pour éviter “repérage OK mais pas visible”, flush immédiat si 6.3/6.4 ajoutés
+            if (FIELD_DUREE_CONSERVATION in upd_fields) or (FIELD_PRECAUTIONS_CONSERVATION in upd_fields):
+                try:
+                    at.update_records([{"id": rec["id"], "fields": upd_fields}])
+                except Exception as e:
+                    failures += 1
+                    warn(f"Update immédiat Airtable KO CIS={cis}: {e} (on continue)")
+                # éviter double envoi dans le batch
+                updates.pop()
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
@@ -1347,8 +1381,10 @@ def main():
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
-                f"| Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme} | reste ~{int(remaining)}s"
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | "
+                f"Durée checks={duree_checks} | 6.3 added={duree_added_63} | 6.4 added={prec_added_64} | "
+                f"skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty} | "
+                f"reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1358,8 +1394,9 @@ def main():
     try_git_commit_report()
     ok(
         f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
-        f"Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme} | "
-        f"rapport suppression: {report_path_deleted_today()} | rapport durée: {report_path_duree_conservation_today()}"
+        f"Durée checks={duree_checks} | 6.3 added={duree_added_63} | 6.4 added={prec_added_64} | "
+        f"skipped(forme)={duree_skipped_forme} | RCP empty={rcp_html_empty} | "
+        f"rapport conservation: {report_path_conservation_today()}"
     )
 
 if __name__ == "__main__":
