@@ -77,6 +77,9 @@ FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
 FIELD_COMPOSITION = "Composition"        # champ à écrire (avec accents + parfois sans accents en 2e ligne)
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (avec accents uniquement)
 
+# NOUVEAU
+FIELD_DUREE_CONSERVATION = "Durée de conservation"  # champ à écrire
+
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
     FIELD_ATC4,
@@ -659,7 +662,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING (SANS ATC)
+# FICHE-INFO SCRAPING (CPD/DISPO) + RCP (Durée de conservation)
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -792,6 +795,81 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
         usage = bool(USAGE_HOSP_PAT.search(zone_text)) or badge_usage
 
     return cpd_text, is_homeo, reserved, usage
+
+# --- Durée de conservation (RCP section 6.3) ---
+_DUREE_63_PAT_NA = re.compile(r"^\s*6\s*[\.\-]?\s*3\s+duree\s+de\s+conservation\b", re.IGNORECASE)
+_NEXT_SECTION_PAT_NA = re.compile(
+    r"^\s*(?:"
+    r"6\s*[\.\-]?\s*(?:[0-2]|4|[5-9])\b"  # 6.0-6.2, 6.4-6.9
+    r"|7\s*[\.\-]?\s*\d\b"                # 7.x
+    r")",
+    re.IGNORECASE,
+)
+
+def extract_duree_conservation_from_rcp_html(html: str) -> str:
+    """
+    Extrait le contenu de la rubrique '6.3 Durée de conservation' depuis le HTML du RCP.
+    Renvoie '' si introuvable.
+    """
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, _bs_parser())
+    raw_lines = soup.get_text("\n", strip=True).splitlines()
+    lines = [ln.strip() for ln in raw_lines if ln and ln.strip()]
+
+    start_idx = None
+    inline_rest = ""
+
+    for i, ln in enumerate(lines):
+        ln_na = strip_accents(ln).lower()
+        if _DUREE_63_PAT_NA.search(ln_na):
+            start_idx = i
+            # Si le titre contient déjà du contenu (rare) : après ":" ou après le titre
+            if ":" in ln:
+                inline_rest = ln.split(":", 1)[1].strip()
+            else:
+                # tenter de retirer le titre si le texte suit sur la même ligne
+                m = _DUREE_63_PAT_NA.search(ln_na)
+                if m:
+                    # garder la partie originale après le "match" (approx)
+                    # fallback simple : rien
+                    inline_rest = ""
+            break
+
+    if start_idx is None:
+        return ""
+
+    collected: List[str] = []
+    if inline_rest:
+        collected.append(inline_rest)
+
+    for ln in lines[start_idx + 1:]:
+        ln_na = strip_accents(ln).lower()
+        if _NEXT_SECTION_PAT_NA.search(ln_na):
+            break
+        collected.append(ln)
+
+    text = normalize_ws_keep_lines("\n".join(collected)).strip()
+    return text
+
+def fetch_duree_conservation_from_rcp(rcp_url: str) -> str:
+    """
+    Télécharge le RCP (tab=rcp) et extrait la section 6.3.
+    """
+    try:
+        html = fetch_html_checked(rcp_url, max_retries=2)
+    except Exception:
+        return ""
+    return extract_duree_conservation_from_rcp_html(html)
+
+def should_skip_duree_conservation(forme: str) -> bool:
+    """
+    Règle métier :
+    Si le champ Forme contient 'comprimé' ou 'gélule' => ne pas incrémenter.
+    """
+    f = strip_accents(forme).lower()
+    return ("comprime" in f) or ("gelule" in f)
 
 # ============================================================
 # DISPONIBILITE
@@ -965,6 +1043,7 @@ def main():
         FIELD_ATC_LABEL,            # écriture possible
         FIELD_COMPOSITION,          # écriture
         FIELD_COMPOSITION_DETAILS,  # écriture
+        FIELD_DUREE_CONSERVATION,   # écriture
     ]
 
     info("Inventaire Airtable ...")
@@ -1007,10 +1086,10 @@ def main():
                 fields[FIELD_CIP13] = cip.cip13
 
             # ATC via MITM (si dispo)
-            atc = mitm_atc_map.get(cis, "")
-            if atc:
-                fields[FIELD_ATC] = atc
-                atc4_tmp = atc_level4_from_any(atc)
+            atc_val = mitm_atc_map.get(cis, "")
+            if atc_val:
+                fields[FIELD_ATC] = atc_val
+                atc4_tmp = atc_level4_from_any(atc_val)
                 if atc4_tmp:
                     label = atc_labels.get(atc4_tmp, "")
                     if label:
@@ -1019,10 +1098,7 @@ def main():
             # Composition + Composition détails
             compo = compo_map.get(cis, "").strip()
             if compo:
-                # Détails = avec accents uniquement
                 fields[FIELD_COMPOSITION_DETAILS] = compo
-
-                # Composition = avec accents + éventuellement sans accents (2e ligne)
                 compo_no_acc = strip_accents(compo)
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
@@ -1065,7 +1141,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: ATC via MITM + fiche-info (CPD/dispo) + libellé ATC + compositions ...")
+    info("Enrichissement: ATC via MITM + fiche-info (CPD/dispo) + Durée de conservation (RCP 6.3) + libellé ATC + compositions ...")
 
     updates = []
     failures = 0
@@ -1089,7 +1165,6 @@ def main():
         if atc_mitm and (force_refresh or not cur_atc or canonical_atc7(cur_atc) != atc_mitm):
             upd_fields[FIELD_ATC] = atc_mitm
 
-            # libellé ATC immédiat
             cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
             atc4_tmp = atc_level4_from_any(atc_mitm)
             if atc4_tmp:
@@ -1103,11 +1178,9 @@ def main():
 
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
-            # Détails = toujours la version avec accents uniquement
             if force_refresh or (not cur_compo_details) or (cur_compo_details != new_compo):
                 upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
 
-            # Composition = avec accents + éventuellement sans accents (2e ligne)
             new_no_acc = strip_accents(new_compo).strip()
             final_compo = new_compo
             if new_no_acc and new_no_acc.lower() not in new_compo.lower():
@@ -1116,7 +1189,7 @@ def main():
             if force_refresh or (not cur_compo) or (cur_compo != final_compo):
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # 3) Libellé ATC via ATC4 computed (si ton Airtable calcule ATC4)
+        # 3) Libellé ATC via ATC4 computed (si Airtable calcule ATC4)
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1149,7 +1222,26 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # 7) fiche-info (uniquement CPD/dispo)
+        # 7) Durée de conservation (RCP 6.3) : sauf si Forme contient "comprimé" ou "gélule"
+        # Forme effective (celle qu'on va considérer)
+        forme_effective = (
+            str(upd_fields.get(FIELD_FORME, "")).strip()
+            or str(fields_cur.get(FIELD_FORME, "")).strip()
+            or (safe_text(row.forme) if row else "")
+        )
+
+        cur_duree = str(fields_cur.get(FIELD_DUREE_CONSERVATION, "")).strip()
+        skip_duree = should_skip_duree_conservation(forme_effective)
+
+        if (not skip_duree) and (force_refresh or not cur_duree):
+            # Le lien "Lien vers RCP" pointe vers extrait, on force l'onglet rcp
+            rcp_html_url = set_tab(link_rcp, cis, "rcp")
+            duree = fetch_duree_conservation_from_rcp(rcp_html_url)
+            duree = normalize_ws_keep_lines(duree)
+            if duree and duree != cur_duree:
+                upd_fields[FIELD_DUREE_CONSERVATION] = duree
+
+        # 8) fiche-info (uniquement CPD/dispo)
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
