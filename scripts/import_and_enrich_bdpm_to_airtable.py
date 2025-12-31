@@ -29,7 +29,7 @@ BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
-# Equivalence CIS -> ATC depuis le fichier MITM
+# Équivalence CIS -> ATC (médicaments d'intérêt thérapeutique majeur)
 BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
@@ -126,22 +126,45 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
+def report_path_duree_conservation_today() -> str:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    fname = f"duree_conservation_added_{time.strftime('%Y-%m-%d')}.tsv"
+    return os.path.join(REPORT_DIR, fname)
+
+def append_duree_conservation_report(cis: str, specialite: str, forme: str, duree: str, rcp_url: str):
+    """
+    Trace uniquement les AJOUTS/MAJ de la durée de conservation.
+    """
+    p = report_path_duree_conservation_today()
+    header = "timestamp\tcis\tspecialite\tforme\tduree_conservation\trcp_url\n"
+    if not os.path.exists(p):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(header)
+    # éviter les retours ligne dans la cellule TSV
+    duree_one_line = normalize_ws_keep_lines(duree).replace("\n", " | ")
+    line = f"{_ts()}\t{cis}\t{specialite}\t{forme}\t{duree_one_line}\t{rcp_url}\n"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(line)
+
 def try_git_commit_report():
     if not REPORT_COMMIT:
         return
     try:
-        paths = [report_path_deleted_today()]
+        paths = [
+            report_path_deleted_today(),
+            report_path_duree_conservation_today(),
+        ]
         existing = [p for p in paths if os.path.exists(p)]
         if not existing:
             return
         subprocess.run(["git", "status"], check=False)
         for p in existing:
             subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: deleted records ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Report: enrich (deleted + duree) ({time.strftime('%Y-%m-%d')})"], check=True)
         subprocess.run(["git", "push"], check=True)
-        ok("Rapport suppression commit/push sur GitHub effectué.")
+        ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
-        warn(f"Commit/push du rapport impossible (on continue): {e}")
+        warn(f"Commit/push des rapports impossible (on continue): {e}")
 
 # ============================================================
 # TEXT UTIL
@@ -271,10 +294,9 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 
 def parse_bdpm_mitm_cis_atc(txt: str) -> Dict[str, str]:
     """
-    Fichier CIS_MITM.txt : attendu (tab):
+    Fichier CIS_MITM.txt (tab):
       col0 = CIS (8 chiffres)
       col1 = ATC (souvent ATC7)
-      autres colonnes possibles (ignorées)
     """
     out: Dict[str, str] = {}
     for line in (txt or "").splitlines():
@@ -662,7 +684,7 @@ def normalize_lab_name(titulaire: str) -> str:
     return first
 
 # ============================================================
-# FICHE-INFO SCRAPING (CPD/DISPO) + RCP (Durée de conservation)
+# FICHE-INFO (CPD/DISPO) + RCP (Durée de conservation)
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -797,13 +819,19 @@ def analyze_fiche_info(fiche_url: str) -> Tuple[str, bool, bool, bool]:
     return cpd_text, is_homeo, reserved, usage
 
 # --- Durée de conservation (RCP section 6.3) ---
-_DUREE_63_PAT_NA = re.compile(r"^\s*6\s*[\.\-]?\s*3\s+duree\s+de\s+conservation\b", re.IGNORECASE)
+# Tolère: "6.3 Durée..." / "6.3. Durée..." / "6 - 3 Durée..." etc.
+_DUREE_63_PAT_NA = re.compile(
+    r"^\s*6\s*[\.\-]?\s*3\s*[\.\-]?\s*duree\s+de\s+conservation\b",
+    re.IGNORECASE
+)
+
+# Stop à la section suivante: 6.4 / 6.5 ... ou chapitre 7
 _NEXT_SECTION_PAT_NA = re.compile(
     r"^\s*(?:"
-    r"6\s*[\.\-]?\s*(?:[0-2]|4|[5-9])\b"  # 6.0-6.2, 6.4-6.9
-    r"|7\s*[\.\-]?\s*\d\b"                # 7.x
+    r"6\s*[\.\-]?\s*(?:4|5|6|7|8|9)\b"
+    r"|7\s*[\.\-]?\s*\d\b"
     r")",
-    re.IGNORECASE,
+    re.IGNORECASE
 )
 
 def extract_duree_conservation_from_rcp_html(html: str) -> str:
@@ -825,16 +853,15 @@ def extract_duree_conservation_from_rcp_html(html: str) -> str:
         ln_na = strip_accents(ln).lower()
         if _DUREE_63_PAT_NA.search(ln_na):
             start_idx = i
-            # Si le titre contient déjà du contenu (rare) : après ":" ou après le titre
+            # si le titre contient déjà une valeur sur la même ligne
             if ":" in ln:
                 inline_rest = ln.split(":", 1)[1].strip()
             else:
-                # tenter de retirer le titre si le texte suit sur la même ligne
-                m = _DUREE_63_PAT_NA.search(ln_na)
+                # parfois: "6.3. Durée de conservation 2 ans"
+                # on tente de retirer le titre et garder le reste
+                m = re.search(r"(6\s*[\.\-]?\s*3\s*[\.\-]?\s*dur[ée]e\s+de\s+conservation)\s*(.*)$", ln, flags=re.IGNORECASE)
                 if m:
-                    # garder la partie originale après le "match" (approx)
-                    # fallback simple : rien
-                    inline_rest = ""
+                    inline_rest = (m.group(2) or "").strip()
             break
 
     if start_idx is None:
@@ -848,15 +875,14 @@ def extract_duree_conservation_from_rcp_html(html: str) -> str:
         ln_na = strip_accents(ln).lower()
         if _NEXT_SECTION_PAT_NA.search(ln_na):
             break
+        # éviter d'accrocher des répétitions d'en-tête (rare)
+        if _DUREE_63_PAT_NA.search(ln_na):
+            continue
         collected.append(ln)
 
-    text = normalize_ws_keep_lines("\n".join(collected)).strip()
-    return text
+    return normalize_ws_keep_lines("\n".join(collected)).strip()
 
 def fetch_duree_conservation_from_rcp(rcp_url: str) -> str:
-    """
-    Télécharge le RCP (tab=rcp) et extrait la section 6.3.
-    """
     try:
         html = fetch_html_checked(rcp_url, max_retries=2)
     except Exception:
@@ -865,8 +891,8 @@ def fetch_duree_conservation_from_rcp(rcp_url: str) -> str:
 
 def should_skip_duree_conservation(forme: str) -> bool:
     """
-    Règle métier :
-    Si le champ Forme contient 'comprimé' ou 'gélule' => ne pas incrémenter.
+    Règle :
+    Si le champ Forme contient "comprimé" ou "gélule" => ne pas incrémenter.
     """
     f = strip_accents(forme).lower()
     return ("comprime" in f) or ("gelule" in f)
@@ -995,7 +1021,6 @@ def main():
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
-    # Télécharger CIS_MITM au début (CIS -> ATC)
     info("Téléchargement BDPM MITM (CIS -> ATC) ...")
     mitm_txt = download_text(BDPM_MITM_URL, encoding="latin-1")
     ok(f"BDPM MITM OK ({len(mitm_txt)} chars)")
@@ -1085,7 +1110,7 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # ATC via MITM (si dispo)
+            # ATC via MITM
             atc_val = mitm_atc_map.get(cis, "")
             if atc_val:
                 fields[FIELD_ATC] = atc_val
@@ -1146,11 +1171,19 @@ def main():
     updates = []
     failures = 0
     deleted_count = 0
+
+    # Counters durée de conservation
+    duree_checks = 0
+    duree_added = 0
+    duree_skipped_forme = 0
+
     start = time.time()
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis})")
+            info(
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme}"
+            )
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1175,8 +1208,8 @@ def main():
         # 2) Composition + Composition détails
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
         cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
-
         new_compo = compo_map.get(cis, "").strip()
+
         if new_compo:
             if force_refresh or (not cur_compo_details) or (cur_compo_details != new_compo):
                 upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
@@ -1189,7 +1222,7 @@ def main():
             if force_refresh or (not cur_compo) or (cur_compo != final_compo):
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # 3) Libellé ATC via ATC4 computed (si Airtable calcule ATC4)
+        # 3) Libellé ATC via ATC4 computed
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1222,8 +1255,7 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # 7) Durée de conservation (RCP 6.3) : sauf si Forme contient "comprimé" ou "gélule"
-        # Forme effective (celle qu'on va considérer)
+        # 7) Durée de conservation (RCP 6.3) sauf comprimé/gélule
         forme_effective = (
             str(upd_fields.get(FIELD_FORME, "")).strip()
             or str(fields_cur.get(FIELD_FORME, "")).strip()
@@ -1232,16 +1264,29 @@ def main():
 
         cur_duree = str(fields_cur.get(FIELD_DUREE_CONSERVATION, "")).strip()
         skip_duree = should_skip_duree_conservation(forme_effective)
+        if skip_duree:
+            duree_skipped_forme += 1
+        else:
+            if force_refresh or not cur_duree:
+                rcp_html_url = set_tab(link_rcp, cis, "rcp")
+                duree_checks += 1
+                duree = fetch_duree_conservation_from_rcp(rcp_html_url)
+                duree = normalize_ws_keep_lines(duree)
+                if duree and duree != cur_duree:
+                    upd_fields[FIELD_DUREE_CONSERVATION] = duree
+                    duree_added += 1
 
-        if (not skip_duree) and (force_refresh or not cur_duree):
-            # Le lien "Lien vers RCP" pointe vers extrait, on force l'onglet rcp
-            rcp_html_url = set_tab(link_rcp, cis, "rcp")
-            duree = fetch_duree_conservation_from_rcp(rcp_html_url)
-            duree = normalize_ws_keep_lines(duree)
-            if duree and duree != cur_duree:
-                upd_fields[FIELD_DUREE_CONSERVATION] = duree
+                    # Rapport des AJOUTS durée
+                    spec_name = safe_text(row.specialite) if row else safe_text(fields_cur.get(FIELD_SPEC, ""))
+                    append_duree_conservation_report(
+                        cis=cis,
+                        specialite=spec_name,
+                        forme=forme_effective,
+                        duree=duree,
+                        rcp_url=rcp_html_url,
+                    )
 
-        # 8) fiche-info (uniquement CPD/dispo)
+        # 8) fiche-info (CPD/dispo)
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
@@ -1302,7 +1347,8 @@ def main():
             rate = idx / elapsed if elapsed > 0 else 0
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} | reste ~{int(remaining)}s"
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs: {failures} | supprimés: {deleted_count} "
+                f"| Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme} | reste ~{int(remaining)}s"
             )
 
     if updates:
@@ -1310,7 +1356,11 @@ def main():
         ok(f"Updates finaux: {len(updates)}")
 
     try_git_commit_report()
-    ok(f"Terminé. échecs: {failures} | supprimés: {deleted_count} | rapport suppression: {report_path_deleted_today()}")
+    ok(
+        f"Terminé. échecs: {failures} | supprimés: {deleted_count} | "
+        f"Durée checks={duree_checks} | Durée added={duree_added} | Durée skipped(forme)={duree_skipped_forme} | "
+        f"rapport suppression: {report_path_deleted_today()} | rapport durée: {report_path_duree_conservation_today()}"
+    )
 
 if __name__ == "__main__":
     main()
