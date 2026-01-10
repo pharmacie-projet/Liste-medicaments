@@ -11,6 +11,8 @@ import subprocess
 import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -87,6 +89,9 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
+# ✅ NOUVEAU : timestamp de revue
+FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
+
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
     FIELD_ATC4,
@@ -117,6 +122,14 @@ def sleep_throttle():
 
 def retry_sleep(attempt: int):
     time.sleep(min(10, 0.6 * (2 ** (attempt - 1))) + random.random() * 0.25)
+
+# ============================================================
+# REVIEW TIMESTAMP
+# ============================================================
+
+def now_paris_iso_seconds() -> str:
+    # ISO 8601 avec timezone Europe/Paris (Airtable l'accepte très bien pour un champ Date/Date+Heure)
+    return datetime.now(ZoneInfo("Europe/Paris")).isoformat(timespec="seconds")
 
 # ============================================================
 # REPORTING
@@ -634,8 +647,6 @@ def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
         if not cis_m:
             continue
         cis = cis_m.group(1)
-        # chercher un ATC7
-        # (on tolère des séparateurs éventuels)
         atc_m = re.search(r"\b([A-Z]\d{2}[A-Z]{2}\d{2})\b", line.upper())
         if not atc_m:
             continue
@@ -670,7 +681,6 @@ def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
         if not um:
             continue
         url = um.group(1).strip().rstrip(").,;")
-        # normalisation minimale
         if url.startswith("http"):
             cis_to_url[cis] = url
     ok(f"Infos importantes chargées: {len(cis_to_url)} correspondances CIS->URL")
@@ -930,7 +940,6 @@ class AirtableClient:
                 return out
             except Exception as e:
                 msg = str(e)
-                # exemple: {"error":{"type":"UNKNOWN_FIELD_NAME","message":"Unknown field name: \"Durée de conservation\""}}
                 m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*\\"([^\\"]+)\\"', msg)
                 if not m:
                     m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*"([^"]+)"', msg)
@@ -1036,6 +1045,7 @@ def main():
         FIELD_COMPOSITION, # écriture
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
+        FIELD_DATE_REVUE,  # ✅ lecture (facultatif, mais pratique)
     ]
 
     info("Inventaire Airtable ...")
@@ -1057,6 +1067,9 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
+    # ✅ timestamp unique de la “revue” (même valeur pour toutes les lignes revues dans ce run)
+    review_ts = now_paris_iso_seconds()
+
     # CREATE
     if to_create:
         info("Création des enregistrements manquants ...")
@@ -1066,13 +1079,14 @@ def main():
             cip = cip_map.get(cis)
             labo = normalize_lab_name(row.titulaire)
 
-            fields = {
+            fields: Dict[str, object] = {
                 FIELD_CIS: cis,
                 FIELD_SPEC: safe_text(row.specialite),
                 FIELD_FORME: safe_text(row.forme),
                 FIELD_VOIE: safe_text(row.voie_admin),
                 FIELD_LABO: labo,
                 FIELD_RCP: rcp_link_default(cis),
+                FIELD_DATE_REVUE: review_ts,  # ✅ on marque aussi les créations comme “revues”
             }
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
@@ -1139,8 +1153,9 @@ def main():
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
     info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ...")
+    info(f"Revue du jour (timestamp): {review_ts}")
 
-    updates = []
+    updates: List[dict] = []
     failures = 0
     deleted_count = 0
     start = time.time()
@@ -1161,7 +1176,10 @@ def main():
             continue
 
         fields_cur = rec.get("fields", {}) or {}
-        upd_fields: Dict[str, str] = {}
+        upd_fields: Dict[str, object] = {}
+
+        # ✅ NOUVEAU : on marque *toute ligne revue* (même si aucune autre donnée ne change)
+        upd_fields[FIELD_DATE_REVUE] = review_ts
 
         # infos BDPM CIS
         row = cis_map.get(cis)
@@ -1193,11 +1211,9 @@ def main():
         cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
         new_compo = compo_map.get(cis, "").strip()
         if new_compo:
-            # détails = accents uniquement
             if new_compo != cur_compo_details:
                 upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
 
-            # composition = accents + (option) sans accents
             new_no_acc = strip_accents(new_compo).strip()
             final_compo = new_compo
             if new_no_acc and new_no_acc.lower() not in new_compo.lower():
@@ -1284,9 +1300,9 @@ def main():
                 failures += 1
                 warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
-        if upd_fields:
-            upd_fields.pop(FIELD_ATC4, None)  # sécurité
-            updates.append({"id": rec["id"], "fields": upd_fields})
+        # ✅ désormais, upd_fields contient toujours Date revue ligne
+        upd_fields.pop(FIELD_ATC4, None)  # sécurité
+        updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
