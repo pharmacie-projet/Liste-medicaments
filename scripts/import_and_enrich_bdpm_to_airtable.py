@@ -89,6 +89,9 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
+# ✅ NOUVEAU : moment de prise (extraction depuis le RCP)
+FIELD_MOMENT_PRISE = "Moment de prise"  # champ à écrire
+
 # ✅ NOUVEAU : timestamp de revue
 FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
 
@@ -200,6 +203,124 @@ def normalize_ws_keep_lines(s: str) -> str:
             empty = 0
             out.append(line)
     return "\n".join(out).strip()
+
+# ============================================================
+# EXTRACTION "MOMENT DE PRISE" (RCP)
+# ============================================================
+
+# Mots-clés demandés (matching insensible à la casse + accents)
+MOMENT_PRISE_KEYWORDS = [
+    # Repas / nourriture
+    "repas",
+    "nourriture",
+    "manger",
+    "aliment",
+    "aliments",
+    "alimentation",
+
+    # À jeun / estomac
+    "a jeun",
+    "à jeun",
+    "estomac vide",
+    "sur estomac vide",
+
+    # Formulations fréquentes des RCP
+    "avec un repas",
+    "avec les repas",
+    "au cours du repas",
+    "pendant le repas",
+    "avant le repas",
+    "apres le repas",
+    "après le repas",
+    "en dehors des repas",
+    "au moment des repas",
+
+    # Avec / sans nourriture
+    "avec nourriture",
+    "avec de la nourriture",
+    "avec des aliments",
+    "prendre avec nourriture",
+    "avec ou sans nourriture",
+    "avec ou sans aliments",
+    "sans nourriture",
+
+    # Interactions liées à la nourriture
+    "produits laitiers",
+    "lait",
+    "pamplemousse",
+    "alcool",
+    "boisson alcoolisee",
+    "boisson alcoolisée",
+    "repas riche",
+    "repas riche en graisses",
+    "repas riche en graisse",
+    "repas gras",
+]
+_MOMENT_PRISE_KW_NORM = [strip_accents(k).lower() for k in MOMENT_PRISE_KEYWORDS]
+
+def _moment_kw_in(text: str) -> bool:
+    t = strip_accents(safe_text(text)).lower()
+    return any(k in t for k in _MOMENT_PRISE_KW_NORM)
+
+_SENT_SPLIT = re.compile(r"(?<=[\.!\?])\s+")
+
+def _split_sentences(text: str) -> List[str]:
+    t = safe_text(text)
+    if not t:
+        return []
+    # Compacte espaces
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return []
+    return [s.strip() for s in _SENT_SPLIT.split(t) if s.strip()]
+
+def extract_moment_prise_from_rcp_html(html: str) -> str:
+    """Retourne les phrases (ou fragments) contenant les mots-clés repas/nourriture/manger."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, _bs_parser())
+    raw = soup.get_text("\n", strip=True)
+    if not raw:
+        return ""
+
+    hits: List[str] = []
+
+    # 1) D'abord par lignes (souvent plus fidèle au rendu BDPM)
+    for ln in raw.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        if _moment_kw_in(ln):
+            # Si c'est un paragraphe, on prend la/les phrases contenant le mot-clé
+            sents = _split_sentences(ln)
+            if sents:
+                hits.extend([s for s in sents if _moment_kw_in(s)])
+            else:
+                hits.append(ln)
+
+    # 2) En complément: recherche dans des paragraphes (si la mise en page coupe mal les lignes)
+    for para in re.split(r"\n{2,}", raw):
+        for s in _split_sentences(para):
+            if _moment_kw_in(s):
+                hits.append(s)
+
+    # Dé-doublonnage en conservant l'ordre
+    seen = set()
+    uniq: List[str] = []
+    for h in hits:
+        h2 = h.strip()
+        if not h2:
+            continue
+        if h2 in seen:
+            continue
+        uniq.append(h2)
+        seen.add(h2)
+
+    # Sécurité: évite des champs énormes si le site répète du contenu
+    if len(uniq) > 30:
+        uniq = uniq[:30]
+
+    return "\n".join(uniq).strip()
 
 def capitalize_each_line(text: str) -> str:
     if not text:
@@ -1045,6 +1166,7 @@ def main():
         FIELD_COMPOSITION, # écriture
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
+        FIELD_MOMENT_PRISE, # ✅ lecture/écriture (extraction RCP)
         FIELD_DATE_REVUE,  # ✅ lecture (facultatif, mais pratique)
     ]
 
@@ -1163,11 +1285,14 @@ def main():
     fiche_checks = 0
     info_added = 0
     atc_added = 0
+    moment_checks = 0
+    moment_added = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
+                f"moment checks={moment_checks} | moment added={moment_added} | "
                 f"ATC added={atc_added} | info importante added={info_added}"
             )
 
@@ -1205,6 +1330,23 @@ def main():
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
+
+        # Moment de prise (extraction depuis le RCP)
+        cur_moment = str(fields_cur.get(FIELD_MOMENT_PRISE, "")).strip()
+        need_fetch_rcp = force_refresh or (not cur_moment)
+        if need_fetch_rcp and link_rcp:
+            try:
+                moment_checks += 1
+                rcp_url = set_tab(link_rcp, cis, "rcp")
+                html_rcp = fetch_html_checked(rcp_url)
+                moment_txt = extract_moment_prise_from_rcp_html(html_rcp)
+                if moment_txt and moment_txt != cur_moment:
+                    upd_fields[FIELD_MOMENT_PRISE] = moment_txt
+                    moment_added += 1
+            except PageUnavailable as e:
+                warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
+            except Exception as e:
+                warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1325,7 +1467,8 @@ def main():
     try_git_commit_report()
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} | ATC added={atc_added} | info importante added={info_added} | "
+        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | "
+        f"ATC added={atc_added} | info importante added={info_added} | "
         f"rapport suppressions: {report_path_deleted_today()}"
     )
 
