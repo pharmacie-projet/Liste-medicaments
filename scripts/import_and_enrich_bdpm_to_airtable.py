@@ -245,12 +245,6 @@ MOMENT_PRISE_KEYWORDS = [
     "sans nourriture",
 
     # Interactions liées à la nourriture
-    "produits laitiers",
-    "lait",
-    "pamplemousse",
-    "alcool",
-    "boisson alcoolisee",
-    "boisson alcoolisée",
     "repas riche",
     "repas riche en graisses",
     "repas riche en graisse",
