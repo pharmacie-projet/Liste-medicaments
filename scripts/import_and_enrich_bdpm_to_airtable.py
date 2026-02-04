@@ -1,10 +1,13 @@
-#!/usr/bin/env python3
+import pathlib, textwrap
+
+code = r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
 import re
 import time
 import json
+import csv
 import random
 import urllib.parse
 import subprocess
@@ -57,7 +60,6 @@ MAX_RETRIES = 4
 
 REPORT_DIR = os.getenv("REPORT_DIR", "reports")
 REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
-
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
@@ -89,11 +91,11 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
-# ✅ NOUVEAU : moment de prise (extraction depuis le RCP)
+# ✅ Moment de prise : on veut UNIQUEMENT les mots-clés présents (pas la phrase)
 FIELD_MOMENT_PRISE = "Moment de prise"  # champ à écrire
 
-# ✅ NOUVEAU : timestamp de revue
-FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
+# ✅ timestamp de revue
+FIELD_DATE_REVUE = "Date revue ligne"   # champ à écrire
 
 # règle absolue : ne jamais écrire ces champs (computed)
 DO_NOT_WRITE_FIELDS: Set[str] = {
@@ -131,15 +133,20 @@ def retry_sleep(attempt: int):
 # ============================================================
 
 def now_paris_iso_seconds() -> str:
-    # ISO 8601 avec timezone Europe/Paris (Airtable l'accepte très bien pour un champ Date/Date+Heure)
     return datetime.now(ZoneInfo("Europe/Paris")).isoformat(timespec="seconds")
 
 # ============================================================
 # REPORTING
 # ============================================================
 
-def report_path_deleted_today() -> str:
+def ensure_report_dir():
     os.makedirs(REPORT_DIR, exist_ok=True)
+
+def run_id_paris() -> str:
+    return datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y%m%d_%H%M%S")
+
+def report_path_deleted_today() -> str:
+    ensure_report_dir()
     fname = f"deleted_records_{time.strftime('%Y-%m-%d')}.txt"
     return os.path.join(REPORT_DIR, fname)
 
@@ -149,20 +156,35 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def try_git_commit_report():
+def init_moment_report_csv(path: str):
+    ensure_report_dir()
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["run_id", "cis", "rcp_url", "status", "keywords"])
+
+def append_moment_report(path: str, run_id: str, cis: str, rcp_url: str, status: str, keywords: str):
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([run_id, cis, rcp_url, status, keywords])
+        f.flush()
+
+def try_git_commit_reports():
+    """
+    Commit/push optionnel des rapports dans REPORT_DIR (si REPORT_COMMIT=1).
+    """
     if not REPORT_COMMIT:
         return
     try:
-        p = report_path_deleted_today()
-        if not os.path.exists(p):
+        if not os.path.exists(REPORT_DIR):
             return
         subprocess.run(["git", "status"], check=False)
-        subprocess.run(["git", "add", p], check=True)
-        subprocess.run(["git", "commit", "-m", f"Report: deleted records ({time.strftime('%Y-%m-%d')})"], check=True)
+        subprocess.run(["git", "add", REPORT_DIR], check=True)
+        subprocess.run(["git", "commit", "-m", f"Reports: {time.strftime('%Y-%m-%d %H:%M:%S')}"], check=True)
         subprocess.run(["git", "push"], check=True)
-        ok("Rapport (suppressions) commit/push sur GitHub effectué.")
+        ok("Rapports commit/push sur GitHub effectués.")
     except Exception as e:
-        warn(f"Commit/push du rapport impossible (on continue): {e}")
+        warn(f"Commit/push des rapports impossible (on continue): {e}")
 
 # ============================================================
 # TEXT UTIL
@@ -204,11 +226,38 @@ def normalize_ws_keep_lines(s: str) -> str:
             out.append(line)
     return "\n".join(out).strip()
 
+def capitalize_each_line(text: str) -> str:
+    if not text:
+        return text
+    out_lines: List[str] = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped:
+            prefix_len = len(line) - len(stripped)
+            prefix = line[:prefix_len]
+            stripped = stripped[0].upper() + stripped[1:]
+            out_lines.append(prefix + stripped)
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+def chunked(lst: List, n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def _bs_parser():
+    try:
+        import lxml  # noqa: F401
+        return "lxml"
+    except Exception:
+        return "html.parser"
+
 # ============================================================
 # EXTRACTION "MOMENT DE PRISE" (RCP)
 # ============================================================
 
-# Mots-clés demandés (matching insensible à la casse + accents)
+# ✅ Mots-clés EXACTS à récupérer si présents dans le RCP
+# (on ne stocke PAS la phrase, uniquement les mots-clés trouvés)
 MOMENT_PRISE_KEYWORDS = [
     # Formulations fréquentes des RCP
     "avec un repas",
@@ -240,132 +289,70 @@ MOMENT_PRISE_KEYWORDS = [
 def _norm(s: str) -> str:
     return strip_accents(safe_text(s)).lower()
 
-# On trie par longueur décroissante : on privilégie "au cours du repas" plutôt que "repas"
+# Trie par longueur décroissante : si plusieurs expressions coexistent, on privilégie les plus spécifiques
 _KW_NORM_SORTED = sorted([_norm(k) for k in MOMENT_PRISE_KEYWORDS if _norm(k)], key=len, reverse=True)
 
 def _build_kw_patterns(keywords_norm: List[str]) -> List[Tuple[str, re.Pattern]]:
     """
-    Construit des regex robustes :
-    - espaces -> \\s+ (gère retours à la ligne)
-    - bornes de mots \\b pour éviter les faux positifs
+    Regex robustes sur texte normalisé (sans accents):
+    - espaces -> \\s+ (gère retours ligne et espaces multiples)
+    - bornes de mots \\b pour limiter les faux positifs
     """
-    pats: List[Tuple[str, re.Pattern]] = []
+    out: List[Tuple[str, re.Pattern]] = []
     for kw in keywords_norm:
         kw_esc = re.escape(kw)
-        kw_esc = re.sub(r"\\\s+", r"\\s+", kw_esc)  # espaces flexibles
+        kw_esc = re.sub(r"\\\s+", r"\\s+", kw_esc)
         rgx = re.compile(rf"\b{kw_esc}\b", flags=re.IGNORECASE)
-        pats.append((kw, rgx))
-    return pats
+        out.append((kw, rgx))
+    return out
 
 _KW_PATTERNS = _build_kw_patterns(_KW_NORM_SORTED)
 
-_SENT_SPLIT = re.compile(r"(?<=[\.!\?])\s+")
-
-def _split_sentences(text: str) -> List[str]:
-    t = safe_text(text)
-    if not t:
-        return []
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return []
-    return [s.strip() for s in _SENT_SPLIT.split(t) if s.strip()]
-
-def _first_keyword_match(sentence: str) -> str:
+def extract_moment_keywords_from_rcp_html(html: str) -> str:
     """
-    Retourne le 1er mot-clé (le plus long, donc le plus spécifique) trouvé dans la phrase.
-    Si aucun, retourne "".
-    """
-    s_norm = _norm(sentence)
-    for kw, rgx in _KW_PATTERNS:  # _KW_PATTERNS est trié par longueur décroissante
-        if rgx.search(s_norm):
-            return kw
-    return ""
-
-def _has_another_distinct_keyword(sentence: str, chosen_kw: str) -> bool:
-    """
-    True si la phrase contient un AUTRE mot-clé distinct (hors recouvrement par sous-chaîne).
-    - On ignore les mots-clés qui sont des sous-chaînes du mot-clé choisi (ex: "repas riche" dans "repas riche en graisses")
-    """
-    if not chosen_kw:
-        return False
-    s_norm = _norm(sentence)
-    for kw, rgx in _KW_PATTERNS:
-        if kw == chosen_kw:
-            continue
-        if kw in chosen_kw:
-            continue
-        if rgx.search(s_norm):
-            return True
-    return False
-
-def extract_moment_prise_from_rcp_html(html: str) -> str:
-    """
-    ✅ Retourne AU MAX 1 phrase pour 'Moment de prise'
-    - la phrase contient exactement 1 des mots-clés/expressions listés (si possible)
-    - sinon fallback: première phrase contenant au moins 1 mot-clé
+    Retourne uniquement les mots-clés présents (distincts), séparés par '; '.
+    Si aucun mot-clé: retourne "" (et on n'écrit rien dans Airtable).
     """
     if not html:
         return ""
 
     soup = BeautifulSoup(html, _bs_parser())
-
-    # IMPORTANT: flux de texte continu (évite de remonter des "catégories" entières)
     raw = soup.get_text(" ", strip=True)
     if not raw:
         return ""
 
-    sentences = _split_sentences(raw)
-    if not sentences:
+    t = _norm(raw)
+
+    found: List[str] = []
+    for kw_norm, rgx in _KW_PATTERNS:
+        if rgx.search(t):
+            found.append(kw_norm)
+
+    # Dé-doublonnage, conservation de l'ordre (déjà trié par spécificité)
+    seen = set()
+    uniq_norm: List[str] = []
+    for f in found:
+        if f in seen:
+            continue
+        uniq_norm.append(f)
+        seen.add(f)
+
+    if not uniq_norm:
         return ""
 
-    # 1) meilleure phrase qui match EXACTEMENT 1 mot-clé (en tenant compte des recouvrements)
-    best = ""
-    best_kw_len = -1
+    # On renvoie les libellés originaux (ceux de MOMENT_PRISE_KEYWORDS) si possible.
+    # On mappe norm -> original (première occurrence).
+    norm_to_original: Dict[str, str] = {}
+    for orig in MOMENT_PRISE_KEYWORDS:
+        n = _norm(orig)
+        if n and n not in norm_to_original:
+            norm_to_original[n] = orig
 
-    for s in sentences:
-        chosen = _first_keyword_match(s)
-        if chosen and (not _has_another_distinct_keyword(s, chosen)):
-            kw_len = len(chosen)
-            if kw_len > best_kw_len:
-                best = s.strip()
-                best_kw_len = kw_len
-
-    if best:
-        return best
-
-    # 2) fallback: première phrase qui match au moins 1 mot-clé
-    for s in sentences:
-        chosen = _first_keyword_match(s)
-        if chosen:
-            return s.strip()
-
-    return ""
-
-def capitalize_each_line(text: str) -> str:
-    if not text:
-        return text
-    out_lines: List[str] = []
-    for line in text.split("\n"):
-        stripped = line.lstrip()
-        if stripped:
-            prefix_len = len(line) - len(stripped)
-            prefix = line[:prefix_len]
-            stripped = stripped[0].upper() + stripped[1:]
-            out_lines.append(prefix + stripped)
-        else:
-            out_lines.append(line)
-    return "\n".join(out_lines)
-
-def chunked(lst: List, n: int):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-def _bs_parser():
-    try:
-        import lxml  # noqa: F401
-        return "lxml"
-    except Exception:
-        return "html.parser"
+    rendered = [norm_to_original.get(n, n) for n in uniq_norm]
+    # sécurité anti-champs énormes
+    if len(rendered) > 30:
+        rendered = rendered[:30]
+    return "; ".join(rendered).strip()
 
 # ============================================================
 # ATC HELPERS (pour lecture fichiers)
@@ -773,12 +760,6 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
 # ============================================================
 
 def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
-    """
-    Parse le fichier CIS_MITM.txt.
-    Format exact susceptible de varier : on fait du robuste :
-    - on récupère le premier CIS (8 chiffres) sur la ligne
-    - on récupère le premier ATC7 valide sur la ligne
-    """
     cis_to_atc: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -803,12 +784,6 @@ def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
 _URL_PAT = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
 
 def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
-    """
-    Parse CIS_InfoImportantes.txt (génération en direct).
-    Robuste:
-    - trouve un CIS (8 chiffres)
-    - trouve une URL (http/https) quelque part dans la ligne
-    """
     cis_to_url: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -834,7 +809,6 @@ def base_extrait_url_from_cis(cis: str) -> str:
     return BDPM_DOC_EXTRACT_URL.format(cis=cis)
 
 def set_tab(url: str, cis_fallback: str, tab: str) -> str:
-    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
     if not url or not url.startswith("http"):
         url = base_extrait_url_from_cis(cis_fallback)
     parts = urllib.parse.urlsplit(url)
@@ -855,7 +829,7 @@ def rcp_link_default(cis: str) -> str:
     return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
 
 # ============================================================
-# FICHE-INFO SCRAPING (sans recueil d'indications thérapeutiques)
+# FICHE-INFO SCRAPING
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -1054,10 +1028,6 @@ class AirtableClient:
         raise RuntimeError(f"Airtable request failed: {method} {url} / {last_err}")
 
     def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
-        """
-        ⚠️ Airtable renvoie HTTP 422 si un nom de champ est inconnu dans fields[].
-        Ici: on tente avec fields, et si 422 UNKNOWN_FIELD_NAME, on retire ce champ et on réessaie.
-        """
         requested_fields = list(fields) if fields else None
 
         while True:
@@ -1130,6 +1100,11 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
+    RUN_ID = run_id_paris()
+    MOMENT_REPORT_CSV = os.path.join(REPORT_DIR, f"moment_prise_keywords_{RUN_ID}.csv")
+    SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
+    init_moment_report_csv(MOMENT_REPORT_CSV)
+
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
     info("Téléchargement BDPM CIS ...")
@@ -1185,8 +1160,8 @@ def main():
         FIELD_COMPOSITION, # écriture
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
-        FIELD_MOMENT_PRISE, # ✅ lecture/écriture (extraction RCP)
-        FIELD_DATE_REVUE,  # ✅ lecture (facultatif, mais pratique)
+        FIELD_MOMENT_PRISE, # lecture/écriture
+        FIELD_DATE_REVUE,
     ]
 
     info("Inventaire Airtable ...")
@@ -1208,7 +1183,6 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
-    # ✅ timestamp unique de la “revue” (même valeur pour toutes les lignes revues dans ce run)
     review_ts = now_paris_iso_seconds()
 
     # CREATE
@@ -1227,37 +1201,34 @@ def main():
                 FIELD_VOIE: safe_text(row.voie_admin),
                 FIELD_LABO: labo,
                 FIELD_RCP: rcp_link_default(cis),
-                FIELD_DATE_REVUE: review_ts,  # ✅ on marque aussi les créations comme “revues”
+                FIELD_DATE_REVUE: review_ts,
             }
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
-            # Composition
             compo = compo_map.get(cis, "").strip()
             if compo:
-                fields[FIELD_COMPOSITION_DETAILS] = compo  # accents uniquement
+                fields[FIELD_COMPOSITION_DETAILS] = compo
                 compo_no_acc = strip_accents(compo)
                 if compo_no_acc and compo_no_acc.lower() not in compo.lower():
                     fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
                 else:
                     fields[FIELD_COMPOSITION] = compo
 
-            # ATC depuis MITM (si dispo)
-            atc = cis_to_atc.get(cis, "").strip()
-            if atc:
-                fields[FIELD_ATC] = atc
-                atc4 = atc_level4_from_any(atc)
+            atc_code = cis_to_atc.get(cis, "").strip()
+            if atc_code:
+                fields[FIELD_ATC] = atc_code
+                atc4 = atc_level4_from_any(atc_code)
                 if atc4:
                     label = atc_labels.get(atc4, "")
                     if label:
                         fields[FIELD_ATC_LABEL] = label
 
-            # URL info importante (si dispo)
             iu = cis_to_info_url.get(cis, "").strip()
             if iu:
                 fields[FIELD_LIEN_INFO_IMPORTANTE] = iu
 
-            fields.pop(FIELD_ATC4, None)  # sécurité
+            fields.pop(FIELD_ATC4, None)
             new_recs.append({"fields": fields})
 
         at.create_records(new_recs)
@@ -1272,11 +1243,13 @@ def main():
                 airtable_by_cis[cis] = rec
 
     # DELETE
+    deleted_count = 0
     if to_delete:
         info("Suppression des enregistrements Airtable absents de BDPM ...")
         ids = [airtable_by_cis[c]["id"] for c in to_delete if c in airtable_by_cis]
         if ids:
             at.delete_records(ids)
+            deleted_count += len(ids)
             ok(f"Supprimés: {len(ids)}")
 
         records = at.list_all_records(fields=needed_fields)
@@ -1293,12 +1266,11 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + moment de prise (keywords) ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
     failures = 0
-    deleted_count = 0
     start = time.time()
 
     fiche_checks = 0
@@ -1306,13 +1278,14 @@ def main():
     atc_added = 0
     moment_checks = 0
     moment_added = 0
+    moment_no_kw = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"moment checks={moment_checks} | moment added={moment_added} | "
-                f"ATC added={atc_added} | info importante added={info_added}"
+                f"moment checks={moment_checks} | moment added={moment_added} | moment no_kw={moment_no_kw} | "
+                f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
 
         rec = airtable_by_cis.get(cis)
@@ -1322,10 +1295,8 @@ def main():
         fields_cur = rec.get("fields", {}) or {}
         upd_fields: Dict[str, object] = {}
 
-        # ✅ NOUVEAU : on marque *toute ligne revue* (même si aucune autre donnée ne change)
         upd_fields[FIELD_DATE_REVUE] = review_ts
 
-        # infos BDPM CIS
         row = cis_map.get(cis)
         if row:
             labo = normalize_lab_name(row.titulaire)
@@ -1338,34 +1309,43 @@ def main():
             if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
                 upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
 
-        # CIP
         cip = cip_map.get(cis)
         if cip:
             if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
                 upd_fields[FIELD_CIP13] = cip.cip13
 
-        # Lien RCP (si vide)
         link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # Moment de prise (extraction depuis le RCP) -> 1 phrase max
+        # ✅ Moment de prise: on écrit UNIQUEMENT les mots-clés présents
         cur_moment = str(fields_cur.get(FIELD_MOMENT_PRISE, "")).strip()
         need_fetch_rcp = force_refresh or (not cur_moment)
+
         if need_fetch_rcp and link_rcp:
+            rcp_url = set_tab(link_rcp, cis, "rcp")
             try:
                 moment_checks += 1
-                rcp_url = set_tab(link_rcp, cis, "rcp")
                 html_rcp = fetch_html_checked(rcp_url)
-                moment_txt = extract_moment_prise_from_rcp_html(html_rcp)
-                if moment_txt and moment_txt != cur_moment:
-                    upd_fields[FIELD_MOMENT_PRISE] = moment_txt
-                    moment_added += 1
+                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
+
+                if kw_txt:
+                    if kw_txt != cur_moment:
+                        upd_fields[FIELD_MOMENT_PRISE] = kw_txt
+                        moment_added += 1
+                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UPDATED", kw_txt)
+                    else:
+                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UNCHANGED", kw_txt)
+                else:
+                    moment_no_kw += 1
+                    append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "NO_KEYWORD", "")
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
+                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_KO", "")
             except Exception as e:
                 warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
+                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_PARSE_KO", "")
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1385,11 +1365,11 @@ def main():
         # ATC: uniquement via MITM si vide
         cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
         if not cur_atc_raw:
-            atc = cis_to_atc.get(cis, "").strip()
-            if atc:
-                upd_fields[FIELD_ATC] = atc
+            atc_code = cis_to_atc.get(cis, "").strip()
+            if atc_code:
+                upd_fields[FIELD_ATC] = atc_code
                 atc_added += 1
-                atc4_tmp = atc_level4_from_any(atc)
+                atc4_tmp = atc_level4_from_any(atc_code)
                 if atc4_tmp:
                     label = atc_labels.get(atc4_tmp, "")
                     if label:
@@ -1397,7 +1377,7 @@ def main():
                         if label != cur_label:
                             upd_fields[FIELD_ATC_LABEL] = label
 
-        # Libellé ATC via ATC4 computed (si la formule existe déjà côté Airtable)
+        # Libellé ATC via ATC4 computed
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1406,14 +1386,14 @@ def main():
             if label and label != cur_label:
                 upd_fields[FIELD_ATC_LABEL] = label
 
-        # Lien vers information importante (URL) via fichier dédié
+        # Lien vers information importante
         cur_info_url = str(fields_cur.get(FIELD_LIEN_INFO_IMPORTANTE, "")).strip()
         new_info_url = cis_to_info_url.get(cis, "").strip()
         if new_info_url and new_info_url != cur_info_url:
             upd_fields[FIELD_LIEN_INFO_IMPORTANTE] = new_info_url
             info_added += 1
 
-        # CPD + dispo via fiche-info (sans ATC / sans indications)
+        # CPD + dispo via fiche-info
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
@@ -1461,8 +1441,7 @@ def main():
                 failures += 1
                 warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
-        # ✅ désormais, upd_fields contient toujours Date revue ligne
-        upd_fields.pop(FIELD_ATC4, None)  # sécurité
+        upd_fields.pop(FIELD_ATC4, None)
         updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
@@ -1476,20 +1455,45 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} | ATC added={atc_added} | info importante added={info_added} | reste ~{int(remaining)}s"
+                f"| fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} "
+                f"| reste ~{int(remaining)}s"
             )
 
     if updates:
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
-    try_git_commit_report()
+    # Résumé JSON
+    ensure_report_dir()
+    summary = {
+        "run_id": RUN_ID,
+        "timestamp_paris": now_paris_iso_seconds(),
+        "total_cis_processed": len(all_cis),
+        "moment_checks": moment_checks,
+        "moment_added": moment_added,
+        "moment_no_keyword": moment_no_kw,
+        "fiche_checks": fiche_checks,
+        "atc_added": atc_added,
+        "info_added": info_added,
+        "failures": failures,
+        "deleted_count": deleted_count,
+        "moment_report_csv": MOMENT_REPORT_CSV,
+    }
+    with open(SUMMARY_JSON, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    try_git_commit_reports()
+
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | "
+        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
-        f"rapport suppressions: {report_path_deleted_today()}"
+        f"reports: {MOMENT_REPORT_CSV} ; {SUMMARY_JSON}"
     )
 
 if __name__ == "__main__":
     main()
+'''
+out_path = pathlib.Path("/mnt/data/import_and_enrich_bdpm_to_airtable_FULL_keywords_only.py")
+out_path.write_text(code, encoding="utf-8")
+print("Wrote", out_path)
