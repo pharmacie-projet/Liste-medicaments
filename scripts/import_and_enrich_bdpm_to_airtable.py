@@ -1,6 +1,4 @@
-import pathlib, textwrap
-
-code = r'''#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -1493,7 +1491,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-out_path = pathlib.Path("/mnt/data/import_and_enrich_bdpm_to_airtable_FULL_keywords_only.py")
-out_path.write_text(code, encoding="utf-8")
-print("Wrote", out_path)
