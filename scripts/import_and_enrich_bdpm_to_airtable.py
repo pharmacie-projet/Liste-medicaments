@@ -1,10 +1,4 @@
-import pathlib, textwrap, re
-
-# We'll build the full script by taking the user's provided code (as best as possible) and injecting the corrected extraction block.
-# Since we don't have the user's file text programmatically here, we'll craft the script as a complete file based on the provided snippet,
-# keeping everything identical except the extraction block.
-
-code = r'''#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -276,23 +270,33 @@ def _split_sentences(text: str) -> List[str]:
         return []
     return [s.strip() for s in _SENT_SPLIT.split(t) if s.strip()]
 
-def _count_distinct_keyword_matches(sentence: str) -> Tuple[int, List[str]]:
+def _first_keyword_match(sentence: str) -> str:
     """
-    Retourne (nb_mots_cles_distincts_trouves, liste_mots_cles_trouves)
-    Sur texte normalisé (sans accents).
+    Retourne le 1er mot-clé (le plus long, donc le plus spécifique) trouvé dans la phrase.
+    Si aucun, retourne "".
     """
     s_norm = _norm(sentence)
-    found: List[str] = []
-    for kw, rgx in _KW_PATTERNS:
+    for kw, rgx in _KW_PATTERNS:  # _KW_PATTERNS est trié par longueur décroissante
         if rgx.search(s_norm):
-            found.append(kw)
-    found_distinct: List[str] = []
-    seen = set()
-    for f in found:
-        if f not in seen:
-            found_distinct.append(f)
-            seen.add(f)
-    return len(found_distinct), found_distinct
+            return kw
+    return ""
+
+def _has_another_distinct_keyword(sentence: str, chosen_kw: str) -> bool:
+    """
+    True si la phrase contient un AUTRE mot-clé distinct (hors recouvrement par sous-chaîne).
+    - On ignore les mots-clés qui sont des sous-chaînes du mot-clé choisi (ex: "repas riche" dans "repas riche en graisses")
+    """
+    if not chosen_kw:
+        return False
+    s_norm = _norm(sentence)
+    for kw, rgx in _KW_PATTERNS:
+        if kw == chosen_kw:
+            continue
+        if kw in chosen_kw:
+            continue
+        if rgx.search(s_norm):
+            return True
+    return False
 
 def extract_moment_prise_from_rcp_html(html: str) -> str:
     """
@@ -314,14 +318,14 @@ def extract_moment_prise_from_rcp_html(html: str) -> str:
     if not sentences:
         return ""
 
-    # 1) meilleure phrase qui match EXACTEMENT 1 mot-clé
+    # 1) meilleure phrase qui match EXACTEMENT 1 mot-clé (en tenant compte des recouvrements)
     best = ""
     best_kw_len = -1
 
     for s in sentences:
-        n, kws = _count_distinct_keyword_matches(s)
-        if n == 1:
-            kw_len = len(kws[0])
+        chosen = _first_keyword_match(s)
+        if chosen and (not _has_another_distinct_keyword(s, chosen)):
+            kw_len = len(chosen)
             if kw_len > best_kw_len:
                 best = s.strip()
                 best_kw_len = kw_len
@@ -331,8 +335,8 @@ def extract_moment_prise_from_rcp_html(html: str) -> str:
 
     # 2) fallback: première phrase qui match au moins 1 mot-clé
     for s in sentences:
-        n, _ = _count_distinct_keyword_matches(s)
-        if n >= 1:
+        chosen = _first_keyword_match(s)
+        if chosen:
             return s.strip()
 
     return ""
@@ -1489,8 +1493,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-
-out_path = pathlib.Path("/mnt/data/import_and_enrich_bdpm_to_airtable_full_one_sentence.py")
-out_path.write_text(code, encoding="utf-8")
-print("Wrote:", out_path)
