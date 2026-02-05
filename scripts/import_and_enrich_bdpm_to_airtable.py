@@ -782,6 +782,42 @@ def set_tab(url: str, cis_fallback: str, tab: str) -> str:
 def rcp_link_default(cis: str) -> str:
     return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
 
+def resolve_rcp_doc_url(cis: str, fallback_url: str) -> str:
+    """
+    BDPM charge parfois le RCP via une page dédiée (affichageDoc.php?specDoc=RCP...).
+    Cette fonction tente de retrouver l'URL du document RCP dans la page 'extrait'.
+    Si introuvable, retourne fallback_url (souvent ...#tab=rcp).
+    """
+    try:
+        base_url = base_extrait_url_from_cis(cis)
+        html = fetch_html_checked(base_url)
+        soup = BeautifulSoup(html, _bs_parser())
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            low = href.lower()
+            if "affichagedoc.php" in low and "specdoc=rcp" in low:
+                if href.startswith("/"):
+                    href = "https://base-donnees-publique.medicaments.gouv.fr" + href
+                return href
+        # certains templates utilisent onclick ou data-href
+        for el in soup.find_all(["a","button"]):
+            for attr in ["onclick","data-href","data-url"]:
+                v = (el.get(attr) or "")
+                low = v.lower()
+                if "affichagedoc.php" in low and "specdoc=rcp" in low:
+                    m = re.search(r"(https?://[^\s\"']+affichagedoc\.php\?[^\s\"']+)", v, re.IGNORECASE)
+                    if m:
+                        return m.group(1)
+                    m = re.search(r"(\/affichagedoc\.php\?[^\s\"']+)", v, re.IGNORECASE)
+                    if m:
+                        return "https://base-donnees-publique.medicaments.gouv.fr" + m.group(1)
+    except Exception:
+        pass
+    return fallback_url
+
+
 # ============================================================
 # FICHE-INFO SCRAPING
 # ============================================================
@@ -1235,13 +1271,16 @@ def main():
     start = time.time()
 
     fiche_checks = 0
+    rcp_checks = 0
+    rcp_sections_updated = 0
+    rcp_sections_empty = 0
     info_added = 0
     atc_added = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | rcp checks={rcp_checks} (updated={rcp_sections_updated}, empty={rcp_sections_empty}) | rcp checks={rcp_checks} (updated={rcp_sections_updated}, empty={rcp_sections_empty}) | fiche checks={fiche_checks} | "
                 f""
                 f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
@@ -1277,7 +1316,7 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-                        # ✅ RCP: extraction sections 4.1/4.2/4.5
+                                # ✅ RCP: extraction sections 4.1/4.2/4.5
         cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1285,21 +1324,36 @@ def main():
         need_fetch_rcp = force_refresh or (not cur_41) or (not cur_42) or (not cur_45)
 
         if need_fetch_rcp and link_rcp:
-            rcp_url = set_tab(link_rcp, cis, "rcp")
-            try:
-                html_rcp = fetch_html_checked(rcp_url)
+            # 1) On tente d'abord l'URL document RCP (affichageDoc.php?specDoc=RCP...)
+            # 2) Sinon, fallback sur l'onglet rcp de la page extrait
+            fallback_rcp = set_tab(link_rcp, cis, "rcp")
+            rcp_url = resolve_rcp_doc_url(cis, fallback_rcp)
 
+            try:
+                rcp_checks += 1
+                html_rcp = fetch_html_checked(rcp_url)
                 sections = extract_rcp_sections_from_html(html_rcp)
+
                 sec41 = sections.get("4.1", "").strip()
                 sec42 = sections.get("4.2", "").strip()
                 sec45 = sections.get("4.5", "").strip()
 
+                if not sec41 and not sec42 and not sec45:
+                    rcp_sections_empty += 1
+
+                changed = False
                 if sec41 and sec41 != cur_41:
                     upd_fields[FIELD_INDICATIONS_RCP] = sec41
+                    changed = True
                 if sec42 and sec42 != cur_42:
                     upd_fields[FIELD_POSOLOGIE_RCP] = sec42
+                    changed = True
                 if sec45 and sec45 != cur_45:
                     upd_fields[FIELD_INTERACTIONS_RCP] = sec45
+                    changed = True
+
+                if changed:
+                    rcp_sections_updated += 1
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
