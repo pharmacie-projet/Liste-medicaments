@@ -25,5 +25,5 @@ pypdf==5.1.0
 Pillow==10.4.0
 pytesseract==0.3.10
 
+# Navigation headless (pour suivre les liens avec #tab-rcp)
 playwright==1.49.0
-
