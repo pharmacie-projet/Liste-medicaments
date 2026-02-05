@@ -63,6 +63,7 @@ REQUEST_TIMEOUT = 35
 MAX_RETRIES = 4
 
 REPORT_DIR = os.getenv("REPORT_DIR", "reports")
+RCP_REPORT_CSV = os.path.join(REPORT_DIR, f"rcp_extract_report_{time.strftime('%Y-%m-%d')}.csv")
 REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
@@ -181,6 +182,23 @@ def try_git_commit_reports():
     except Exception as e:
         warn(f"Commit/push des rapports impossible (on continue): {e}")
 
+
+# ============================================================
+# RCP REPORTING (debug extraction)
+# ============================================================
+
+def init_rcp_report_csv(path: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if os.path.exists(path):
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ts,cis,rcp_url,kind,text_len,has_41,has_42,has_45,updated,empty_reason\n")
+
+def append_rcp_report(path: str, cis: str, rcp_url: str, kind: str, text_len: int,
+                      has_41: bool, has_42: bool, has_45: bool, updated: bool, empty_reason: str):
+    line = f"{_ts()},{cis},{rcp_url},{kind},{text_len},{int(has_41)},{int(has_42)},{int(has_45)},{int(updated)},{empty_reason}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
 # ============================================================
 # TEXT UTIL
 # ============================================================
@@ -316,31 +334,69 @@ def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
 
 def extract_rcp_sections_from_text(text: str) -> Dict[str, str]:
     """
-    Même logique que extract_rcp_sections_from_html, mais à partir d'un texte déjà extrait (HTML ou PDF).
+    Extraction robuste des sections 4.1 / 4.2 / 4.5 depuis un texte (HTML ou PDF).
+    Stratégie:
+      1) repérage par numérotation tolérante: 4.1 / 4 . 1 / 4-1 / 4:1
+      2) si échec, fallback par titres (indications thérapeutiques / posologie / interactions)
     """
     text = safe_text(text)
     if not text:
         return {"4.1": "", "4.2": "", "4.5": ""}
 
-    # On transforme en lignes, en gardant les retours
-    lines: List[str] = []
-    for ln in text.split("\n"):
-        ln = re.sub(r"\s+", " ", ln).strip()
-        if ln:
-            lines.append(ln)
-
-    if not lines:
+    # Normalisation légère
+    t = text.replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) < 50:
         return {"4.1": "", "4.2": "", "4.5": ""}
 
-    stop_41 = re.compile(r"^\s*(?:4\.2(?:\b|[\.\-:])|5\.)")
-    stop_42 = re.compile(r"^\s*(?:4\.[3-9](?:\b|[\.\-:])|5\.)")
-    stop_45 = re.compile(r"^\s*(?:4\.[6-9](?:\b|[\.\-:])|5\.)")
+    # --- helper: extract between two markers in full text
+    def between(start_re: re.Pattern, end_re: re.Pattern) -> str:
+        m1 = start_re.search(t)
+        if not m1:
+            return ""
+        start = m1.end()
+        m2 = end_re.search(t, start)
+        end = m2.start() if m2 else len(t)
+        seg = t[start:end].strip()
+        return normalize_ws_keep_lines(seg)
 
-    return {
-        "4.1": _extract_section(lines, "4.1", stop_41),
-        "4.2": _extract_section(lines, "4.2", stop_42),
-        "4.5": _extract_section(lines, "4.5", stop_45),
-    }
+    # numérotation tolérante
+    s41 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*1\b[^\n]*", re.IGNORECASE)
+    s42 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*2\b[^\n]*", re.IGNORECASE)
+    s45 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*5\b[^\n]*", re.IGNORECASE)
+
+    # fins: 4.2 pour 4.1; 4.3-4.9 ou 5.* pour 4.2; 4.6-4.9 ou 5.* pour 4.5
+    e41 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*2\b", re.IGNORECASE)
+    e42 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*[3-9]\b|(?:^|\n)\s*5\s*[\.\-:]\s*1\b|(?:^|\n)\s*5\.", re.IGNORECASE)
+    e45 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*[6-9]\b|(?:^|\n)\s*5\s*[\.\-:]\s*1\b|(?:^|\n)\s*5\.", re.IGNORECASE)
+
+    out41 = between(s41, e41)
+    out42 = between(s42, e42)
+    out45 = between(s45, e45)
+
+    # fallback titres si vide
+    if not out41:
+        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*1\s*)?indications\s+th[ée]rapeutiques\b", re.IGNORECASE)
+        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*2\b|posologie\s+et\s+mode\s+d['’]administration\b)", re.IGNORECASE)
+        out41 = between(s, e)
+
+    if not out42:
+        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*2\s*)?posologie\s+et\s+mode\s+d['’]administration\b", re.IGNORECASE)
+        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*[3-9]\b|4\s*[\.\-:]\s*5\b|interactions\b|5\.)", re.IGNORECASE)
+        out42 = between(s, e)
+
+    if not out45:
+        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*5\s*)?interactions\b", re.IGNORECASE)
+        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*[6-9]\b|5\.)", re.IGNORECASE)
+        out45 = between(s, e)
+
+    # Sécurité: on évite des blobs énormes (Airtable supporte, mais on coupe à 50k)
+    def cap(x: str) -> str:
+        x = x.strip()
+        return x[:50000].strip()
+
+    return {"4.1": cap(out41), "4.2": cap(out42), "4.5": cap(out45)}
 
 
 # ============================================================
@@ -1219,6 +1275,7 @@ def main():
     RUN_ID = run_id_paris()
     SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
+    init_rcp_report_csv(RCP_REPORT_CSV)
 
     info("Téléchargement BDPM CIS ...")
     cis_txt = download_text(BDPM_CIS_URL, encoding="latin-1")
@@ -1461,6 +1518,7 @@ def main():
 
                 if not rcp_text or len(rcp_text) < 200:
                     rcp_sections_empty += 1
+                append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), False, False, False, False, \"no_text\")
                 else:
                     sections = extract_rcp_sections_from_text(rcp_text)
 
@@ -1470,6 +1528,7 @@ def main():
 
                     if not sec41 and not sec42 and not sec45:
                         rcp_sections_empty += 1
+                    append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), False, False, False, False, \"no_sections\")
 
                     changed = False
                     if sec41 and sec41 != cur_41:
@@ -1484,6 +1543,8 @@ def main():
 
                     if changed:
                         rcp_sections_updated += 1
+
+                append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), bool(sec41), bool(sec42), bool(sec45), True, \"\")
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
