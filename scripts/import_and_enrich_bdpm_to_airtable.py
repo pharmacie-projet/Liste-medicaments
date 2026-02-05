@@ -225,6 +225,194 @@ def normalize_ws_keep_lines(s: str) -> str:
             out.append(line)
     return "\n".join(out).strip()
 
+
+def _extract_rcp_sections_text_fallback(html: str) -> Dict[str, str]:
+    """
+    Variante ultra-robuste:
+    - on récupère le texte brut de la page BDPM "extrait?tab=rcp"
+    - on repère les lignes contenant les titres (4.1 / 4.2 / 4.5)
+    - on prend tout ce qui suit jusqu'au prochain titre 4.x (ou fin).
+    """
+    html = safe_text(html)
+    if not html or len(html) < 300:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    soup = BeautifulSoup(html, _bs_parser())
+    raw = soup.get_text("\n", strip=True)
+    raw = normalize_ws_keep_lines(raw)
+    if not raw:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    norm_lines = [strip_accents(ln).lower() for ln in lines]
+
+    def is_heading_line(norm_ln: str) -> Optional[str]:
+        # renvoie la section ("4.1" etc.) si la ligne correspond
+        for sec, keys in _RCP_HEADINGS.items():
+            for k in keys:
+                if k in norm_ln:
+                    return sec
+        # fallback: numérotation pure "4.1" début de ligne
+        if re.match(r"^\s*4\s*[\.\-:]\s*1\b", norm_ln):
+            return "4.1"
+        if re.match(r"^\s*4\s*[\.\-:]\s*2\b", norm_ln):
+            return "4.2"
+        if re.match(r"^\s*4\s*[\.\-:]\s*5\b", norm_ln):
+            return "4.5"
+        return None
+
+    # index de début pour chaque section
+    start_idx: Dict[str, int] = {}
+    for i, nln in enumerate(norm_lines):
+        sec = is_heading_line(nln)
+        if sec and sec not in start_idx:
+            start_idx[sec] = i
+
+    # rien trouvé
+    if not start_idx:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    # calcule la fin = prochain heading "4." (ou fin)
+    def next_section_start(i0: int) -> int:
+        for j in range(i0 + 1, len(norm_lines)):
+            if re.match(r"^\s*4\s*[\.\-:]\s*\d\b", norm_lines[j]):
+                return j
+            # aussi si la ligne ressemble fortement à un des headings connus
+            if is_heading_line(norm_lines[j]) is not None:
+                return j
+        return len(norm_lines)
+
+    out: Dict[str, str] = {"4.1": "", "4.2": "", "4.5": ""}
+    for sec in ["4.1", "4.2", "4.5"]:
+        if sec not in start_idx:
+            continue
+        s = start_idx[sec]
+        e = next_section_start(s)
+        content_lines = lines[s+1:e]  # sans le titre lui-même
+        txt = normalize_ws_keep_lines("\n".join(content_lines)).strip()
+        out[sec] = txt[:50000].strip()
+    return out
+# ============================================================
+# URL HELPERS
+# ============================================================
+
+
+def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
+    """
+    Extrait le contenu des rubriques 4.1, 4.2 et 4.5 depuis l'onglet RCP BDPM.
+    Méthode robuste: repère les titres dans le DOM (h1..h6 + éléments "heading-like"),
+    puis concatène tout le texte qui suit jusqu'au prochain titre 4.x.
+    """
+    out = {"4.1": "", "4.2": "", "4.5": ""}
+    if not html:
+        return out
+
+    soup = BeautifulSoup(html, _bs_parser())
+
+    def norm(s: str) -> str:
+        return strip_accents(safe_text(s)).lower()
+
+    # Titres cibles (normalisés)
+    targets = {
+        "4.1": [
+            "4.1 indications therapeutiques",
+            "4.1 indication therapeutique",
+        ],
+        "4.2": [
+            "4.2 posologie et mode d'administration",
+            "4.2 posologie et mode d administration",
+        ],
+        "4.5": [
+            "4.5 interactions avec d'autres medicaments et autres formes d'interactions",
+            "4.5 interactions avec d autres medicaments et autres formes d interactions",
+        ],
+    }
+    targets_norm = {k: [norm(x) for x in v] for k, v in targets.items()}
+
+    # Une "ligne de titre" plausible (dans le DOM), pas seulement h2/h3 car BDPM varie
+    heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b", "p", "div", "span", "li"}
+
+    # Collecte de tous les éléments susceptibles d'être des titres, dans l'ordre du document
+    candidates: List[Tuple[str, object]] = []
+    for el in soup.find_all(list(heading_tags)):
+        t = safe_text(el.get_text(" ", strip=True))
+        if not t:
+            continue
+        tn = norm(t)
+        # On ne garde que ce qui ressemble à "4.x ..."
+        if re.match(r"^4\s*[\.\-:]\s*\d\b", tn):
+            candidates.append((tn, el))
+
+    # Map section -> élément titre
+    section_el: Dict[str, object] = {}
+
+    def is_target(section: str, tn: str) -> bool:
+        return any(tn.startswith(x) for x in targets_norm[section])
+
+    for tn, el in candidates:
+        for sec in ("4.1", "4.2", "4.5"):
+            if sec not in section_el and is_target(sec, tn):
+                section_el[sec] = el
+        if len(section_el) == 3:
+            break
+
+    # fallback: si la détection DOM échoue, on tente l'ancienne méthode "texte brut"
+    if not section_el:
+        try:
+            return _extract_rcp_sections_text_fallback(html)
+        except Exception:
+            return out
+
+    def next_heading_after(el) -> Optional[object]:
+        # Prochain titre 4.x après le titre actuel
+        found = False
+        for tn2, el2 in candidates:
+            if el2 is el:
+                found = True
+                continue
+            if not found:
+                continue
+            return el2
+        return None
+
+    def collect_text_between(start_el, end_el: Optional[object]) -> str:
+        parts: List[str] = []
+        # Parcours des éléments suivants dans l'ordre du DOM
+        for sib in start_el.next_elements:
+            if sib is start_el:
+                continue
+            # Stop quand on atteint le prochain titre
+            if end_el is not None and sib is end_el:
+                break
+            if getattr(sib, "name", None) in ("script", "style"):
+                continue
+            # Texte
+            if isinstance(sib, str):
+                txt = safe_text(sib)
+                if txt:
+                    parts.append(txt)
+        text = normalize_ws_keep_lines("\n".join(parts))
+        return text.strip()
+
+    # Construit chaque section en coupant au prochain titre (quel qu'il soit),
+    # puis nettoie les répétitions du titre dans le contenu.
+    for sec in ("4.1", "4.2", "4.5"):
+        if sec not in section_el:
+            continue
+        start_el = section_el[sec]
+        end_el = next_heading_after(start_el)
+        raw = collect_text_between(start_el, end_el)
+
+        # Nettoyage: si le texte commence par le titre, on le retire
+        raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if raw_lines:
+            first = norm(raw_lines[0])
+            if re.match(r"^4\s*[\.\-:]\s*\d\b", first):
+                raw_lines = raw_lines[1:]
+        out[sec] = normalize_ws_keep_lines("\n".join(raw_lines)).strip()
+
+    return out
+
 def capitalize_each_line(text: str) -> str:
     if not text:
         return text
@@ -352,31 +540,6 @@ def _extract_section(lines: List[str], sec: str, stop_pat: re.Pattern) -> str:
 
     text = "\n".join(body_lines).strip()
     return normalize_ws_keep_lines(text)
-
-def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
-    if not html:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    lines = _normalize_rcp_lines(html)
-    if not lines:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    stop_41 = re.compile(r"^\s*(?:4\.2\b|5\.)")
-    stop_42 = re.compile(r"^\s*(?:4\.[3-9]\b|5\.)")
-    stop_45 = re.compile(r"^\s*(?:4\.[6-9]\b|5\.)")
-
-    return {
-        "4.1": _extract_section(lines, "4.1", stop_41),
-        "4.2": _extract_section(lines, "4.2", stop_42),
-        "4.5": _extract_section(lines, "4.5", stop_45),
-    }
-
-# ============================================================
-# ATC HELPERS (pour lecture fichiers)
-# ============================================================
-
-ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
-ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
 def canonical_atc7(raw: str) -> str:
     if not raw:
@@ -821,168 +984,6 @@ def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
 
 # ============================================================
 # RCP EXTRAIT HTML PARSING (fiable sur BDPM extrait?tab=rcp)
-# ============================================================
-
-def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
-    """
-    Extrait 4.1 / 4.2 / 4.5 directement depuis la page BDPM:
-    https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait?tab=rcp
-    => c'est la page que tu vois avec les titres 4.1 / 4.2 / 4.5.
-    """
-    html = safe_text(html)
-    if not html or len(html) < 500:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    soup = BeautifulSoup(html, _bs_parser())
-    main = soup.find("main") or soup
-
-    heading_tags = ["h1", "h2", "h3", "h4", "h5", "h6"]
-
-    def norm(s: str) -> str:
-        s = strip_accents(safe_text(s)).lower()
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def is_section_heading(txt: str, sec: str) -> bool:
-        t = norm(txt)
-        # numérotation tolérante (4.1 / 4 . 1 / 4-1 / 4:1)
-        if sec == "4.1":
-            return bool(re.search(r"^\s*4\s*[\.\-:]\s*1\b", txt)) or "indications therapeutiques" in t
-        if sec == "4.2":
-            return bool(re.search(r"^\s*4\s*[\.\-:]\s*2\b", txt)) or ("posologie" in t and "mode d'administration" in t or "mode d administration" in t)
-        if sec == "4.5":
-            return bool(re.search(r"^\s*4\s*[\.\-:]\s*5\b", txt)) or "interactions" in t
-        return False
-
-    # Repère les headings
-    headings = []
-    for h in main.find_all(heading_tags):
-        txt = safe_text(h.get_text(" ", strip=True))
-        if txt:
-            headings.append((h, txt))
-
-    def grab(sec: str) -> str:
-        start = None
-        for h, txt in headings:
-            if is_section_heading(txt, sec):
-                start = h
-                break
-        if not start:
-            return ""
-        parts = []
-        for sib in start.next_siblings:
-            if getattr(sib, "name", None) is None:
-                continue
-            if sib.name in heading_tags:
-                break
-            txt = safe_text(sib.get_text(" ", strip=True)) if hasattr(sib, "get_text") else ""
-            if txt:
-                parts.append(txt)
-        return normalize_ws_keep_lines("\n".join(parts)).strip()
-
-    out = {"4.1": grab("4.1"), "4.2": grab("4.2"), "4.5": grab("4.5")}
-
-    # fallback texte brut si besoin
-    if not (out["4.1"] or out["4.2"] or out["4.5"]):
-        raw = main.get_text("\n", strip=True)
-        return extract_rcp_sections_by_headings(raw)
-
-    # cap pour Airtable
-    for k in out:
-        out[k] = out[k][:50000].strip()
-    return out
-
-# ============================================================
-# RCP SECTION EXTRACTION (keyword-based headings)
-# ============================================================
-
-_RCP_HEADINGS = {
-    "4.1": [
-        "4.1. indications therapeutiques",
-        "indications therapeutiques",
-    ],
-    "4.2": [
-        "4.2. posologie et mode d'administration",
-        "4.2. posologie et mode d administration",
-        "posologie et mode d'administration",
-        "posologie et mode d administration",
-    ],
-    "4.5": [
-        "4.5. interactions avec d'autres medicaments et autres formes d'interactions",
-        "4.5. interactions avec d autres medicaments et autres formes d interactions",
-        "interactions avec d'autres medicaments et autres formes d'interactions",
-        "interactions avec d autres medicaments et autres formes d interactions",
-    ],
-}
-
-def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
-    """
-    Variante ultra-robuste:
-    - on récupère le texte brut de la page BDPM "extrait?tab=rcp"
-    - on repère les lignes contenant les titres (4.1 / 4.2 / 4.5)
-    - on prend tout ce qui suit jusqu'au prochain titre 4.x (ou fin).
-    """
-    html = safe_text(html)
-    if not html or len(html) < 300:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    soup = BeautifulSoup(html, _bs_parser())
-    raw = soup.get_text("\n", strip=True)
-    raw = normalize_ws_keep_lines(raw)
-    if not raw:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
-    norm_lines = [strip_accents(ln).lower() for ln in lines]
-
-    def is_heading_line(norm_ln: str) -> Optional[str]:
-        # renvoie la section ("4.1" etc.) si la ligne correspond
-        for sec, keys in _RCP_HEADINGS.items():
-            for k in keys:
-                if k in norm_ln:
-                    return sec
-        # fallback: numérotation pure "4.1" début de ligne
-        if re.match(r"^\s*4\s*[\.\-:]\s*1\b", norm_ln):
-            return "4.1"
-        if re.match(r"^\s*4\s*[\.\-:]\s*2\b", norm_ln):
-            return "4.2"
-        if re.match(r"^\s*4\s*[\.\-:]\s*5\b", norm_ln):
-            return "4.5"
-        return None
-
-    # index de début pour chaque section
-    start_idx: Dict[str, int] = {}
-    for i, nln in enumerate(norm_lines):
-        sec = is_heading_line(nln)
-        if sec and sec not in start_idx:
-            start_idx[sec] = i
-
-    # rien trouvé
-    if not start_idx:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    # calcule la fin = prochain heading "4." (ou fin)
-    def next_section_start(i0: int) -> int:
-        for j in range(i0 + 1, len(norm_lines)):
-            if re.match(r"^\s*4\s*[\.\-:]\s*\d\b", norm_lines[j]):
-                return j
-            # aussi si la ligne ressemble fortement à un des headings connus
-            if is_heading_line(norm_lines[j]) is not None:
-                return j
-        return len(norm_lines)
-
-    out: Dict[str, str] = {"4.1": "", "4.2": "", "4.5": ""}
-    for sec in ["4.1", "4.2", "4.5"]:
-        if sec not in start_idx:
-            continue
-        s = start_idx[sec]
-        e = next_section_start(s)
-        content_lines = lines[s+1:e]  # sans le titre lui-même
-        txt = normalize_ws_keep_lines("\n".join(content_lines)).strip()
-        out[sec] = txt[:50000].strip()
-    return out
-# ============================================================
-# URL HELPERS
 # ============================================================
 
 def base_extrait_url_from_cis(cis: str) -> str:
@@ -1464,6 +1465,9 @@ def main():
     fiche_checks = 0
     info_added = 0
     atc_added = 0
+    rcp_checks = 0
+    rcp_updated = 0
+    rcp_empty = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
