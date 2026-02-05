@@ -4,14 +4,13 @@
 import os
 import re
 import time
+import json
 import random
-import urllib.parse
 import unicodedata
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup, Tag
-
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 # ============================================================
 # CONFIG
@@ -25,17 +24,11 @@ HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
 HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "25"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
 
-# limite par run (sinon ça ne finira jamais en GitHub Actions)
+# IMPORTANT : limite par run (sinon ça ne finira jamais en GitHub Actions)
 RCP_MAX_PER_RUN = int(os.getenv("RCP_MAX_PER_RUN", "200"))
 
 UPDATE_FLUSH_THRESHOLD = int(os.getenv("UPDATE_FLUSH_THRESHOLD", "200"))
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
-
-HEADERS_WEB = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.7",
-}
 
 # Airtable fields
 FIELD_CIS = "Code cis"
@@ -43,8 +36,16 @@ FIELD_RCP_URL = "Lien vers RCP"
 
 FIELD_INDICATIONS_RCP = "Indications RCP"      # 4.1
 FIELD_POSOLOGIE_RCP = "Posologie RCP"          # 4.2
-FIELD_INTERACTIONS_RCP = "Interactions RCP"    # 4.5
+FIELD_INTERACTIONS_RCP = "Interactions RCP"    # 4.4 + 4.5 concat
 
+# Airtable limits / safety
+AIRTABLE_CELL_SOFT_LIMIT = int(os.getenv("AIRTABLE_CELL_SOFT_LIMIT", "95000"))  # < 100k
+AIRTABLE_JSON_SOFT_LIMIT = int(os.getenv("AIRTABLE_JSON_SOFT_LIMIT", str(900_000)))  # ~1MB
+
+# Playwright tuning
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "45000"))
+PW_WAIT_TIMEOUT_MS = int(os.getenv("PW_WAIT_TIMEOUT_MS", "45000"))
+PW_HEADLESS = os.getenv("PW_HEADLESS", "1").strip() != "0"
 
 # ============================================================
 # LOG
@@ -53,31 +54,24 @@ FIELD_INTERACTIONS_RCP = "Interactions RCP"    # 4.5
 def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
-
 def info(msg: str):
     print(f"[{_ts()}] ℹ️ {msg}", flush=True)
-
 
 def ok(msg: str):
     print(f"[{_ts()}] ✅ {msg}", flush=True)
 
-
 def warn(msg: str):
     print(f"[{_ts()}] ⚠️ {msg}", flush=True)
-
 
 def die(msg: str, code: int = 1):
     print(f"[{_ts()}] ❌ {msg}", flush=True)
     raise SystemExit(code)
 
-
 def sleep_throttle():
     time.sleep(AIRTABLE_MIN_DELAY_S)
 
-
 def retry_sleep(attempt: int):
     time.sleep(min(10, 0.6 * (2 ** (attempt - 1))) + random.random() * 0.25)
-
 
 # ============================================================
 # TEXT / NORMALIZATION
@@ -92,7 +86,6 @@ def safe_text(x: Any) -> str:
     x = x.replace("\r\n", "\n").replace("\r", "\n")
     return x.strip()
 
-
 def strip_accents(s: str) -> str:
     s = safe_text(s)
     return "".join(
@@ -100,157 +93,16 @@ def strip_accents(s: str) -> str:
         if unicodedata.category(c) != "Mn"
     )
 
-
 def norm_key(s: str) -> str:
-    # lower + sans accents + espaces normalisés
     s = strip_accents(s).lower()
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
-def looks_like_header_4x(txt: str) -> bool:
-    """
-    Détecte un header type "4.3." / "4.4." / "4.5." etc.
-    """
-    t = norm_key(txt)
-    return bool(re.match(r"^4\.\d+\.", t))
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def http_get(url: str) -> str:
-    last = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(
-                url,
-                headers=HEADERS_WEB,
-                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
-                allow_redirects=True,
-            )
-            if r.status_code >= 400:
-                raise RuntimeError(f"HTTP {r.status_code}")
-            r.encoding = r.apparent_encoding or "utf-8"
-            return r.text
-        except Exception as e:
-            last = e
-            warn(f"GET KO (attempt {attempt}/{MAX_RETRIES}) url={url} err={e}")
-            retry_sleep(attempt)
-    raise RuntimeError(f"GET failed after retries: {last}")
-
-
-# ============================================================
-# RCP EXTRACTION (copier-coller brut sous le header)
-# ============================================================
-
-TARGETS = [
-    (FIELD_INDICATIONS_RCP, "indications therapeutiques"),
-    (FIELD_POSOLOGIE_RCP, "posologie et mode d'administration"),
-    (FIELD_INTERACTIONS_RCP, "interactions avec d'autres medicaments et autres formes d'interactions"),
-]
-
-
-def find_heading_tag(soup: BeautifulSoup, key_phrase: str) -> Optional[Tag]:
-    """
-    Trouve le tag qui contient la phrase cible (sans accents, insensible à la casse).
-    On accepte h1..h6, strong, b, p, div (car le site varie parfois).
-    """
-    key = norm_key(key_phrase)
-
-    candidates = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b", "p", "div", "span"])
-    for tag in candidates:
-        txt = tag.get_text(" ", strip=True)
-        if not txt:
-            continue
-        nt = norm_key(txt)
-        if key in nt:
-            return tag
-
-        # tolérance : "4.1. Indications thérapeutiques"
-        if ("indications therapeutiques" in key) and ("indications therapeutiques" in nt):
-            return tag
-        if ("posologie et mode d'administration" in key) and ("posologie et mode d'administration" in nt):
-            return tag
-        if ("interactions avec d'autres medicaments" in key) and ("interactions avec d'autres medicaments" in nt):
-            return tag
-
-    return None
-
-
-def iter_after(tag: Tag):
-    """
-    Itère en ordre document sur les éléments après 'tag'.
-    """
-    cur = tag
-    while True:
-        cur = cur.find_next()
-        if cur is None:
-            return
-        if isinstance(cur, Tag):
-            yield cur
-
-
-def extract_under_heading_until_next_4x(soup: BeautifulSoup, heading_phrase: str) -> str:
-    """
-    1) repère le header
-    2) récupère tout le texte qui suit
-    3) stop au prochain header "4.x." (autre rubrique 4.y)
-    """
-    h = find_heading_tag(soup, heading_phrase)
-    if h is None:
-        return ""
-
-    collected: List[str] = []
-    started = False
-
-    for el in iter_after(h):
-        # stop si on tombe sur un nouveau header 4.x (et qu’on a commencé à collecter)
-        if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            ht = el.get_text(" ", strip=True)
-            if looks_like_header_4x(ht) and started:
-                break
-
-            # stop si on rencontre l'un des 3 headers cibles (évite d'englober)
-            nt = norm_key(ht)
-            if started and (
-                "indications therapeutiques" in nt
-                or "posologie et mode d'administration" in nt
-                or "interactions avec d'autres medicaments" in nt
-            ):
-                break
-
-        # saute sommaire si classe "sommaire"
-        if el.get("class") and any("sommaire" in c.lower() for c in el.get("class", [])):
-            continue
-
-        if el.name in ("p", "li", "table", "tbody", "tr", "td", "div", "span", "ul", "ol"):
-            txt = el.get_text("\n", strip=True)
-            txt = safe_text(txt)
-            if txt:
-                started = True
-                collected.append(txt)
-
-    # supprime doublons consécutifs
-    out: List[str] = []
-    prev = ""
-    for chunk in collected:
-        if chunk == prev:
-            continue
-        out.append(chunk)
-        prev = chunk
-
-    return "\n\n".join(out).strip()
-
-
-def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
-    soup = BeautifulSoup(html, "lxml")
-    results: Dict[str, str] = {}
-    for field_name, heading in TARGETS:
-        results[field_name] = extract_under_heading_until_next_4x(soup, heading)
-    return results
-
+def clip_airtable_cell(s: str, limit: int = AIRTABLE_CELL_SOFT_LIMIT) -> str:
+    s = safe_text(s)
+    if len(s) <= limit:
+        return s
+    return s[:limit - 40].rstrip() + "\n\n[...TRONQUÉ - limite Airtable...]"
 
 # ============================================================
 # AIRTABLE API
@@ -262,35 +114,33 @@ def airtable_headers(token: str) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-
 def airtable_list_records(token: str, base_id: str, table: str) -> List[Dict[str, Any]]:
     """
     Récupère tous les records (pagination).
     """
-    url = f"{AIRTABLE_API_BASE}/{base_id}/{urllib.parse.quote(table)}"
+    url = f"{AIRTABLE_API_BASE}/{base_id}/{requests.utils.quote(table)}"
     out: List[Dict[str, Any]] = []
     offset = None
 
     while True:
-        params = {"pageSize": 100}
+        params = {}
         if offset:
             params["offset"] = offset
-
-        r = requests.get(url, headers=airtable_headers(token), params=params, timeout=60)
+        r = requests.get(url, headers=airtable_headers(token), params=params, timeout=30)
         if r.status_code >= 400:
-            raise RuntimeError(f"Airtable list HTTP {r.status_code}: {r.text[:500]}")
+            raise RuntimeError(f"Airtable list HTTP {r.status_code}: {r.text[:200]}")
         data = r.json()
         recs = data.get("records", [])
         out.extend(recs)
-
         offset = data.get("offset")
         if not offset:
             break
-
         sleep_throttle()
 
     return out
 
+def _payload_size_bytes(obj: Any) -> int:
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 def airtable_batch_update(token: str, base_id: str, table: str, updates: List[Dict[str, Any]]):
     """
@@ -298,14 +148,187 @@ def airtable_batch_update(token: str, base_id: str, table: str, updates: List[Di
     """
     if not updates:
         return
-    url = f"{AIRTABLE_API_BASE}/{base_id}/{urllib.parse.quote(table)}"
+
+    url = f"{AIRTABLE_API_BASE}/{base_id}/{requests.utils.quote(table)}"
     payload = {"records": updates, "typecast": False}
+
+    # Safety: si payload trop gros -> envoyer 1 par 1
+    if _payload_size_bytes(payload) > AIRTABLE_JSON_SOFT_LIMIT and len(updates) > 1:
+        for u in updates:
+            airtable_batch_update(token, base_id, table, [u])
+        return
 
     r = requests.patch(url, headers=airtable_headers(token), json=payload, timeout=60)
     if r.status_code >= 400:
-        raise RuntimeError(f"Airtable update HTTP {r.status_code}: {r.text[:800]}")
+        raise RuntimeError(f"Airtable update HTTP {r.status_code}: {r.text[:400]}")
     sleep_throttle()
 
+# ============================================================
+# PLAYWRIGHT EXTRACTION
+# ============================================================
+
+def _extract_sections_js() -> str:
+    """
+    Renvoie une fonction JS (string) qui extrait le texte sous un heading,
+    jusqu'au prochain heading 4.x / 5.x (on coupe proprement).
+    """
+    return r"""
+    (phrase) => {
+      const norm = (s) => (s || "")
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase().replace(/\s+/g, " ").trim();
+
+      const target = norm(phrase);
+
+      // Cherche un heading h1..h6 dont le texte contient la phrase
+      const headings = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+      let h = headings.find(x => norm(x.textContent).includes(target));
+      if (!h) return "";
+
+      // Conteneur principal: on remonte un peu (souvent section/article/div)
+      let root = h.closest("article,section,div") || document.body;
+
+      const isStopHeading = (el) => {
+        if (!el || !el.matches) return false;
+        if (!el.matches("h1,h2,h3,h4,h5,h6")) return false;
+        const t = norm(el.textContent);
+        // Stop sur 4.x ou 5.x (rubriques structurantes)
+        return /^4\.\d+/.test(t) || /^5\./.test(t);
+      };
+
+      // Parcours DOM "suivant" après le heading
+      const out = [];
+      let cur = h;
+
+      const nextNode = (node) => {
+        // depth-first next
+        if (node.firstElementChild) return node.firstElementChild;
+        while (node) {
+          if (node.nextElementSibling) return node.nextElementSibling;
+          node = node.parentElement;
+        }
+        return null;
+      };
+
+      // On commence juste après h
+      cur = nextNode(cur);
+
+      const pushText = (el) => {
+        if (!el) return;
+        // On ignore menu/sommaire
+        const cls = (el.getAttribute && el.getAttribute("class")) ? el.getAttribute("class") : "";
+        if (typeof cls === "string" && cls.toLowerCase().includes("sommaire")) return;
+
+        // On prend les blocs utiles
+        if (el.matches("p,li,ul,ol,table,tbody,tr,td,div,span")) {
+          const t = (el.innerText || el.textContent || "").trim();
+          if (t) out.push(t);
+        }
+      };
+
+      // Collecte jusqu'au prochain heading stop
+      let guard = 0;
+      while (cur && guard < 5000) {
+        guard++;
+
+        if (isStopHeading(cur)) break;
+
+        pushText(cur);
+        cur = nextNode(cur);
+      }
+
+      // Nettoyage: supprimer doublons consécutifs
+      const cleaned = [];
+      let prev = "";
+      for (const x of out) {
+        if (x === prev) continue;
+        cleaned.push(x);
+        prev = x;
+      }
+
+      return cleaned.join("\n\n").trim();
+    }
+    """
+
+def fetch_and_extract_rcp_with_playwright(url_with_hash: str) -> Dict[str, str]:
+    """
+    IMPORTANT: on utilise exactement l'URL fournie (avec #tab-rcp).
+    """
+    url_with_hash = safe_text(url_with_hash)
+    if not url_with_hash:
+        return {FIELD_INDICATIONS_RCP: "", FIELD_POSOLOGIE_RCP: "", FIELD_INTERACTIONS_RCP: ""}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=PW_HEADLESS)
+        context = browser.new_context(locale="fr-FR")
+        page = context.new_page()
+        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+        page.set_default_timeout(PW_WAIT_TIMEOUT_MS)
+
+        # goto EXACT URL (avec #)
+        page.goto(url_with_hash, wait_until="domcontentloaded")
+
+        # On attend un élément typique du RCP
+        # (souvent "4. DONNEES CLINIQUES" ou "Résumé des caractéristiques du produit")
+        try:
+            page.wait_for_selector("text=Résumé des caractéristiques du produit", timeout=PW_WAIT_TIMEOUT_MS)
+        except PWTimeoutError:
+            # parfois ça charge quand même; on continue
+
+            pass
+
+        # S'il faut cliquer l'onglet RCP (au cas où)
+        # (pas toujours nécessaire, mais ça sauve des cas)
+        try:
+            tab = page.locator("role=tab[name*='Résumé des caractéristiques du produit']").first
+            if tab.count() > 0:
+                tab.click(timeout=2000)
+        except Exception:
+            pass
+
+        # Attendre le début des données cliniques
+        try:
+            page.wait_for_selector("text=4. DONNÉES CLINIQUES", timeout=PW_WAIT_TIMEOUT_MS)
+        except PWTimeoutError:
+            # variantes sans accent
+            try:
+                page.wait_for_selector("text=4. DONNEES CLINIQUES", timeout=PW_WAIT_TIMEOUT_MS)
+            except PWTimeoutError:
+                # on tente quand même l'extraction
+                pass
+
+        extractor = _extract_sections_js()
+
+        def get_section(phrase: str) -> str:
+            try:
+                txt = page.evaluate(extractor, phrase)
+                return safe_text(txt)
+            except Exception:
+                return ""
+
+        indications = get_section("4.1. Indications thérapeutiques")
+        posologie = get_section("4.2. Posologie et mode d'administration")
+
+        # 4.4 + 4.5 concat dans Interactions RCP (comme tu veux)
+        prec = get_section("4.4. Mises en garde spéciales et précautions d'emploi")
+        inter = get_section("4.5. Interactions avec d'autres médicaments et autres formes d'interactions")
+
+        interactions = ""
+        if prec:
+            interactions += "4.4. Mises en garde spéciales et précautions d'emploi\n" + prec.strip()
+        if inter:
+            if interactions:
+                interactions += "\n\n"
+            interactions += "4.5. Interactions avec d'autres médicaments et autres formes d'interactions\n" + inter.strip()
+
+        context.close()
+        browser.close()
+
+        return {
+            FIELD_INDICATIONS_RCP: indications,
+            FIELD_POSOLOGIE_RCP: posologie,
+            FIELD_INTERACTIONS_RCP: interactions,
+        }
 
 # ============================================================
 # MAIN
@@ -326,7 +349,7 @@ def main():
     to_update: List[Dict[str, Any]] = []
     updated = 0
     checked = 0
-    empty_or_missing_url = 0
+    missing_url = 0
     fetched = 0
     parse_ok = 0
     parse_empty = 0
@@ -338,15 +361,17 @@ def main():
         fields = rec.get("fields", {}) or {}
 
         cis = safe_text(fields.get(FIELD_CIS))
-        rcp_url_raw = safe_text(fields.get(FIELD_RCP_URL))
+        rcp_url = safe_text(fields.get(FIELD_RCP_URL))
 
-        if not rcp_url_raw:
-            empty_or_missing_url += 1
+        if not rcp_url:
+            missing_url += 1
             continue
 
         already_ind = safe_text(fields.get(FIELD_INDICATIONS_RCP))
         already_pos = safe_text(fields.get(FIELD_POSOLOGIE_RCP))
         already_int = safe_text(fields.get(FIELD_INTERACTIONS_RCP))
+
+        # Si tout est déjà rempli -> skip
         if already_ind and already_pos and already_int:
             continue
 
@@ -357,34 +382,41 @@ def main():
         rcp_done_this_run += 1
 
         try:
-            # on utilise le lien tel quel (même s'il contient un #, requests l'ignore côté serveur)
-            html = http_get(rcp_url_raw)
+            sections = fetch_and_extract_rcp_with_playwright(rcp_url)  # URL EXACTE avec #
+
             fetched += 1
 
-            sections = extract_rcp_sections_from_html(html)
+            ind = safe_text(sections.get(FIELD_INDICATIONS_RCP))
+            pos = safe_text(sections.get(FIELD_POSOLOGIE_RCP))
+            inter = safe_text(sections.get(FIELD_INTERACTIONS_RCP))
 
-            if not (sections[FIELD_INDICATIONS_RCP] or sections[FIELD_POSOLOGIE_RCP] or sections[FIELD_INTERACTIONS_RCP]):
+            if not (ind or pos or inter):
                 parse_empty += 1
-                warn(f"RCP vide après parse | CIS={cis or 'NA'} | url={rcp_url_raw}")
+                warn(f"RCP vide après extraction | CIS={cis or 'NA'} | url={rcp_url}")
                 continue
 
             parse_ok += 1
 
             patch: Dict[str, Any] = {}
-            if not already_ind and sections[FIELD_INDICATIONS_RCP]:
-                patch[FIELD_INDICATIONS_RCP] = sections[FIELD_INDICATIONS_RCP]
-            if not already_pos and sections[FIELD_POSOLOGIE_RCP]:
-                patch[FIELD_POSOLOGIE_RCP] = sections[FIELD_POSOLOGIE_RCP]
-            if not already_int and sections[FIELD_INTERACTIONS_RCP]:
-                patch[FIELD_INTERACTIONS_RCP] = sections[FIELD_INTERACTIONS_RCP]
+
+            if not already_ind and ind:
+                patch[FIELD_INDICATIONS_RCP] = clip_airtable_cell(ind)
+            if not already_pos and pos:
+                patch[FIELD_POSOLOGIE_RCP] = clip_airtable_cell(pos)
+            if not already_int and inter:
+                patch[FIELD_INTERACTIONS_RCP] = clip_airtable_cell(inter)
 
             if patch:
                 to_update.append({"id": rec["id"], "fields": patch})
 
+            # Flush
             if len(to_update) >= UPDATE_FLUSH_THRESHOLD:
                 info(f"Flush updates: {len(to_update)}")
+
+                # Batch: on essaye par 10 mais si trop gros -> fonction enverra 1 par 1
                 for i in range(0, len(to_update), AIRTABLE_BATCH_SIZE):
                     airtable_batch_update(token, base_id, table, to_update[i:i + AIRTABLE_BATCH_SIZE])
+
                 updated += len(to_update)
                 to_update = []
                 ok(f"Flush OK (total updated so far: {updated})")
@@ -396,10 +428,11 @@ def main():
 
         if checked % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: checked={checked} fetched={fetched} parse_ok={parse_ok} parse_empty={parse_empty} "
-                f"failures={failures} updates_buffer={len(to_update)}"
+                f"Heartbeat: checked={checked} fetched={fetched} parse_ok={parse_ok} "
+                f"parse_empty={parse_empty} failures={failures} updates_buffer={len(to_update)}"
             )
 
+    # Final flush
     if to_update:
         info(f"Final flush updates: {len(to_update)}")
         for i in range(0, len(to_update), AIRTABLE_BATCH_SIZE):
@@ -408,11 +441,10 @@ def main():
         ok(f"Final flush OK (total updated: {updated})")
 
     ok(
-        f"Done. rcp_checked={checked} fetched={fetched} parse_ok={parse_ok} parse_empty={parse_empty} "
-        f"failures={failures} updated={updated} missing_url={empty_or_missing_url} "
-        f"limit_per_run={RCP_MAX_PER_RUN}"
+        f"Done. rcp_checked={checked} fetched={fetched} parse_ok={parse_ok} "
+        f"parse_empty={parse_empty} failures={failures} updated={updated} "
+        f"missing_url={missing_url} limit_per_run={RCP_MAX_PER_RUN}"
     )
-
 
 if __name__ == "__main__":
     main()
