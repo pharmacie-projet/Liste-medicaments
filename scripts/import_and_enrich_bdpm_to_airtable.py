@@ -1200,17 +1200,25 @@ def main():
     ok(f"BDPM Infos importantes OK ({len(info_imp_txt)} chars)")
     cis_to_info_url = parse_info_importantes_cis_to_url(info_imp_txt)
 
-    info("Recherche lien Excel ANSM (rétrocession) ...")
-    ansm_link = find_ansm_retro_excel_link()
-    ok(f"Lien ANSM trouvé: {ansm_link}")
+    # ANSM rétrocession (robuste: si KO on continue sans rétrocession)
+    ansm_retro_cis: Set[str] = set()
+    ansm_link = ""
+    try:
+        info("Recherche lien Excel ANSM (rétrocession) ...")
+        ansm_link = find_ansm_retro_excel_link()
+        ok(f"Lien ANSM trouvé: {ansm_link}")
 
-    info("Téléchargement Excel ANSM ...")
-    ansm_bytes = download_bytes(ansm_link, timeout_s=140.0)
-    ok(f"ANSM Excel OK ({len(ansm_bytes)} bytes)")
+        info("Téléchargement Excel ANSM ...")
+        ansm_bytes = download_bytes(ansm_link, timeout_s=140.0)
+        ok(f"ANSM Excel OK ({len(ansm_bytes)} bytes)")
+
+        ansm_retro_cis = parse_ansm_retrocession_cis(ansm_bytes, url_hint=ansm_link)
+        ok(f"ANSM rétrocession: {len(ansm_retro_cis)} CIS")
+    except Exception as e:
+        warn(f"ANSM rétrocession indisponible (on continue): {e}")
 
     cis_map = parse_bdpm_cis(cis_txt)
     cip_map = parse_bdpm_cis_cip(cis_cip_txt)
-    ansm_retro_cis = parse_ansm_retrocession_cis(ansm_bytes, url_hint=ansm_link)
 
     at = AirtableClient(api_token, base_id, table_name)
 
