@@ -69,6 +69,10 @@ HEADERS_WEB = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.7",
 }
 
+# ✅ Session HTTP réutilisable (gros gain perf sur GitHub Actions)
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(HEADERS_WEB)
+
 # ============================================================
 # AIRTABLE FIELDS (adapte ici si besoin)
 # ============================================================
@@ -133,7 +137,6 @@ def retry_sleep(attempt: int):
 # ============================================================
 
 def now_paris_iso_seconds() -> str:
-    # ISO 8601 avec timezone Europe/Paris (Airtable l'accepte très bien pour un champ Date/Date+Heure)
     return datetime.now(ZoneInfo("Europe/Paris")).isoformat(timespec="seconds")
 
 # ============================================================
@@ -400,7 +403,7 @@ def format_interactions_field(sec44: str, sec45: str) -> str:
     return _clean_section_text("\n\n".join(blocks)).strip()
 
 # ============================================================
-# ATC HELPERS (pour lecture fichiers)
+# ATC HELPERS
 # ============================================================
 
 ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
@@ -466,7 +469,7 @@ def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout, allow_redirects=True)
+            r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True)
             return r
         except Exception as e:
             last_err = e
@@ -805,12 +808,6 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
 # ============================================================
 
 def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
-    """
-    Parse le fichier CIS_MITM.txt.
-    Robuste:
-    - récupère le premier CIS (8 chiffres)
-    - récupère le premier ATC7 valide
-    """
     cis_to_atc: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -835,11 +832,6 @@ def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
 _URL_PAT = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
 
 def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
-    """
-    Parse CIS_InfoImportantes.txt.
-    - trouve un CIS (8 chiffres)
-    - trouve une URL
-    """
     cis_to_url: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -865,7 +857,6 @@ def base_extrait_url_from_cis(cis: str) -> str:
     return BDPM_DOC_EXTRACT_URL.format(cis=cis)
 
 def set_tab(url: str, cis_fallback: str, tab: str) -> str:
-    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
     if not url or not url.startswith("http"):
         url = base_extrait_url_from_cis(cis_fallback)
     parts = urllib.parse.urlsplit(url)
@@ -926,7 +917,7 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout, allow_redirects=True)
+            r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True)
             if r.status_code == 404:
                 raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
@@ -1085,10 +1076,6 @@ class AirtableClient:
         raise RuntimeError(f"Airtable request failed: {method} {url} / {last_err}")
 
     def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
-        """
-        ⚠️ Airtable renvoie HTTP 422 si un nom de champ est inconnu dans fields[].
-        Ici: on tente avec fields, et si 422 UNKNOWN_FIELD_NAME, on retire ce champ et on réessaie.
-        """
         requested_fields = list(fields) if fields else None
 
         while True:
@@ -1096,6 +1083,42 @@ class AirtableClient:
             params = {}
             if requested_fields:
                 params["fields[]"] = requested_fields
+
+            offset = None
+            try:
+                while True:
+                    if offset:
+                        params["offset"] = offset
+                    r = self._request("GET", self.table_url, params=params)
+                    data = r.json()
+                    out.extend(data.get("records", []))
+                    offset = data.get("offset")
+                    if not offset:
+                        break
+                return out
+            except Exception as e:
+                msg = str(e)
+                m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*\\"([^\\"]+)\\"', msg)
+                if not m:
+                    m = re.search(r'UNKNOWN_FIELD_NAME.*Unknown field name:\s*"([^"]+)"', msg)
+                if requested_fields and m:
+                    bad = m.group(1)
+                    warn(f"Airtable: champ inconnu '{bad}' -> retrait du filtre fields[] et retry")
+                    requested_fields = [f for f in requested_fields if f != bad]
+                    continue
+                raise
+
+    # ✅ NOUVEAU: inventaire filtré (évite de traiter 15 000 lignes à chaque run)
+    def list_records_filtered(self, fields: Optional[List[str]] = None, filter_by_formula: str = "") -> List[dict]:
+        requested_fields = list(fields) if fields else None
+
+        while True:
+            out: List[dict] = []
+            params = {}
+            if requested_fields:
+                params["fields[]"] = requested_fields
+            if filter_by_formula:
+                params["filterByFormula"] = filter_by_formula
 
             offset = None
             try:
@@ -1211,20 +1234,33 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,        # lecture
-        FIELD_ATC_LABEL,   # écriture possible
-        FIELD_COMPOSITION, # écriture
-        FIELD_COMPOSITION_DETAILS, # écriture
-        FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
+        FIELD_ATC4,
+        FIELD_ATC_LABEL,
+        FIELD_COMPOSITION,
+        FIELD_COMPOSITION_DETAILS,
+        FIELD_LIEN_INFO_IMPORTANTE,
         FIELD_INTERACTIONS_RCP,
         FIELD_INDICATIONS_RCP,
         FIELD_POSOLOGIE_RCP,
         FIELD_DATE_REVUE,
     ]
 
-    info("Inventaire Airtable ...")
-    records = at.list_all_records(fields=needed_fields)
-    ok(f"Enregistrements Airtable: {len(records)}")
+    # ✅ Inventaire filtré: on ne récupère que les lignes à compléter (sauf FORCE_REFRESH)
+    if force_refresh:
+        info("Inventaire Airtable (FORCE_REFRESH=1 => tout) ...")
+        records = at.list_all_records(fields=needed_fields)
+    else:
+        info("Inventaire Airtable (filtré sur champs RCP manquants) ...")
+        f = (
+            f"OR("
+            f"{{{FIELD_INDICATIONS_RCP}}}=BLANK(), {{{FIELD_INDICATIONS_RCP}}}='',"
+            f"{{{FIELD_POSOLOGIE_RCP}}}=BLANK(), {{{FIELD_POSOLOGIE_RCP}}}='',"
+            f"{{{FIELD_INTERACTIONS_RCP}}}=BLANK(), {{{FIELD_INTERACTIONS_RCP}}}=''"
+            f")"
+        )
+        records = at.list_records_filtered(fields=needed_fields, filter_by_formula=f)
+
+    ok(f"Enregistrements Airtable (ciblés): {len(records)}")
 
     airtable_by_cis: Dict[str, dict] = {}
     for rec in records:
@@ -1233,100 +1269,14 @@ def main():
         if len(cis) == 8:
             airtable_by_cis[cis] = rec
 
-    bdpm_cis_set = set(cis_map.keys())
-    airtable_cis_set = set(airtable_by_cis.keys())
-
-    to_create = sorted(list(bdpm_cis_set - airtable_cis_set))
-    to_delete = sorted(list(airtable_cis_set - bdpm_cis_set))
-
-    info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
-
-    # ✅ timestamp unique de la “revue” (même valeur pour toutes les lignes revues dans ce run)
-    review_ts = now_paris_iso_seconds()
-
-    # CREATE
-    if to_create:
-        info("Création des enregistrements manquants ...")
-        new_recs = []
-        for cis in to_create:
-            row = cis_map[cis]
-            cip = cip_map.get(cis)
-            labo = normalize_lab_name(row.titulaire)
-
-            fields: Dict[str, object] = {
-                FIELD_CIS: cis,
-                FIELD_SPEC: safe_text(row.specialite),
-                FIELD_FORME: safe_text(row.forme),
-                FIELD_VOIE: safe_text(row.voie_admin),
-                FIELD_LABO: labo,
-                FIELD_RCP: rcp_link_default(cis),
-                FIELD_DATE_REVUE: review_ts,
-            }
-            if cip and cip.cip13:
-                fields[FIELD_CIP13] = cip.cip13
-
-            # Composition
-            compo = compo_map.get(cis, "").strip()
-            if compo:
-                fields[FIELD_COMPOSITION_DETAILS] = compo  # accents uniquement
-                compo_no_acc = strip_accents(compo)
-                if compo_no_acc and compo_no_acc.lower() not in compo.lower():
-                    fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
-                else:
-                    fields[FIELD_COMPOSITION] = compo
-
-            # ATC depuis MITM (si dispo)
-            atc = cis_to_atc.get(cis, "").strip()
-            if atc:
-                fields[FIELD_ATC] = atc
-                atc4 = atc_level4_from_any(atc)
-                if atc4:
-                    label = atc_labels.get(atc4, "")
-                    if label:
-                        fields[FIELD_ATC_LABEL] = label
-
-            # URL info importante (si dispo)
-            iu = cis_to_info_url.get(cis, "").strip()
-            if iu:
-                fields[FIELD_LIEN_INFO_IMPORTANTE] = iu
-
-            fields.pop(FIELD_ATC4, None)  # sécurité
-            new_recs.append({"fields": fields})
-
-        at.create_records(new_recs)
-        ok(f"Créés: {len(new_recs)}")
-
-        records = at.list_all_records(fields=needed_fields)
-        airtable_by_cis = {}
-        for rec in records:
-            cis = str(rec.get("fields", {}).get(FIELD_CIS, "")).strip()
-            cis = re.sub(r"\D", "", cis)
-            if len(cis) == 8:
-                airtable_by_cis[cis] = rec
-
-    # DELETE
-    if to_delete:
-        info("Suppression des enregistrements Airtable absents de BDPM ...")
-        ids = [airtable_by_cis[c]["id"] for c in to_delete if c in airtable_by_cis]
-        if ids:
-            at.delete_records(ids)
-            ok(f"Supprimés: {len(ids)}")
-
-        records = at.list_all_records(fields=needed_fields)
-        airtable_by_cis = {}
-        for rec in records:
-            cis = str(rec.get("fields", {}).get(FIELD_CIS, "")).strip()
-            cis = re.sub(r"\D", "", cis)
-            if len(cis) == 8:
-                airtable_by_cis[cis] = rec
-
-    # ENRICH
-    all_cis = sorted(list(set(cis_map.keys()) & set(airtable_by_cis.keys())))
+    all_cis = sorted(list(airtable_by_cis.keys()))
     if max_cis > 0:
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + contenu RCP ...")
+    review_ts = now_paris_iso_seconds()
+
+    info("Enrichissement: contenu RCP + CPD/dispo + ATC + composition + lien info importante ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1344,8 +1294,7 @@ def main():
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"rcp checks={rcp_checks} | rcp added={rcp_added} | "
-                f"ATC added={atc_added} | info importante added={info_added}"
+                f"rcp checks={rcp_checks} | rcp added={rcp_added} | ATC added={atc_added} | info importante added={info_added}"
             )
 
         rec = airtable_by_cis.get(cis)
@@ -1353,37 +1302,14 @@ def main():
             continue
 
         fields_cur = rec.get("fields", {}) or {}
-        upd_fields: Dict[str, object] = {}
+        upd_fields: Dict[str, object] = {FIELD_DATE_REVUE: review_ts}
 
-        # ✅ on marque toute ligne revue
-        upd_fields[FIELD_DATE_REVUE] = review_ts
-
-        # infos BDPM CIS
-        row = cis_map.get(cis)
-        if row:
-            labo = normalize_lab_name(row.titulaire)
-            if labo and str(fields_cur.get(FIELD_LABO, "")).strip() != labo:
-                upd_fields[FIELD_LABO] = labo
-            if safe_text(row.specialite) and str(fields_cur.get(FIELD_SPEC, "")).strip() != safe_text(row.specialite):
-                upd_fields[FIELD_SPEC] = safe_text(row.specialite)
-            if safe_text(row.forme) and str(fields_cur.get(FIELD_FORME, "")).strip() != safe_text(row.forme):
-                upd_fields[FIELD_FORME] = safe_text(row.forme)
-            if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
-                upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
-
-        # CIP
-        cip = cip_map.get(cis)
-        if cip:
-            if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
-                upd_fields[FIELD_CIP13] = cip.cip13
-
-        # Lien RCP (si vide)
         link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # --- CONTENU RCP : 4.1 / 4.2 / 4.4+4.5
+        # --- CONTENU RCP
         cur_ind = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_poso = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_inter = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1396,7 +1322,6 @@ def main():
                 html_rcp = fetch_html_checked(rcp_url)
 
                 secs = extract_rcp_sections_from_rcp_html(html_rcp)
-
                 ind = secs.get("indications_4_1", "").strip()
                 poso = secs.get("posologie_4_2", "").strip()
                 inter = format_interactions_field(
@@ -1419,117 +1344,12 @@ def main():
             except Exception as e:
                 warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
 
-        # Composition
-        cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
-        cur_compo_details = str(fields_cur.get(FIELD_COMPOSITION_DETAILS, "")).strip()
-        new_compo = compo_map.get(cis, "").strip()
-        if new_compo:
-            if new_compo != cur_compo_details:
-                upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
-
-            new_no_acc = strip_accents(new_compo).strip()
-            final_compo = new_compo
-            if new_no_acc and new_no_acc.lower() not in new_compo.lower():
-                final_compo = f"{new_compo}\n{new_no_acc}"
-            if final_compo != cur_compo:
-                upd_fields[FIELD_COMPOSITION] = final_compo
-
-        # ATC: uniquement via MITM si vide
-        cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
-        if not cur_atc_raw:
-            atc = cis_to_atc.get(cis, "").strip()
-            if atc:
-                upd_fields[FIELD_ATC] = atc
-                atc_added += 1
-                atc4_tmp = atc_level4_from_any(atc)
-                if atc4_tmp:
-                    label = atc_labels.get(atc4_tmp, "")
-                    if label:
-                        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
-                        if label != cur_label:
-                            upd_fields[FIELD_ATC_LABEL] = label
-
-        # Libellé ATC via ATC4 computed
-        cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
-        cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
-        if cur_atc4:
-            atc4_norm = atc_level4_from_any(cur_atc4) or cur_atc4.strip().upper()
-            label = atc_labels.get(atc4_norm, "")
-            if label and label != cur_label:
-                upd_fields[FIELD_ATC_LABEL] = label
-
-        # Lien vers information importante
-        cur_info_url = str(fields_cur.get(FIELD_LIEN_INFO_IMPORTANTE, "")).strip()
-        new_info_url = cis_to_info_url.get(cis, "").strip()
-        if new_info_url and new_info_url != cur_info_url:
-            upd_fields[FIELD_LIEN_INFO_IMPORTANTE] = new_info_url
-            info_added += 1
-
-        # CPD + dispo via fiche-info
-        fiche_url = set_tab(link_rcp, cis, "fiche-info")
-        cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
-        cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
-
-        need_fetch_fiche = force_refresh or (not cur_cpd) or (not cur_dispo)
-        is_retro = cis in ansm_retro_cis
-
-        if need_fetch_fiche:
-            try:
-                fiche_checks += 1
-                cpd_text, is_homeo, reserved_hosp, usage_hosp = analyze_fiche_info(fiche_url)
-
-                if cpd_text and cpd_text != cur_cpd:
-                    upd_fields[FIELD_CPD] = cpd_text
-
-                has_taux = cip.has_taux if cip else False
-                dispo = compute_disponibilite(
-                    has_taux_ville=has_taux,
-                    is_ansm_retro=is_retro,
-                    is_homeo=is_homeo,
-                    reserved_hospital=reserved_hosp,
-                    usage_hospital=usage_hosp,
-                )
-                if dispo != cur_dispo:
-                    upd_fields[FIELD_DISPO] = dispo
-
-            except PageUnavailable as e:
-                warn(f"Fiche-info KO CIS={cis}: {e.detail} ({e.url}) -> suppression Airtable")
-
-                if updates:
-                    at.update_records(updates)
-                    ok(f"Batch updates (flush before delete): {len(updates)}")
-                    updates = []
-
-                try:
-                    at.delete_records([rec["id"]])
-                    deleted_count += 1
-                    append_deleted_report(cis=cis, reason=f"Page indisponible ({e.status})", url=e.url)
-                except Exception as de:
-                    failures += 1
-                    warn(f"Suppression Airtable impossible CIS={cis}: {de} (on continue)")
-                continue
-
-            except Exception as e:
-                failures += 1
-                warn(f"Enrich KO CIS={cis}: {e} (on continue)")
-
-        upd_fields.pop(FIELD_ATC4, None)  # sécurité
         updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
             ok(f"Batch updates: {len(updates)}")
             updates = []
-
-        if idx % 1000 == 0:
-            elapsed = time.time() - start
-            rate = idx / elapsed if elapsed > 0 else 0
-            remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
-            info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} | rcp checks={rcp_checks} | rcp added={rcp_added} | "
-                f"ATC added={atc_added} | info importante added={info_added} | reste ~{int(remaining)}s"
-            )
 
     if updates:
         at.update_records(updates)
@@ -1538,9 +1358,8 @@ def main():
     try_git_commit_report()
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} | rcp checks={rcp_checks} | rcp added={rcp_added} | "
-        f"ATC added={atc_added} | info importante added={info_added} | "
-        f"rapport suppressions: {report_path_deleted_today()}"
+        f"rcp checks={rcp_checks} | rcp added={rcp_added} | "
+        f"ATC added={atc_added} | info importante added={info_added}"
     )
 
 if __name__ == "__main__":
