@@ -24,3 +24,6 @@ pypdf==5.1.0
 # OCR (activé seulement si OCR_ENABLE=1)
 Pillow==10.4.0
 pytesseract==0.3.10
+
+playwright==1.49.0
+
