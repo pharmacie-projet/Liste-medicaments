@@ -7,7 +7,7 @@ import time
 import random
 import urllib.parse
 import unicodedata
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -53,21 +53,27 @@ FIELD_INTERACTIONS_RCP = "Interactions RCP"    # 4.5
 def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
+
 def info(msg: str):
     print(f"[{_ts()}] ℹ️ {msg}", flush=True)
+
 
 def ok(msg: str):
     print(f"[{_ts()}] ✅ {msg}", flush=True)
 
+
 def warn(msg: str):
     print(f"[{_ts()}] ⚠️ {msg}", flush=True)
+
 
 def die(msg: str, code: int = 1):
     print(f"[{_ts()}] ❌ {msg}", flush=True)
     raise SystemExit(code)
 
+
 def sleep_throttle():
     time.sleep(AIRTABLE_MIN_DELAY_S)
+
 
 def retry_sleep(attempt: int):
     time.sleep(min(10, 0.6 * (2 ** (attempt - 1))) + random.random() * 0.25)
@@ -78,13 +84,26 @@ def retry_sleep(attempt: int):
 # ============================================================
 
 def safe_text(x: Any) -> str:
+    """
+    IMPORTANT : normalise aussi les apostrophes typographiques et espaces insécables.
+    Sinon les titres du RCP ne matchent pas ("d’administration", "d’autres", etc.)
+    """
     if x is None:
         return ""
     if not isinstance(x, str):
         x = str(x)
+
     x = x.replace("\uFFFD", "")
     x = x.replace("\r\n", "\n").replace("\r", "\n")
+
+    # apostrophes typographiques -> apostrophe simple
+    x = x.replace("\u2019", "'").replace("\u2018", "'").replace("\u02BC", "'")
+
+    # espaces insécables -> espace normal
+    x = x.replace("\u00A0", " ").replace("\u202F", " ")
+
     return x.strip()
+
 
 def strip_accents(s: str) -> str:
     s = safe_text(s)
@@ -93,16 +112,18 @@ def strip_accents(s: str) -> str:
         if unicodedata.category(c) != "Mn"
     )
 
+
 def norm_key(s: str) -> str:
     # lower + sans accents + espaces normalisés
     s = strip_accents(s).lower()
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def normalize_rcp_url(url: str) -> str:
     """
-    Problème principal : le fragment #tab-rcp n'est PAS envoyé au serveur.
-    Donc on transforme en extrait?tab=rcp (côté serveur).
+    Le fragment #tab-rcp n'est PAS envoyé au serveur.
+    On transforme en query ?tab=rcp.
     """
     url = safe_text(url)
     if not url:
@@ -112,23 +133,23 @@ def normalize_rcp_url(url: str) -> str:
     # enlever fragment
     p = p._replace(fragment="")
 
-    # si déjà un query tab=rcp, ok
     qs = urllib.parse.parse_qs(p.query, keep_blank_values=True)
     if "tab" in qs and qs["tab"] and qs["tab"][0].lower() == "rcp":
         return urllib.parse.urlunsplit(p)
 
-    # cas classique: .../extrait (ou .../extrait?xxx) => on force tab=rcp
     qs["tab"] = ["rcp"]
     new_query = urllib.parse.urlencode(qs, doseq=True)
     p = p._replace(query=new_query)
     return urllib.parse.urlunsplit(p)
 
+
 def looks_like_header_4x(txt: str) -> bool:
     """
-    Détecte un header type "4.3." / "4.4." / "4.5." etc.
+    Le site peut écrire "4.2 Posologie ..." sans point final.
+    On accepte donc 4.<num> avec ou sans '.' après.
     """
     t = norm_key(txt)
-    return bool(re.match(r"^4\.\d+\.", t))
+    return bool(re.match(r"^4\.\d+\b", t))
 
 
 # ============================================================
@@ -166,33 +187,40 @@ TARGETS = [
     (FIELD_INTERACTIONS_RCP, "interactions avec d'autres medicaments et autres formes d'interactions"),
 ]
 
+
 def find_heading_tag(soup: BeautifulSoup, key_phrase: str) -> Optional[Tag]:
     """
     Trouve le tag qui contient la phrase cible (sans accents, insensible à la casse).
-    On accepte h1..h6, strong, b, p, div (car le site varie parfois).
+    On accepte h1..h6, strong, b, p, div, span + a/button (souvent cliquable sur BDPM).
     """
     key = norm_key(key_phrase)
+    candidates = soup.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b", "p", "div", "span", "a", "button"]
+    )
 
-    candidates = soup.find_all(["h1","h2","h3","h4","h5","h6","strong","b","p","div","span"])
     for tag in candidates:
         txt = tag.get_text(" ", strip=True)
         if not txt:
             continue
         nt = norm_key(txt)
+
         if key in nt:
             return tag
-        # tolérance : "4.1. Indications thérapeutiques"
-        if ("indications therapeutiques" in key) and ("indications therapeutiques" in nt):
+
+        # tolérances (si la phrase cible est plus longue que le titre réel)
+        if "indications therapeutiques" in key and "indications therapeutiques" in nt:
             return tag
-        if ("posologie et mode d'administration" in key) and ("posologie et mode d'administration" in nt):
+        if "posologie et mode d'administration" in key and "posologie et mode d'administration" in nt:
             return tag
-        if ("interactions avec d'autres medicaments" in key) and ("interactions avec d'autres medicaments" in nt):
+        if "interactions avec d'autres medicaments" in key and "interactions avec d'autres medicaments" in nt:
             return tag
+
     return None
+
 
 def iter_after(tag: Tag):
     """
-    Itère en ordre document sur les éléments après 'tag' (en restant dans le contenu principal).
+    Itère en ordre document sur les éléments après 'tag'.
     """
     cur = tag
     while True:
@@ -202,11 +230,12 @@ def iter_after(tag: Tag):
         if isinstance(cur, Tag):
             yield cur
 
+
 def extract_under_heading_until_next_4x(soup: BeautifulSoup, heading_phrase: str) -> str:
     """
     1) repère le header
     2) récupère tout le texte qui suit
-    3) stop au prochain header "4.x." (autre rubrique 4.y)
+    3) stop au prochain header "4.x" (rubrique 4.y) ou au prochain des 3 headers cibles
     """
     h = find_heading_tag(soup, heading_phrase)
     if h is None:
@@ -217,12 +246,14 @@ def extract_under_heading_until_next_4x(soup: BeautifulSoup, heading_phrase: str
 
     for el in iter_after(h):
         # stop si on tombe sur un nouveau header 4.x (et qu’on a commencé à collecter)
-        if el.name in ("h1","h2","h3","h4","h5","h6"):
+        if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             ht = el.get_text(" ", strip=True)
-            if looks_like_header_4x(ht) and started:
-                break
-            # aussi stop si on rencontre l'un des 3 headers cibles (évite d'englober)
             nt = norm_key(ht)
+
+            if started and looks_like_header_4x(ht):
+                break
+
+            # stop aussi si on rencontre un autre des 3 titres (évite d'englober)
             if started and (
                 "indications therapeutiques" in nt
                 or "posologie et mode d'administration" in nt
@@ -230,22 +261,20 @@ def extract_under_heading_until_next_4x(soup: BeautifulSoup, heading_phrase: str
             ):
                 break
 
-        # on saute les éléments "menu" / sommaire (rare mais ça arrive)
-        if el.get("class") and any("sommaire" in c.lower() for c in el.get("class", [])):
+        # saute éventuellement le sommaire
+        classes = el.get("class") or []
+        if classes and any("sommaire" in str(c).lower() for c in classes):
             continue
 
-        # textes réellement utiles : p, li, table, div, etc.
-        if el.name in ("p","li","table","tbody","tr","td","div","span","ul","ol"):
+        # on collecter du texte utile
+        if el.name in ("p", "li", "table", "tbody", "tr", "td", "div", "span", "ul", "ol"):
             txt = el.get_text("\n", strip=True)
             txt = safe_text(txt)
             if txt:
                 started = True
                 collected.append(txt)
 
-        # sécurité: si on a commencé et qu’on accumule beaucoup, on continue quand même,
-        # mais on évite les doublons exacts
-    # nettoyage final
-    # - supprime doublons consécutifs
+    # nettoyage final : supprime doublons consécutifs
     out: List[str] = []
     prev = ""
     for chunk in collected:
@@ -254,17 +283,14 @@ def extract_under_heading_until_next_4x(soup: BeautifulSoup, heading_phrase: str
         out.append(chunk)
         prev = chunk
 
-    result = "\n\n".join(out).strip()
-    return result
+    return "\n\n".join(out).strip()
 
 
 def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "lxml")
-
     results: Dict[str, str] = {}
     for field_name, heading in TARGETS:
         results[field_name] = extract_under_heading_until_next_4x(soup, heading)
-
     return results
 
 
@@ -278,6 +304,7 @@ def airtable_headers(token: str) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+
 def airtable_list_records(token: str, base_id: str, table: str) -> List[Dict[str, Any]]:
     """
     Récupère tous les records (pagination).
@@ -290,19 +317,20 @@ def airtable_list_records(token: str, base_id: str, table: str) -> List[Dict[str
         params = {}
         if offset:
             params["offset"] = offset
-        # on ne filtre pas côté Airtable pour rester simple et robuste
+
         r = requests.get(url, headers=airtable_headers(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"Airtable list HTTP {r.status_code}: {r.text[:200]}")
+
         data = r.json()
-        recs = data.get("records", [])
-        out.extend(recs)
+        out.extend(data.get("records", []))
         offset = data.get("offset")
         if not offset:
             break
         sleep_throttle()
 
     return out
+
 
 def airtable_batch_update(token: str, base_id: str, table: str, updates: List[Dict[str, Any]]):
     """
@@ -312,6 +340,7 @@ def airtable_batch_update(token: str, base_id: str, table: str, updates: List[Di
         return
     url = f"{AIRTABLE_API_BASE}/{base_id}/{urllib.parse.quote(table)}"
     payload = {"records": updates, "typecast": False}
+
     r = requests.patch(url, headers=airtable_headers(token), json=payload, timeout=60)
     if r.status_code >= 400:
         raise RuntimeError(f"Airtable update HTTP {r.status_code}: {r.text[:400]}")
@@ -334,7 +363,6 @@ def main():
     records = airtable_list_records(token, base_id, table)
     ok(f"Records Airtable chargés: {len(records)}")
 
-    # traitement
     to_update: List[Dict[str, Any]] = []
     updated = 0
     checked = 0
@@ -347,6 +375,10 @@ def main():
     rcp_done_this_run = 0
 
     for idx, rec in enumerate(records, start=1):
+        # Heartbeat de scan (évite l'impression “ça tourne dans le vide”)
+        if idx % 500 == 0:
+            info(f"Scan progress: idx={idx}/{len(records)} checked={checked} updates_buffer={len(to_update)}")
+
         fields = rec.get("fields", {}) or {}
 
         cis = safe_text(fields.get(FIELD_CIS))
@@ -378,7 +410,6 @@ def main():
 
             sections = extract_rcp_sections_from_html(html)
 
-            # si tout est vide => parfois le site renvoie encore une page sans RCP
             if not (sections[FIELD_INDICATIONS_RCP] or sections[FIELD_POSOLOGIE_RCP] or sections[FIELD_INTERACTIONS_RCP]):
                 parse_empty += 1
                 warn(f"RCP vide après parse | CIS={cis or 'NA'} | url={rcp_url}")
@@ -401,7 +432,6 @@ def main():
             # flush
             if len(to_update) >= UPDATE_FLUSH_THRESHOLD:
                 info(f"Flush updates: {len(to_update)}")
-                # batch 10
                 for i in range(0, len(to_update), AIRTABLE_BATCH_SIZE):
                     airtable_batch_update(token, base_id, table, to_update[i:i + AIRTABLE_BATCH_SIZE])
                 updated += len(to_update)
