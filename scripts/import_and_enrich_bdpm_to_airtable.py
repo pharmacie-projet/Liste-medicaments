@@ -1227,7 +1227,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + moment de prise (keywords) ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1242,7 +1242,7 @@ def main():
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"moment checks={moment_checks} |  moment no_kw={moment_no_kw} | "
+                f""
                 f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
 
@@ -1414,7 +1414,6 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} |  no_kw={moment_no_kw} "
                 f"| reste ~{int(remaining)}s"
             )
 
@@ -1441,7 +1440,6 @@ def main():
 
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} |  no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
     )
 
