@@ -158,13 +158,6 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def init_moment_report_csv(path: str):
-    ensure_report_dir()
-    if not os.path.exists(path):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["run_id", "cis", "rcp_url", "status", "keywords"])
-
 def try_git_commit_reports():
     """
     Commit/push optionnel des rapports dans REPORT_DIR (si REPORT_COMMIT=1).
@@ -1063,8 +1056,6 @@ def main():
 
     RUN_ID = run_id_paris()
     SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
-    init_moment_report_csv(MOMENT_REPORT_CSV)
-
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
     info("Téléchargement BDPM CIS ...")
@@ -1437,15 +1428,11 @@ def main():
         "run_id": RUN_ID,
         "timestamp_paris": now_paris_iso_seconds(),
         "total_cis_processed": len(all_cis),
-        "moment_checks": moment_checks,
-        "moment_added": moment_added,
-        "moment_no_keyword": moment_no_kw,
-        "fiche_checks": fiche_checks,
+                                "fiche_checks": fiche_checks,
         "atc_added": atc_added,
         "info_added": info_added,
         "failures": failures,
         "deleted_count": deleted_count,
-        "moment_report_csv": MOMENT_REPORT_CSV,
     }
     with open(SUMMARY_JSON, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -1456,7 +1443,6 @@ def main():
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
         f"fiche checks={fiche_checks} |  no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
-        f"reports: {MOMENT_REPORT_CSV} ; {SUMMARY_JSON}"
     )
 
 if __name__ == "__main__":
