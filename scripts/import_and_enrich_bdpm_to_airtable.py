@@ -1334,7 +1334,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + moment de prise (keywords) ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ... ")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1486,7 +1486,7 @@ def main():
             try:
                 rcp_url = f"https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait?tab=rcp"
                 html_rcp = fetch_html_checked(rcp_url)
-                sec = extract_rcp_sections(html_rcp)
+                sec = extract_rcp_sections_by_headings(html_rcp)
                 if sec.get('indications') and sec['indications'] != cur_ind:
                     upd_fields[FIELD_INDICATIONS_RCP] = sec['indications']
                 if sec.get('posologie') and sec['posologie'] != cur_poso:
