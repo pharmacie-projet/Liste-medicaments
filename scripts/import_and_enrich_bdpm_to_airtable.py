@@ -89,7 +89,6 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
-# ✅ Moment de prise : on veut UNIQUEMENT les mots-clés présents (pas la phrase)
 
 # ✅ Champs RCP à extraire dans Airtable
 FIELD_INDICATIONS_RCP = "Indications RCP"      # 4.1
@@ -158,14 +157,12 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
-def init_moment_report_csv(path: str):
     ensure_report_dir()
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["run_id", "cis", "rcp_url", "status", "keywords"])
 
-def append_moment_report(path: str, run_id: str, cis: str, rcp_url: str, status: str, keywords: str):
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([run_id, cis, rcp_url, status, keywords])
@@ -310,56 +307,7 @@ def _build_kw_patterns(keywords_norm: List[str]) -> List[Tuple[str, re.Pattern]]
 
 _KW_PATTERNS = _build_kw_patterns(_KW_NORM_SORTED)
 
-def extract_moment_keywords_from_rcp_html(html: str) -> str:
-    """
-    Retourne uniquement les mots-clés présents (distincts), séparés par '; '.
-    Si aucun mot-clé: retourne "" (et on n'écrit rien dans Airtable).
-    """
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, _bs_parser())
-    raw = soup.get_text(" ", strip=True)
-    if not raw:
-        return ""
-
-    t = _norm(raw)
-
-    found: List[str] = []
-    for kw_norm, rgx in _KW_PATTERNS:
-        if rgx.search(t):
-            found.append(kw_norm)
-
-    # Dé-doublonnage, conservation de l'ordre (déjà trié par spécificité)
-    seen = set()
-    uniq_norm: List[str] = []
-    for f in found:
-        if f in seen:
-            continue
-        uniq_norm.append(f)
-        seen.add(f)
-
-    if not uniq_norm:
-        return ""
-
-    # On renvoie les libellés originaux (ceux de MOMENT_PRISE_KEYWORDS) si possible.
-    # On mappe norm -> original (première occurrence).
-    norm_to_original: Dict[str, str] = {}
-    for orig in MOMENT_PRISE_KEYWORDS:
-        n = _norm(orig)
-        if n and n not in norm_to_original:
-            norm_to_original[n] = orig
-
-    rendered = [norm_to_original.get(n, n) for n in uniq_norm]
-    # sécurité anti-champs énormes
-    if len(rendered) > 30:
-        rendered = rendered[:30]
-    return "; ".join(rendered).strip()
-
-
-# ============================================================
-# EXTRACTION RCP SECTIONS 4.1 / 4.2 / 4.5
-# ============================================================
+    
 
 def _normalize_rcp_lines(html: str) -> List[str]:
     soup = BeautifulSoup(html, _bs_parser())
@@ -405,7 +353,7 @@ def _extract_section(lines: List[str], sec: str, stop_pat: re.Pattern) -> str:
     text = "\n".join(body_lines).strip()
     return normalize_ws_keep_lines(text)
 
-def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
+def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
     if not html:
         return {"4.1": "", "4.2": "", "4.5": ""}
 
@@ -875,7 +823,7 @@ def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
 # RCP EXTRAIT HTML PARSING (fiable sur BDPM extrait?tab=rcp)
 # ============================================================
 
-def extract_rcp_sections_from_extrait_html(html: str) -> Dict[str, str]:
+def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
     """
     Extrait 4.1 / 4.2 / 4.5 directement depuis la page BDPM:
     https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait?tab=rcp
@@ -937,11 +885,101 @@ def extract_rcp_sections_from_extrait_html(html: str) -> Dict[str, str]:
     # fallback texte brut si besoin
     if not (out["4.1"] or out["4.2"] or out["4.5"]):
         raw = main.get_text("\n", strip=True)
-        return extract_rcp_sections_from_text(raw)
+        return extract_rcp_sections_by_headings(raw)
 
     # cap pour Airtable
     for k in out:
         out[k] = out[k][:50000].strip()
+    return out
+
+# ============================================================
+# RCP SECTION EXTRACTION (keyword-based headings)
+# ============================================================
+
+_RCP_HEADINGS = {
+    "4.1": [
+        "4.1. indications therapeutiques",
+        "indications therapeutiques",
+    ],
+    "4.2": [
+        "4.2. posologie et mode d'administration",
+        "4.2. posologie et mode d administration",
+        "posologie et mode d'administration",
+        "posologie et mode d administration",
+    ],
+    "4.5": [
+        "4.5. interactions avec d'autres medicaments et autres formes d'interactions",
+        "4.5. interactions avec d autres medicaments et autres formes d interactions",
+        "interactions avec d'autres medicaments et autres formes d'interactions",
+        "interactions avec d autres medicaments et autres formes d interactions",
+    ],
+}
+
+def extract_rcp_sections_by_headings(html: str) -> Dict[str, str]:
+    """
+    Variante ultra-robuste:
+    - on récupère le texte brut de la page BDPM "extrait?tab=rcp"
+    - on repère les lignes contenant les titres (4.1 / 4.2 / 4.5)
+    - on prend tout ce qui suit jusqu'au prochain titre 4.x (ou fin).
+    """
+    html = safe_text(html)
+    if not html or len(html) < 300:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    soup = BeautifulSoup(html, _bs_parser())
+    raw = soup.get_text("\n", strip=True)
+    raw = normalize_ws_keep_lines(raw)
+    if not raw:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    norm_lines = [strip_accents(ln).lower() for ln in lines]
+
+    def is_heading_line(norm_ln: str) -> Optional[str]:
+        # renvoie la section ("4.1" etc.) si la ligne correspond
+        for sec, keys in _RCP_HEADINGS.items():
+            for k in keys:
+                if k in norm_ln:
+                    return sec
+        # fallback: numérotation pure "4.1" début de ligne
+        if re.match(r"^\s*4\s*[\.\-:]\s*1\b", norm_ln):
+            return "4.1"
+        if re.match(r"^\s*4\s*[\.\-:]\s*2\b", norm_ln):
+            return "4.2"
+        if re.match(r"^\s*4\s*[\.\-:]\s*5\b", norm_ln):
+            return "4.5"
+        return None
+
+    # index de début pour chaque section
+    start_idx: Dict[str, int] = {}
+    for i, nln in enumerate(norm_lines):
+        sec = is_heading_line(nln)
+        if sec and sec not in start_idx:
+            start_idx[sec] = i
+
+    # rien trouvé
+    if not start_idx:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    # calcule la fin = prochain heading "4." (ou fin)
+    def next_section_start(i0: int) -> int:
+        for j in range(i0 + 1, len(norm_lines)):
+            if re.match(r"^\s*4\s*[\.\-:]\s*\d\b", norm_lines[j]):
+                return j
+            # aussi si la ligne ressemble fortement à un des headings connus
+            if is_heading_line(norm_lines[j]) is not None:
+                return j
+        return len(norm_lines)
+
+    out: Dict[str, str] = {"4.1": "", "4.2": "", "4.5": ""}
+    for sec in ["4.1", "4.2", "4.5"]:
+        if sec not in start_idx:
+            continue
+        s = start_idx[sec]
+        e = next_section_start(s)
+        content_lines = lines[s+1:e]  # sans le titre lui-même
+        txt = normalize_ws_keep_lines("\n".join(content_lines)).strip()
+        out[sec] = txt[:50000].strip()
     return out
 # ============================================================
 # URL HELPERS
@@ -1243,9 +1281,7 @@ def main():
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
     RUN_ID = run_id_paris()
-    MOMENT_REPORT_CSV = os.path.join(REPORT_DIR, f"moment_prise_keywords_{RUN_ID}.csv")
     SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
-    init_moment_report_csv(MOMENT_REPORT_CSV)
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
@@ -1428,15 +1464,11 @@ def main():
     fiche_checks = 0
     info_added = 0
     atc_added = 0
-    moment_checks = 0
-    moment_added = 0
-    moment_no_kw = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"moment checks={moment_checks} | moment added={moment_added} | moment no_kw={moment_no_kw} | "
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | rcp checks={rcp_checks} (updated={rcp_updated}, empty={rcp_empty}) | fiche checks={fiche_checks} | "
                 f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
 
@@ -1471,51 +1503,48 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-                # ✅ RCP: extraction keywords (moment de prise) + sections 4.1/4.2/4.5
-        cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
-        cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
-        cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
 
-        need_fetch_rcp = force_refresh or (not str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()) or (not str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()) or (not str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()) or (not cur_41) or (not cur_42) or (not cur_45)
+        # RCP sections (4.1 / 4.2 / 4.5)
+        cur_ind = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
+        cur_pos = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
+        cur_int = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
+        need_fetch_rcp = force_refresh or (not cur_ind) or (not cur_pos) or (not cur_int)
 
         if need_fetch_rcp and link_rcp:
-            rcp_url = set_tab(link_rcp, cis, "rcp")
             try:
-                moment_checks += 1
+                rcp_checks += 1
+                rcp_url = set_tab(link_rcp, cis, "rcp")  # force tab=rcp
                 html_rcp = fetch_html_checked(rcp_url)
-
-                # 1) Moment de prise = mots-clés uniquement
-                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
-                if kw_txt:
-                    if kw_txt != cur_moment:
-                        moment_added += 1
-                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UPDATED", kw_txt)
-                    else:
-                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UNCHANGED", kw_txt)
-                else:
-                    moment_no_kw += 1
-                    append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "NO_KEYWORD", "")
-
-                # 2) Sections 4.1 / 4.2 / 4.5
-                sections = extract_rcp_sections_from_html(html_rcp)
+                sections = extract_rcp_sections_by_headings(html_rcp)
 
                 sec41 = sections.get("4.1", "").strip()
                 sec42 = sections.get("4.2", "").strip()
                 sec45 = sections.get("4.5", "").strip()
 
-                if sec41 and sec41 != cur_41:
+                if sec41 and sec41 != cur_ind:
                     upd_fields[FIELD_INDICATIONS_RCP] = sec41
-                if sec42 and sec42 != cur_42:
+                    rcp_updated += 1
+                elif not sec41:
+                    rcp_empty += 1
+
+                if sec42 and sec42 != cur_pos:
                     upd_fields[FIELD_POSOLOGIE_RCP] = sec42
-                if sec45 and sec45 != cur_45:
+                    rcp_updated += 1
+                elif not sec42:
+                    rcp_empty += 1
+
+                if sec45 and sec45 != cur_int:
                     upd_fields[FIELD_INTERACTIONS_RCP] = sec45
+                    rcp_updated += 1
+                elif not sec45:
+                    rcp_empty += 1
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
-                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_KO", "")
+                failures += 1
             except Exception as e:
                 warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
-                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_PARSE_KO", "")
+                failures += 1
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1625,7 +1654,6 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} "
                 f"| reste ~{int(remaining)}s"
             )
 
@@ -1639,15 +1667,11 @@ def main():
         "run_id": RUN_ID,
         "timestamp_paris": now_paris_iso_seconds(),
         "total_cis_processed": len(all_cis),
-        "moment_checks": moment_checks,
-        "moment_added": moment_added,
-        "moment_no_keyword": moment_no_kw,
         "fiche_checks": fiche_checks,
         "atc_added": atc_added,
         "info_added": info_added,
         "failures": failures,
         "deleted_count": deleted_count,
-        "moment_report_csv": MOMENT_REPORT_CSV,
     }
     with open(SUMMARY_JSON, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -1656,7 +1680,6 @@ def main():
 
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
         f"reports: {MOMENT_REPORT_CSV} ; {SUMMARY_JSON}"
     )
