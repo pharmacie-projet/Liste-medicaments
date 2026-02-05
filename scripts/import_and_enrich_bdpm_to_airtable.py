@@ -92,6 +92,11 @@ FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écr
 # ✅ Moment de prise : on veut UNIQUEMENT les mots-clés présents (pas la phrase)
 FIELD_MOMENT_PRISE = "Moment de prise"  # champ à écrire
 
+# ✅ Champs RCP à extraire dans Airtable
+FIELD_INDICATIONS_RCP = "Indications RCP"      # 4.1
+FIELD_POSOLOGIE_RCP = "Posologie RCP"          # 4.2
+FIELD_INTERACTIONS_RCP = "Interactions RCP"    # 4.5
+
 # ✅ timestamp de revue
 FIELD_DATE_REVUE = "Date revue ligne"   # champ à écrire
 
@@ -351,6 +356,73 @@ def extract_moment_keywords_from_rcp_html(html: str) -> str:
     if len(rendered) > 30:
         rendered = rendered[:30]
     return "; ".join(rendered).strip()
+
+
+# ============================================================
+# EXTRACTION RCP SECTIONS 4.1 / 4.2 / 4.5
+# ============================================================
+
+def _normalize_rcp_lines(html: str) -> List[str]:
+    soup = BeautifulSoup(html, _bs_parser())
+    raw = soup.get_text("\n", strip=True)
+    raw = safe_text(raw)
+    if not raw:
+        return []
+    lines: List[str] = []
+    for ln in raw.split("\n"):
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+    return lines
+
+def _find_section_start(lines: List[str], sec: str) -> Optional[int]:
+    pat = re.compile(rf"^\s*{re.escape(sec)}\b")
+    for i, ln in enumerate(lines):
+        if pat.match(ln):
+            return i
+    return None
+
+def _find_section_end(lines: List[str], start_idx: int, stop_pat: re.Pattern) -> int:
+    for j in range(start_idx + 1, len(lines)):
+        if stop_pat.match(lines[j]):
+            return j
+    return len(lines)
+
+def _extract_section(lines: List[str], sec: str, stop_pat: re.Pattern) -> str:
+    start = _find_section_start(lines, sec)
+    if start is None:
+        return ""
+    end = _find_section_end(lines, start, stop_pat)
+
+    body_lines = lines[start + 1:end]
+
+    title_ln = lines[start]
+    title_tail = re.sub(rf"^\s*{re.escape(sec)}\s*", "", title_ln).strip()
+    if ":" in title_tail:
+        after = title_tail.split(":", 1)[1].strip()
+        if after:
+            body_lines = [after] + body_lines
+
+    text = "\n".join(body_lines).strip()
+    return normalize_ws_keep_lines(text)
+
+def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
+    if not html:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    lines = _normalize_rcp_lines(html)
+    if not lines:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    stop_41 = re.compile(r"^\s*(?:4\.2\b|5\.)")
+    stop_42 = re.compile(r"^\s*(?:4\.[3-9]\b|5\.)")
+    stop_45 = re.compile(r"^\s*(?:4\.[6-9]\b|5\.)")
+
+    return {
+        "4.1": _extract_section(lines, "4.1", stop_41),
+        "4.2": _extract_section(lines, "4.2", stop_42),
+        "4.5": _extract_section(lines, "4.5", stop_45),
+    }
 
 # ============================================================
 # ATC HELPERS (pour lecture fichiers)
@@ -1159,6 +1231,9 @@ def main():
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
         FIELD_MOMENT_PRISE, # lecture/écriture
+        FIELD_INDICATIONS_RCP,
+        FIELD_POSOLOGIE_RCP,
+        FIELD_INTERACTIONS_RCP,
         FIELD_DATE_REVUE,
     ]
 
@@ -1317,17 +1392,22 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # ✅ Moment de prise: on écrit UNIQUEMENT les mots-clés présents
+                # ✅ RCP: extraction keywords (moment de prise) + sections 4.1/4.2/4.5
         cur_moment = str(fields_cur.get(FIELD_MOMENT_PRISE, "")).strip()
-        need_fetch_rcp = force_refresh or (not cur_moment)
+        cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
+        cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
+        cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
+
+        need_fetch_rcp = force_refresh or (not cur_moment) or (not cur_41) or (not cur_42) or (not cur_45)
 
         if need_fetch_rcp and link_rcp:
             rcp_url = set_tab(link_rcp, cis, "rcp")
             try:
                 moment_checks += 1
                 html_rcp = fetch_html_checked(rcp_url)
-                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
 
+                # 1) Moment de prise = mots-clés uniquement
+                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
                 if kw_txt:
                     if kw_txt != cur_moment:
                         upd_fields[FIELD_MOMENT_PRISE] = kw_txt
@@ -1338,6 +1418,21 @@ def main():
                 else:
                     moment_no_kw += 1
                     append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "NO_KEYWORD", "")
+
+                # 2) Sections 4.1 / 4.2 / 4.5
+                sections = extract_rcp_sections_from_html(html_rcp)
+
+                sec41 = sections.get("4.1", "").strip()
+                sec42 = sections.get("4.2", "").strip()
+                sec45 = sections.get("4.5", "").strip()
+
+                if sec41 and sec41 != cur_41:
+                    upd_fields[FIELD_INDICATIONS_RCP] = sec41
+                if sec42 and sec42 != cur_42:
+                    upd_fields[FIELD_POSOLOGIE_RCP] = sec42
+                if sec45 and sec45 != cur_45:
+                    upd_fields[FIELD_INTERACTIONS_RCP] = sec45
+
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
                 append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_KO", "")
