@@ -18,12 +18,6 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
-# PDF text extraction (pour les RCP servis en PDF)
-try:
-    from pdfminer.high_level import extract_text as pdf_extract_text  # type: ignore
-except Exception:
-    pdf_extract_text = None  # noqa
-
 # Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
 try:
     import pandas as pd  # type: ignore
@@ -63,7 +57,6 @@ REQUEST_TIMEOUT = 35
 MAX_RETRIES = 4
 
 REPORT_DIR = os.getenv("REPORT_DIR", "reports")
-RCP_REPORT_CSV = os.path.join(REPORT_DIR, f"rcp_extract_report_{time.strftime('%Y-%m-%d')}.csv")
 REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
@@ -165,6 +158,19 @@ def append_deleted_report(cis: str, reason: str, url: str):
     with open(p, "a", encoding="utf-8") as f:
         f.write(line)
 
+def init_moment_report_csv(path: str):
+    ensure_report_dir()
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["run_id", "cis", "rcp_url", "status", "keywords"])
+
+def append_moment_report(path: str, run_id: str, cis: str, rcp_url: str, status: str, keywords: str):
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([run_id, cis, rcp_url, status, keywords])
+        f.flush()
+
 def try_git_commit_reports():
     """
     Commit/push optionnel des rapports dans REPORT_DIR (si REPORT_COMMIT=1).
@@ -182,23 +188,6 @@ def try_git_commit_reports():
     except Exception as e:
         warn(f"Commit/push des rapports impossible (on continue): {e}")
 
-
-# ============================================================
-# RCP REPORTING (debug extraction)
-# ============================================================
-
-def init_rcp_report_csv(path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    if os.path.exists(path):
-        return
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("ts,cis,rcp_url,kind,text_len,has_41,has_42,has_45,updated,empty_reason\n")
-
-def append_rcp_report(path: str, cis: str, rcp_url: str, kind: str, text_len: int,
-                      has_41: bool, has_42: bool, has_45: bool, updated: bool, empty_reason: str):
-    line = f"{_ts()},{cis},{rcp_url},{kind},{text_len},{int(has_41)},{int(has_42)},{int(has_45)},{int(updated)},{empty_reason}\n"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line)
 # ============================================================
 # TEXT UTIL
 # ============================================================
@@ -264,6 +253,108 @@ def _bs_parser():
         return "lxml"
     except Exception:
         return "html.parser"
+
+# ============================================================
+# EXTRACTION "MOMENT DE PRISE" (RCP)
+# ============================================================
+
+# ✅ Mots-clés EXACTS à récupérer si présents dans le RCP
+# (on ne stocke PAS la phrase, uniquement les mots-clés trouvés)
+MOMENT_PRISE_KEYWORDS = [
+    # Formulations fréquentes des RCP
+    "avec un repas",
+    "avec les repas",
+    "au cours du repas",
+    "pendant le repas",
+    "avant le repas",
+    "apres le repas",
+    "après le repas",
+    "en dehors des repas",
+    "au moment des repas",
+
+    # Avec / sans nourriture
+    "avec nourriture",
+    "avec de la nourriture",
+    "avec des aliments",
+    "prendre avec nourriture",
+    "avec ou sans nourriture",
+    "avec ou sans aliments",
+    "sans nourriture",
+
+    # Interactions liées à la nourriture
+    "repas riche",
+    "repas riche en graisses",
+    "repas riche en graisse",
+    "repas gras",
+]
+
+def _norm(s: str) -> str:
+    return strip_accents(safe_text(s)).lower()
+
+# Trie par longueur décroissante : si plusieurs expressions coexistent, on privilégie les plus spécifiques
+_KW_NORM_SORTED = sorted([_norm(k) for k in MOMENT_PRISE_KEYWORDS if _norm(k)], key=len, reverse=True)
+
+def _build_kw_patterns(keywords_norm: List[str]) -> List[Tuple[str, re.Pattern]]:
+    """
+    Regex robustes sur texte normalisé (sans accents):
+    - espaces -> \\s+ (gère retours ligne et espaces multiples)
+    - bornes de mots \\b pour limiter les faux positifs
+    """
+    out: List[Tuple[str, re.Pattern]] = []
+    for kw in keywords_norm:
+        kw_esc = re.escape(kw)
+        kw_esc = re.sub(r"\\\s+", r"\\s+", kw_esc)
+        rgx = re.compile(rf"\b{kw_esc}\b", flags=re.IGNORECASE)
+        out.append((kw, rgx))
+    return out
+
+_KW_PATTERNS = _build_kw_patterns(_KW_NORM_SORTED)
+
+def extract_moment_keywords_from_rcp_html(html: str) -> str:
+    """
+    Retourne uniquement les mots-clés présents (distincts), séparés par '; '.
+    Si aucun mot-clé: retourne "" (et on n'écrit rien dans Airtable).
+    """
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, _bs_parser())
+    raw = soup.get_text(" ", strip=True)
+    if not raw:
+        return ""
+
+    t = _norm(raw)
+
+    found: List[str] = []
+    for kw_norm, rgx in _KW_PATTERNS:
+        if rgx.search(t):
+            found.append(kw_norm)
+
+    # Dé-doublonnage, conservation de l'ordre (déjà trié par spécificité)
+    seen = set()
+    uniq_norm: List[str] = []
+    for f in found:
+        if f in seen:
+            continue
+        uniq_norm.append(f)
+        seen.add(f)
+
+    if not uniq_norm:
+        return ""
+
+    # On renvoie les libellés originaux (ceux de MOMENT_PRISE_KEYWORDS) si possible.
+    # On mappe norm -> original (première occurrence).
+    norm_to_original: Dict[str, str] = {}
+    for orig in MOMENT_PRISE_KEYWORDS:
+        n = _norm(orig)
+        if n and n not in norm_to_original:
+            norm_to_original[n] = orig
+
+    rendered = [norm_to_original.get(n, n) for n in uniq_norm]
+    # sécurité anti-champs énormes
+    if len(rendered) > 30:
+        rendered = rendered[:30]
+    return "; ".join(rendered).strip()
 
 
 # ============================================================
@@ -331,73 +422,6 @@ def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
         "4.2": _extract_section(lines, "4.2", stop_42),
         "4.5": _extract_section(lines, "4.5", stop_45),
     }
-
-def extract_rcp_sections_from_text(text: str) -> Dict[str, str]:
-    """
-    Extraction robuste des sections 4.1 / 4.2 / 4.5 depuis un texte (HTML ou PDF).
-    Stratégie:
-      1) repérage par numérotation tolérante: 4.1 / 4 . 1 / 4-1 / 4:1
-      2) si échec, fallback par titres (indications thérapeutiques / posologie / interactions)
-    """
-    text = safe_text(text)
-    if not text:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    # Normalisation légère
-    t = text.replace("\r", "\n")
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    if len(t) < 50:
-        return {"4.1": "", "4.2": "", "4.5": ""}
-
-    # --- helper: extract between two markers in full text
-    def between(start_re: re.Pattern, end_re: re.Pattern) -> str:
-        m1 = start_re.search(t)
-        if not m1:
-            return ""
-        start = m1.end()
-        m2 = end_re.search(t, start)
-        end = m2.start() if m2 else len(t)
-        seg = t[start:end].strip()
-        return normalize_ws_keep_lines(seg)
-
-    # numérotation tolérante
-    s41 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*1\b[^\n]*", re.IGNORECASE)
-    s42 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*2\b[^\n]*", re.IGNORECASE)
-    s45 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*5\b[^\n]*", re.IGNORECASE)
-
-    # fins: 4.2 pour 4.1; 4.3-4.9 ou 5.* pour 4.2; 4.6-4.9 ou 5.* pour 4.5
-    e41 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*2\b", re.IGNORECASE)
-    e42 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*[3-9]\b|(?:^|\n)\s*5\s*[\.\-:]\s*1\b|(?:^|\n)\s*5\.", re.IGNORECASE)
-    e45 = re.compile(r"(?:^|\n)\s*4\s*[\.\-:]\s*[6-9]\b|(?:^|\n)\s*5\s*[\.\-:]\s*1\b|(?:^|\n)\s*5\.", re.IGNORECASE)
-
-    out41 = between(s41, e41)
-    out42 = between(s42, e42)
-    out45 = between(s45, e45)
-
-    # fallback titres si vide
-    if not out41:
-        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*1\s*)?indications\s+th[ée]rapeutiques\b", re.IGNORECASE)
-        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*2\b|posologie\s+et\s+mode\s+d['’]administration\b)", re.IGNORECASE)
-        out41 = between(s, e)
-
-    if not out42:
-        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*2\s*)?posologie\s+et\s+mode\s+d['’]administration\b", re.IGNORECASE)
-        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*[3-9]\b|4\s*[\.\-:]\s*5\b|interactions\b|5\.)", re.IGNORECASE)
-        out42 = between(s, e)
-
-    if not out45:
-        s = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*5\s*)?interactions\b", re.IGNORECASE)
-        e = re.compile(r"(?:^|\n)\s*(?:4\s*[\.\-:]\s*[6-9]\b|5\.)", re.IGNORECASE)
-        out45 = between(s, e)
-
-    # Sécurité: on évite des blobs énormes (Airtable supporte, mais on coupe à 50k)
-    def cap(x: str) -> str:
-        x = x.strip()
-        return x[:50000].strip()
-
-    return {"4.1": cap(out41), "4.2": cap(out42), "4.5": cap(out45)}
-
 
 # ============================================================
 # ATC HELPERS (pour lecture fichiers)
@@ -846,6 +870,79 @@ def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
     ok(f"Infos importantes chargées: {len(cis_to_url)} correspondances CIS->URL")
     return cis_to_url
 
+
+# ============================================================
+# RCP EXTRAIT HTML PARSING (fiable sur BDPM extrait?tab=rcp)
+# ============================================================
+
+def extract_rcp_sections_from_extrait_html(html: str) -> Dict[str, str]:
+    """
+    Extrait 4.1 / 4.2 / 4.5 directement depuis la page BDPM:
+    https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait?tab=rcp
+    => c'est la page que tu vois avec les titres 4.1 / 4.2 / 4.5.
+    """
+    html = safe_text(html)
+    if not html or len(html) < 500:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    soup = BeautifulSoup(html, _bs_parser())
+    main = soup.find("main") or soup
+
+    heading_tags = ["h1", "h2", "h3", "h4", "h5", "h6"]
+
+    def norm(s: str) -> str:
+        s = strip_accents(safe_text(s)).lower()
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def is_section_heading(txt: str, sec: str) -> bool:
+        t = norm(txt)
+        # numérotation tolérante (4.1 / 4 . 1 / 4-1 / 4:1)
+        if sec == "4.1":
+            return bool(re.search(r"^\s*4\s*[\.\-:]\s*1\b", txt)) or "indications therapeutiques" in t
+        if sec == "4.2":
+            return bool(re.search(r"^\s*4\s*[\.\-:]\s*2\b", txt)) or ("posologie" in t and "mode d'administration" in t or "mode d administration" in t)
+        if sec == "4.5":
+            return bool(re.search(r"^\s*4\s*[\.\-:]\s*5\b", txt)) or "interactions" in t
+        return False
+
+    # Repère les headings
+    headings = []
+    for h in main.find_all(heading_tags):
+        txt = safe_text(h.get_text(" ", strip=True))
+        if txt:
+            headings.append((h, txt))
+
+    def grab(sec: str) -> str:
+        start = None
+        for h, txt in headings:
+            if is_section_heading(txt, sec):
+                start = h
+                break
+        if not start:
+            return ""
+        parts = []
+        for sib in start.next_siblings:
+            if getattr(sib, "name", None) is None:
+                continue
+            if sib.name in heading_tags:
+                break
+            txt = safe_text(sib.get_text(" ", strip=True)) if hasattr(sib, "get_text") else ""
+            if txt:
+                parts.append(txt)
+        return normalize_ws_keep_lines("\n".join(parts)).strip()
+
+    out = {"4.1": grab("4.1"), "4.2": grab("4.2"), "4.5": grab("4.5")}
+
+    # fallback texte brut si besoin
+    if not (out["4.1"] or out["4.2"] or out["4.5"]):
+        raw = main.get_text("\n", strip=True)
+        return extract_rcp_sections_from_text(raw)
+
+    # cap pour Airtable
+    for k in out:
+        out[k] = out[k][:50000].strip()
+    return out
 # ============================================================
 # URL HELPERS
 # ============================================================
@@ -872,42 +969,6 @@ def set_tab(url: str, cis_fallback: str, tab: str) -> str:
 
 def rcp_link_default(cis: str) -> str:
     return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
-
-def resolve_rcp_doc_url(cis: str, fallback_url: str) -> str:
-    """
-    BDPM charge parfois le RCP via une page dédiée (affichageDoc.php?specDoc=RCP...).
-    Cette fonction tente de retrouver l'URL du document RCP dans la page 'extrait'.
-    Si introuvable, retourne fallback_url (souvent ...#tab=rcp).
-    """
-    try:
-        base_url = base_extrait_url_from_cis(cis)
-        html = fetch_html_checked(base_url)
-        soup = BeautifulSoup(html, _bs_parser())
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href:
-                continue
-            low = href.lower()
-            if "affichagedoc.php" in low and "specdoc=rcp" in low:
-                if href.startswith("/"):
-                    href = "https://base-donnees-publique.medicaments.gouv.fr" + href
-                return href
-        # certains templates utilisent onclick ou data-href
-        for el in soup.find_all(["a","button"]):
-            for attr in ["onclick","data-href","data-url"]:
-                v = (el.get(attr) or "")
-                low = v.lower()
-                if "affichagedoc.php" in low and "specdoc=rcp" in low:
-                    m = re.search(r"(https?://[^\s\"']+affichagedoc\.php\?[^\s\"']+)", v, re.IGNORECASE)
-                    if m:
-                        return m.group(1)
-                    m = re.search(r"(\/affichagedoc\.php\?[^\s\"']+)", v, re.IGNORECASE)
-                    if m:
-                        return "https://base-donnees-publique.medicaments.gouv.fr" + m.group(1)
-    except Exception:
-        pass
-    return fallback_url
-
 
 # ============================================================
 # FICHE-INFO SCRAPING
@@ -965,97 +1026,6 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
             time.sleep(1.0 * attempt)
     raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
 
-
-def fetch_bytes_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT), max_retries: int = 3) -> Tuple[bytes, str]:
-    """
-    Retourne (content_bytes, content_type). Gère 404/4xx de manière similaire à fetch_html_checked.
-    """
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout, allow_redirects=True)
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if r.status_code == 404:
-                raise PageUnavailable(url, 404, "HTTP 404")
-            if r.status_code >= 400:
-                raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
-            content = r.content or b""
-            if len(content) < 200:
-                raise PageUnavailable(url, r.status_code, "Contenu vide/trop court")
-            return content, ct
-        except PageUnavailable:
-            raise
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0 * attempt)
-    raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    if not pdf_bytes:
-        return ""
-    if pdf_extract_text is None:
-        # pdfminer non dispo: on ne peut pas extraire
-        return ""
-    import io
-    try:
-        # pdfminer accepte un file-like via BytesIO
-        return safe_text(pdf_extract_text(io.BytesIO(pdf_bytes)))
-    except Exception:
-        return ""
-
-_PDF_HINT_RE = re.compile(r"\.pdf(?:$|\?)", re.IGNORECASE)
-
-def get_rcp_text(cis: str, rcp_url: str) -> Tuple[str, str]:
-    """
-    Retourne (texte, source_kind) où source_kind ∈ {"pdf","html","html_iframe_pdf","html_link_pdf","unknown"}.
-    - Si rcp_url renvoie un PDF -> extraction pdf
-    - Si rcp_url renvoie HTML contenant iframe/pdf -> extraction pdf depuis iframe
-    - Sinon -> extraction texte depuis HTML
-    """
-    # 1) Essai direct
-    content, ct = fetch_bytes_checked(rcp_url)
-    if "application/pdf" in ct or _PDF_HINT_RE.search(rcp_url):
-        txt = extract_text_from_pdf_bytes(content)
-        return txt, "pdf"
-
-    html = ""
-    try:
-        html = content.decode("utf-8", errors="ignore")
-    except Exception:
-        html = ""
-
-    # 2) Si HTML contient un iframe vers PDF
-    if html:
-        soup = BeautifulSoup(html, _bs_parser())
-        # iframe/src/object/data
-        for tag, attr in [("iframe","src"),("object","data"),("embed","src")]:
-            for el in soup.find_all(tag):
-                v = (el.get(attr) or "").strip()
-                if v and (_PDF_HINT_RE.search(v) or "application/pdf" in v.lower()):
-                    if v.startswith("/"):
-                        v = "https://base-donnees-publique.medicaments.gouv.fr" + v
-                    pdf_bytes, pdf_ct = fetch_bytes_checked(v, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
-                    if "application/pdf" in pdf_ct or _PDF_HINT_RE.search(v):
-                        txt = extract_text_from_pdf_bytes(pdf_bytes)
-                        return txt, "html_iframe_pdf"
-
-        # 3) liens <a href="...pdf">
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href:
-                continue
-            if _PDF_HINT_RE.search(href):
-                if href.startswith("/"):
-                    href = "https://base-donnees-publique.medicaments.gouv.fr" + href
-                pdf_bytes, pdf_ct = fetch_bytes_checked(href, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
-                if "application/pdf" in pdf_ct or _PDF_HINT_RE.search(href):
-                    txt = extract_text_from_pdf_bytes(pdf_bytes)
-                    return txt, "html_link_pdf"
-
-        # 4) fallback: texte HTML
-        return safe_text(soup.get_text("\n", strip=True)), "html"
-
-    return "", "unknown"
 def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
@@ -1273,9 +1243,11 @@ def main():
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
     RUN_ID = run_id_paris()
+    MOMENT_REPORT_CSV = os.path.join(REPORT_DIR, f"moment_prise_keywords_{RUN_ID}.csv")
     SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
+    init_moment_report_csv(MOMENT_REPORT_CSV)
+
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
-    init_rcp_report_csv(RCP_REPORT_CSV)
 
     info("Téléchargement BDPM CIS ...")
     cis_txt = download_text(BDPM_CIS_URL, encoding="latin-1")
@@ -1446,7 +1418,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante ")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + moment de prise (keywords) ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1454,17 +1426,17 @@ def main():
     start = time.time()
 
     fiche_checks = 0
-    rcp_checks = 0
-    rcp_sections_updated = 0
-    rcp_sections_empty = 0
     info_added = 0
     atc_added = 0
+    moment_checks = 0
+    moment_added = 0
+    moment_no_kw = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | rcp checks={rcp_checks} (updated={rcp_sections_updated}, empty={rcp_sections_empty}) | rcp checks={rcp_checks} (updated={rcp_sections_updated}, empty={rcp_sections_empty}) | fiche checks={fiche_checks} | "
-                f""
+                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
+                f"moment checks={moment_checks} | moment added={moment_added} | moment no_kw={moment_no_kw} | "
                 f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
 
@@ -1499,57 +1471,51 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-                                        # ✅ RCP: extraction sections 4.1/4.2/4.5 (HTML ou PDF)
+                # ✅ RCP: extraction keywords (moment de prise) + sections 4.1/4.2/4.5
         cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
 
-        need_fetch_rcp = force_refresh or (not cur_41) or (not cur_42) or (not cur_45)
+        need_fetch_rcp = force_refresh or (not str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()) or (not str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()) or (not str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()) or (not cur_41) or (not cur_42) or (not cur_45)
 
         if need_fetch_rcp and link_rcp:
-            # 1) On tente d'abord l'URL document RCP (affichageDoc.php?specDoc=RCP...)
-            # 2) Sinon, fallback sur l'onglet rcp de la page extrait
-            fallback_rcp = set_tab(link_rcp, cis, "rcp")
-            rcp_url = resolve_rcp_doc_url(cis, fallback_rcp)
-
+            rcp_url = set_tab(link_rcp, cis, "rcp")
             try:
-                rcp_checks += 1
-                rcp_text, rcp_kind = get_rcp_text(cis, rcp_url)
+                moment_checks += 1
+                html_rcp = fetch_html_checked(rcp_url)
 
-                if not rcp_text or len(rcp_text) < 200:
-                    rcp_sections_empty += 1
-                append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), False, False, False, False, \"no_text\")
+                # 1) Moment de prise = mots-clés uniquement
+                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
+                if kw_txt:
+                    if kw_txt != cur_moment:
+                        moment_added += 1
+                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UPDATED", kw_txt)
+                    else:
+                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UNCHANGED", kw_txt)
                 else:
-                    sections = extract_rcp_sections_from_text(rcp_text)
+                    moment_no_kw += 1
+                    append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "NO_KEYWORD", "")
 
-                    sec41 = sections.get("4.1", "").strip()
-                    sec42 = sections.get("4.2", "").strip()
-                    sec45 = sections.get("4.5", "").strip()
+                # 2) Sections 4.1 / 4.2 / 4.5
+                sections = extract_rcp_sections_from_html(html_rcp)
 
-                    if not sec41 and not sec42 and not sec45:
-                        rcp_sections_empty += 1
-                    append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), False, False, False, False, \"no_sections\")
+                sec41 = sections.get("4.1", "").strip()
+                sec42 = sections.get("4.2", "").strip()
+                sec45 = sections.get("4.5", "").strip()
 
-                    changed = False
-                    if sec41 and sec41 != cur_41:
-                        upd_fields[FIELD_INDICATIONS_RCP] = sec41
-                        changed = True
-                    if sec42 and sec42 != cur_42:
-                        upd_fields[FIELD_POSOLOGIE_RCP] = sec42
-                        changed = True
-                    if sec45 and sec45 != cur_45:
-                        upd_fields[FIELD_INTERACTIONS_RCP] = sec45
-                        changed = True
-
-                    if changed:
-                        rcp_sections_updated += 1
-
-                append_rcp_report(RCP_REPORT_CSV, cis, rcp_url, rcp_kind, len(rcp_text), bool(sec41), bool(sec42), bool(sec45), True, \"\")
+                if sec41 and sec41 != cur_41:
+                    upd_fields[FIELD_INDICATIONS_RCP] = sec41
+                if sec42 and sec42 != cur_42:
+                    upd_fields[FIELD_POSOLOGIE_RCP] = sec42
+                if sec45 and sec45 != cur_45:
+                    upd_fields[FIELD_INTERACTIONS_RCP] = sec45
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
+                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_KO", "")
             except Exception as e:
                 warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
+                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_PARSE_KO", "")
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1659,6 +1625,7 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
+                f"| fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} "
                 f"| reste ~{int(remaining)}s"
             )
 
@@ -1672,11 +1639,15 @@ def main():
         "run_id": RUN_ID,
         "timestamp_paris": now_paris_iso_seconds(),
         "total_cis_processed": len(all_cis),
-                                "fiche_checks": fiche_checks,
+        "moment_checks": moment_checks,
+        "moment_added": moment_added,
+        "moment_no_keyword": moment_no_kw,
+        "fiche_checks": fiche_checks,
         "atc_added": atc_added,
         "info_added": info_added,
         "failures": failures,
         "deleted_count": deleted_count,
+        "moment_report_csv": MOMENT_REPORT_CSV,
     }
     with open(SUMMARY_JSON, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -1685,7 +1656,9 @@ def main():
 
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
+        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
+        f"reports: {MOMENT_REPORT_CSV} ; {SUMMARY_JSON}"
     )
 
 if __name__ == "__main__":
