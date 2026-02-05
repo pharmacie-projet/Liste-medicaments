@@ -30,8 +30,10 @@ except Exception:
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
+
 BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
 BDPM_INFO_IMPORTANTES_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/CIS_InfoImportantes.txt"
+
 BDPM_DOC_EXTRACT_URL = "https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
@@ -215,10 +217,9 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# EXTRACTION SECTIONS RCP (VRAI CONTENU, PAS TABLE DES MATIERES)
+# EXTRACTION SECTIONS RCP (CONTENU)
 # ============================================================
 
-# Pour reconnaître et jeter une "table des matières" qui n'est que des titres
 _TITLE_ONLY_MIN_WORDS = 10
 _TITLE_ONLY_MAX_CHARS = 240
 
@@ -239,91 +240,60 @@ def _clean_section_text(s: str, max_chars: int = 20000) -> str:
         out.append(ln)
         last = ln
     s2 = "\n".join(out).strip()
-
-    # Tronquage sécurité
     if len(s2) > max_chars:
         s2 = s2[:max_chars].rstrip() + "\n\n[Texte tronqué]"
     return s2
 
 def _looks_like_title_only(text: str) -> bool:
-    """
-    True si le texte ressemble juste à des titres répétés (cas table des matières).
-    """
     t = safe_text(text)
     if not t:
         return True
     if len(t) <= _TITLE_ONLY_MAX_CHARS:
-        # très court -> souvent TDM
-        # si en plus peu de mots -> quasi sûr
         words = re.findall(r"\w+", t, flags=re.UNICODE)
         if len(words) <= _TITLE_ONLY_MIN_WORDS:
             return True
-
-    # Si on voit des numéros de sections très rapprochés et presque pas de phrases (peu de ponctuation)
     punct = sum(t.count(x) for x in [".", ";", ":", "!", "?", "—"])
     if punct <= 2 and len(t) < 400:
         return True
-
     return False
 
 def _strip_leading_heading_lines(text: str, major: int, minor: int) -> str:
-    """
-    Enlève les 1-3 premières lignes si elles répètent juste le titre ("4.4 ..." + intitulé).
-    """
     t = _clean_section_text(text)
     if not t:
         return ""
-
     lines = t.split("\n")
     cleaned: List[str] = []
-
     head_pat = re.compile(rf"^\s*{major}\s*\.\s*{minor}\s*(?:\.)?\s*", re.IGNORECASE)
-    # enlève aussi lignes qui sont exactement l'intitulé (souvent répété)
-    # on ne connait pas l'intitulé exact -> heuristique: lignes très courtes sans ponctuation
-    drop_count = 0
+
     for i, ln in enumerate(lines):
         ln_stripped = ln.strip()
         if i < 4:
             if head_pat.search(ln_stripped):
-                drop_count += 1
                 continue
-            # ligne très courte, pas de ponctuation => probable "Mises en garde..." etc.
             if len(ln_stripped) <= 90 and sum(ln_stripped.count(x) for x in [".", ";", ":", "!", "?"]) == 0:
-                # mais on évite de supprimer une vraie phrase courte
                 if not re.search(r"\b(?:chez|patients|traitement|posologie|dose|contre-indiqu|risque|surveillance)\b",
                                  ln_stripped, flags=re.IGNORECASE):
-                    drop_count += 1
                     continue
         cleaned.append(ln)
 
-    # si on a trop agressif et qu'il ne reste rien, on garde l'original
     out = "\n".join(cleaned).strip()
     return out if out else t
 
 def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tuple[int, int]]) -> str:
-    """
-    Très important :
-    La page BDPM contient souvent une table des matières avec "4.4 ..." puis "4.5 ..."
-    AVANT le vrai contenu.
-    => On cherche TOUS les occurrences de "4.4" et on garde celle qui produit le plus de contenu.
-    """
     if not raw:
         return ""
 
     t = raw.replace("\xa0", " ")
     t = t.replace("\r", "\n")
-    # garde les retours ligne (utile), mais évite explosion d'espaces
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
 
-    # Début / fin (on accepte titres cassés avec espaces)
     start_pat = re.compile(rf"(?:^|\b){major}\s*\.\s*{minor}\s*(?:\.)?\s*", re.IGNORECASE)
-    end_pats = [rf"(?:^|\b){emj}\s*\.\s*{emn}\s*(?:\.)?\s*" for emj, emn in end_markers цикл: List[str] = []
-    # (petite protection : la partie 5.* peut parfois être captée en fin)
+
+    end_pats = [rf"(?:^|\b){emj}\s*\.\s*{emn}\s*(?:\.)?\s*" for emj, emn in end_markers]
     end_pats += [r"(?:^|\b)5\s*\.\s*\d{1,2}\s*(?:\.)?\s*"]
     end_re = re.compile(rf"(?:{'|'.join(end_pats)})", re.IGNORECASE)
 
-    # On travaille en "flat" pour que les titres cassés matchent aussi
     flat = re.sub(r"\s+", " ", t).strip()
 
     starts = [m.start() for m in start_pat.finditer(flat)]
@@ -343,20 +313,16 @@ def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tu
         tail = flat[content_start:]
         m_end = end_re.search(tail)
         block = tail[:m_end.start()] if m_end else tail
-
         block = block.strip()
         if not block:
             continue
 
-        # Nettoyage & suppression des titres répétés en tête
         cleaned = _strip_leading_heading_lines(block, major, minor)
         cleaned = _clean_section_text(cleaned)
 
-        # jette les "table des matières" (souvent juste 2 lignes)
         if _looks_like_title_only(cleaned):
             continue
 
-        # score = longueur + diversité
         score = len(cleaned)
         if score > best_len:
             best = cleaned
@@ -365,17 +331,11 @@ def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tu
     return best.strip()
 
 def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
-    """
-    Extraction depuis le HTML BDPM (onglet RCP).
-    On récupère le texte complet, puis on utilise _extract_section_best
-    pour éviter la table des matières.
-    """
     if not html:
         return {}
 
     soup = BeautifulSoup(html, _bs_parser())
 
-    # IMPORTANT: get_text() capte aussi la table des matières (liens/ancres)
     raw = soup.get_text("\n")
     raw = raw.replace("\r", "\n").replace("\xa0", " ")
     raw = re.sub(r"[ \t]+", " ", raw)
@@ -403,10 +363,6 @@ def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
     return out
 
 def format_interactions_field(sec44: str, sec45: str) -> str:
-    """
-    Tu veux le CONTENU.
-    Ici on met un seul titre par rubrique + le contenu (sans répétitions).
-    """
     sec44 = safe_text(sec44)
     sec45 = safe_text(sec45)
 
@@ -1093,7 +1049,6 @@ class AirtableClient:
 
     def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
         requested_fields = list(fields) if fields else None
-
         while True:
             out: List[dict] = []
             params = {}
@@ -1505,16 +1460,6 @@ def main():
             at.update_records(updates)
             ok(f"Batch updates: {len(updates)}")
             updates = []
-
-        if idx % 1000 == 0:
-            elapsed = time.time() - start
-            rate = idx / elapsed if elapsed > 0 else 0
-            remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
-            info(
-                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} | rcp checks={rcp_checks} | rcp added={rcp_added} "
-                f"| ATC added={atc_added} | info importante added={info_added} | reste ~{int(remaining)}s"
-            )
 
     if updates:
         at.update_records(updates)
