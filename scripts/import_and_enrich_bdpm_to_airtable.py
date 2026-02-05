@@ -27,24 +27,15 @@ except Exception:
 # CONFIG
 # ============================================================
 
-# BDPM (TXT)
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
-
-# BDPM "Médicaments d'intérêt thérapeutique majeur" (CIS -> ATC)
 BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
-
-# BDPM "Informations importantes" (génération en direct) (CIS -> URL info importante)
 BDPM_INFO_IMPORTANTES_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/CIS_InfoImportantes.txt"
-
-# Page BDPM pour fiche-info (HTML)
 BDPM_DOC_EXTRACT_URL = "https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
-# ANSM rétrocession
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
-# Airtable
 AIRTABLE_API_BASE = "https://api.airtable.com/v0"
 AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))
 AIRTABLE_BATCH_SIZE = 10
@@ -60,7 +51,6 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
 HEADERS_WEB = {
@@ -70,7 +60,7 @@ HEADERS_WEB = {
 }
 
 # ============================================================
-# AIRTABLE FIELDS (adapte ici si besoin)
+# AIRTABLE FIELDS
 # ============================================================
 
 FIELD_CIS = "Code cis"
@@ -86,21 +76,17 @@ FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
 FIELD_COMPOSITION = "Composition"        # champ à écrire
-FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
-FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
+FIELD_COMPOSITION_DETAILS = "Composition détails"
+FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"
 
-# ✅ Champs RCP à remplir
+# Champs RCP à remplir (CONTENU)
 FIELD_INTERACTIONS_RCP = "Interactions RCP"
 FIELD_INDICATIONS_RCP = "Indications RCP"
 FIELD_POSOLOGIE_RCP = "Posologie RCP"
 
-# ✅ Timestamp de revue
-FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
+FIELD_DATE_REVUE = "Date revue ligne"
 
-# règle absolue : ne jamais écrire ces champs (computed)
-DO_NOT_WRITE_FIELDS: Set[str] = {
-    FIELD_ATC4,
-}
+DO_NOT_WRITE_FIELDS: Set[str] = {FIELD_ATC4}
 
 # ============================================================
 # LOG
@@ -182,10 +168,7 @@ def strip_accents(s: str) -> str:
     s = safe_text(s)
     if not s:
         return ""
-    return "".join(
-        c for c in unicodedata.normalize("NFD", s)
-        if unicodedata.category(c) != "Mn"
-    )
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def normalize_ws_keep_lines(s: str) -> str:
     s = safe_text(s)
@@ -232,10 +215,14 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# EXTRACTION SECTIONS RCP (4.1 / 4.2 / 4.4 / 4.5) - ULTRA ROBUSTE
+# EXTRACTION SECTIONS RCP (VRAI CONTENU, PAS TABLE DES MATIERES)
 # ============================================================
 
-def _clean_section_text(s: str, max_chars: int = 15000) -> str:
+# Pour reconnaître et jeter une "table des matières" qui n'est que des titres
+_TITLE_ONLY_MIN_WORDS = 10
+_TITLE_ONLY_MAX_CHARS = 240
+
+def _clean_section_text(s: str, max_chars: int = 20000) -> str:
     s = normalize_ws_keep_lines(safe_text(s))
     if not s:
         return ""
@@ -252,112 +239,191 @@ def _clean_section_text(s: str, max_chars: int = 15000) -> str:
         out.append(ln)
         last = ln
     s2 = "\n".join(out).strip()
+
+    # Tronquage sécurité
     if len(s2) > max_chars:
         s2 = s2[:max_chars].rstrip() + "\n\n[Texte tronqué]"
     return s2
 
-def _extract_section_by_regex(raw: str, major: int, minor: int, end_markers: List[Tuple[int, int]]) -> str:
+def _looks_like_title_only(text: str) -> bool:
     """
-    Extraction robuste en 2 passes:
-    1) mode "lignes" (titre au début d'une ligne)
-    2) mode "flat text" (titre peut être coupé / retours ligne aléatoires)
+    True si le texte ressemble juste à des titres répétés (cas table des matières).
+    """
+    t = safe_text(text)
+    if not t:
+        return True
+    if len(t) <= _TITLE_ONLY_MAX_CHARS:
+        # très court -> souvent TDM
+        # si en plus peu de mots -> quasi sûr
+        words = re.findall(r"\w+", t, flags=re.UNICODE)
+        if len(words) <= _TITLE_ONLY_MIN_WORDS:
+            return True
+
+    # Si on voit des numéros de sections très rapprochés et presque pas de phrases (peu de ponctuation)
+    punct = sum(t.count(x) for x in [".", ";", ":", "!", "?", "—"])
+    if punct <= 2 and len(t) < 400:
+        return True
+
+    return False
+
+def _strip_leading_heading_lines(text: str, major: int, minor: int) -> str:
+    """
+    Enlève les 1-3 premières lignes si elles répètent juste le titre ("4.4 ..." + intitulé).
+    """
+    t = _clean_section_text(text)
+    if not t:
+        return ""
+
+    lines = t.split("\n")
+    cleaned: List[str] = []
+
+    head_pat = re.compile(rf"^\s*{major}\s*\.\s*{minor}\s*(?:\.)?\s*", re.IGNORECASE)
+    # enlève aussi lignes qui sont exactement l'intitulé (souvent répété)
+    # on ne connait pas l'intitulé exact -> heuristique: lignes très courtes sans ponctuation
+    drop_count = 0
+    for i, ln in enumerate(lines):
+        ln_stripped = ln.strip()
+        if i < 4:
+            if head_pat.search(ln_stripped):
+                drop_count += 1
+                continue
+            # ligne très courte, pas de ponctuation => probable "Mises en garde..." etc.
+            if len(ln_stripped) <= 90 and sum(ln_stripped.count(x) for x in [".", ";", ":", "!", "?"]) == 0:
+                # mais on évite de supprimer une vraie phrase courte
+                if not re.search(r"\b(?:chez|patients|traitement|posologie|dose|contre-indiqu|risque|surveillance)\b",
+                                 ln_stripped, flags=re.IGNORECASE):
+                    drop_count += 1
+                    continue
+        cleaned.append(ln)
+
+    # si on a trop agressif et qu'il ne reste rien, on garde l'original
+    out = "\n".join(cleaned).strip()
+    return out if out else t
+
+def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tuple[int, int]]) -> str:
+    """
+    Très important :
+    La page BDPM contient souvent une table des matières avec "4.4 ..." puis "4.5 ..."
+    AVANT le vrai contenu.
+    => On cherche TOUS les occurrences de "4.4" et on garde celle qui produit le plus de contenu.
     """
     if not raw:
         return ""
 
-    # ---------- PASS 1: lignes ----------
-    start_re_line = rf"(?m)^\s*{major}\s*\.\s*{minor}\s*(?:\.)?\s+.*$"
-    end_parts_line = [rf"{emj}\s*\.\s*{emn}\s*(?:\.)?\s+" for emj, emn in end_markers]
-    end_parts_line += [r"5\s*\.\s*\d{1,2}\s*(?:\.)?\s+", r"5\s*(?:[\.\-])\s+\S+"]
-    end_re_line = rf"(?m)^\s*(?:{'|'.join(end_parts_line)})"
-
-    m = re.search(start_re_line, raw)
-    if m:
-        start_pos = m.end()
-        m2 = re.search(end_re_line, raw[start_pos:])
-        block = raw[start_pos:start_pos + m2.start()] if m2 else raw[start_pos:]
-        out = _clean_section_text(block)
-        if out:
-            return out
-
-    # ---------- PASS 2: flat text ----------
-    t = safe_text(raw)
-    if not t:
-        return ""
-
-    t = t.replace("\xa0", " ")
-    t = re.sub(r"[ \t]+", " ", t)
+    t = raw.replace("\xa0", " ")
     t = t.replace("\r", "\n")
-    t = re.sub(r"\n{2,}", "\n", t)
+    # garde les retours ligne (utile), mais évite explosion d'espaces
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
 
+    # Début / fin (on accepte titres cassés avec espaces)
+    start_pat = re.compile(rf"(?:^|\b){major}\s*\.\s*{minor}\s*(?:\.)?\s*", re.IGNORECASE)
+    end_pats = [rf"(?:^|\b){emj}\s*\.\s*{emn}\s*(?:\.)?\s*" for emj, emn in end_markers цикл: List[str] = []
+    # (petite protection : la partie 5.* peut parfois être captée en fin)
+    end_pats += [r"(?:^|\b)5\s*\.\s*\d{1,2}\s*(?:\.)?\s*"]
+    end_re = re.compile(rf"(?:{'|'.join(end_pats)})", re.IGNORECASE)
+
+    # On travaille en "flat" pour que les titres cassés matchent aussi
     flat = re.sub(r"\s+", " ", t).strip()
 
-    start_pat = rf"\b{major}\s*\.\s*{minor}\s*(?:\.)?\s*"
-    end_pats = [rf"\b{emj}\s*\.\s*{emn}\s*(?:\.)?\s*" for emj, emn in end_markers]
-    end_pats += [r"\b5\s*\.\s*\d{1,2}\s*(?:\.)?\s*", r"\b5\s*\.\s*"]
-    end_pat = rf"(?:{'|'.join(end_pats)})"
-
-    m3 = re.search(start_pat, flat)
-    if not m3:
+    starts = [m.start() for m in start_pat.finditer(flat)]
+    if not starts:
         return ""
 
-    start_pos = m3.end()
-    m4 = re.search(end_pat, flat[start_pos:])
-    block2 = flat[start_pos:start_pos + m4.start()] if m4 else flat[start_pos:]
-    block2 = block2.strip()
-    if not block2:
-        return ""
+    best = ""
+    best_len = 0
 
-    return _clean_section_text(block2)
+    for s_pos in starts:
+        after = flat[s_pos:]
+        m_start = start_pat.search(after)
+        if not m_start:
+            continue
+        content_start = s_pos + m_start.end()
+
+        tail = flat[content_start:]
+        m_end = end_re.search(tail)
+        block = tail[:m_end.start()] if m_end else tail
+
+        block = block.strip()
+        if not block:
+            continue
+
+        # Nettoyage & suppression des titres répétés en tête
+        cleaned = _strip_leading_heading_lines(block, major, minor)
+        cleaned = _clean_section_text(cleaned)
+
+        # jette les "table des matières" (souvent juste 2 lignes)
+        if _looks_like_title_only(cleaned):
+            continue
+
+        # score = longueur + diversité
+        score = len(cleaned)
+        if score > best_len:
+            best = cleaned
+            best_len = score
+
+    return best.strip()
 
 def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
+    """
+    Extraction depuis le HTML BDPM (onglet RCP).
+    On récupère le texte complet, puis on utilise _extract_section_best
+    pour éviter la table des matières.
+    """
     if not html:
         return {}
 
     soup = BeautifulSoup(html, _bs_parser())
 
+    # IMPORTANT: get_text() capte aussi la table des matières (liens/ancres)
     raw = soup.get_text("\n")
     raw = raw.replace("\r", "\n").replace("\xa0", " ")
     raw = re.sub(r"[ \t]+", " ", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
 
-    if not raw or len(raw) < 50:
+    if not raw or len(raw) < 200:
         return {}
 
     out: Dict[str, str] = {}
 
-    ind = _extract_section_by_regex(raw, 4, 1, end_markers=[(4, 2), (4, 3)])
-    poso = _extract_section_by_regex(raw, 4, 2, end_markers=[(4, 3), (4, 4)])
-    mg = _extract_section_by_regex(raw, 4, 4, end_markers=[(4, 5), (4, 6)])
-    inter = _extract_section_by_regex(raw, 4, 5, end_markers=[(4, 6), (4, 7)])
+    ind = _extract_section_best(raw, 4, 1, end_markers=[(4, 2), (4, 3)])
+    poso = _extract_section_best(raw, 4, 2, end_markers=[(4, 3), (4, 4)])
+    sec44 = _extract_section_best(raw, 4, 4, end_markers=[(4, 5), (4, 6)])
+    sec45 = _extract_section_best(raw, 4, 5, end_markers=[(4, 6), (4, 7)])
 
     if ind:
         out["indications_4_1"] = ind
     if poso:
         out["posologie_4_2"] = poso
-    if mg:
-        out["mises_en_garde_4_4"] = mg
-    if inter:
-        out["interactions_4_5"] = inter
+    if sec44:
+        out["mises_en_garde_4_4"] = sec44
+    if sec45:
+        out["interactions_4_5"] = sec45
 
     return out
 
 def format_interactions_field(sec44: str, sec45: str) -> str:
+    """
+    Tu veux le CONTENU.
+    Ici on met un seul titre par rubrique + le contenu (sans répétitions).
+    """
     sec44 = safe_text(sec44)
     sec45 = safe_text(sec45)
-    blocks = []
-    if sec44:
+
+    blocks: List[str] = []
+    if sec44 and not _looks_like_title_only(sec44):
         blocks.append("4.4. Mises en garde spéciales et précautions d'emploi\n" + sec44)
-    if sec45:
+    if sec45 and not _looks_like_title_only(sec45):
         blocks.append("4.5. Interactions avec d'autres médicaments et autres formes d'interactions\n" + sec45)
+
     return _clean_section_text("\n\n".join(blocks)).strip()
 
 # ============================================================
 # ATC HELPERS
 # ============================================================
 
-ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
-ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
+ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")
+ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")
 
 def canonical_atc7(raw: str) -> str:
     if not raw:
@@ -1148,15 +1214,15 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,        # lecture
-        FIELD_ATC_LABEL,   # écriture possible
-        FIELD_COMPOSITION, # écriture
-        FIELD_COMPOSITION_DETAILS, # écriture
-        FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
-        FIELD_INTERACTIONS_RCP,     # lecture/écriture
-        FIELD_INDICATIONS_RCP,      # lecture/écriture
-        FIELD_POSOLOGIE_RCP,        # lecture/écriture
-        FIELD_DATE_REVUE,           # lecture/écriture
+        FIELD_ATC4,
+        FIELD_ATC_LABEL,
+        FIELD_COMPOSITION,
+        FIELD_COMPOSITION_DETAILS,
+        FIELD_LIEN_INFO_IMPORTANTE,
+        FIELD_INTERACTIONS_RCP,
+        FIELD_INDICATIONS_RCP,
+        FIELD_POSOLOGIE_RCP,
+        FIELD_DATE_REVUE,
     ]
 
     info("Inventaire Airtable ...")
@@ -1256,7 +1322,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + sections RCP ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC + composition + lien info importante + contenu RCP (4.1/4.2/4.4/4.5) ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1307,7 +1373,7 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # ✅ RCP
+        # ✅ CONTENU RCP
         cur_ind = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_poso = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_inter = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1320,6 +1386,7 @@ def main():
                 html_rcp = fetch_html_checked(rcp_url)
 
                 secs = extract_rcp_sections_from_rcp_html(html_rcp)
+
                 ind = secs.get("indications_4_1", "").strip()
                 poso = secs.get("posologie_4_2", "").strip()
                 inter = format_interactions_field(
@@ -1377,12 +1444,14 @@ def main():
             if label and label != cur_label:
                 upd_fields[FIELD_ATC_LABEL] = label
 
+        # Lien info importante
         cur_info_url = str(fields_cur.get(FIELD_LIEN_INFO_IMPORTANTE, "")).strip()
         new_info_url = cis_to_info_url.get(cis, "").strip()
         if new_info_url and new_info_url != cur_info_url:
             upd_fields[FIELD_LIEN_INFO_IMPORTANTE] = new_info_url
             info_added += 1
 
+        # Fiche-info
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
