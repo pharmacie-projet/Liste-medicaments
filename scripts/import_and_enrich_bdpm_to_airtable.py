@@ -18,6 +18,12 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
+# PDF text extraction (pour les RCP servis en PDF)
+try:
+    from pdfminer.high_level import extract_text as pdf_extract_text  # type: ignore
+except Exception:
+    pdf_extract_text = None  # noqa
+
 # Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
 try:
     import pandas as pd  # type: ignore
@@ -307,6 +313,35 @@ def extract_rcp_sections_from_html(html: str) -> Dict[str, str]:
         "4.2": _extract_section(lines, "4.2", stop_42),
         "4.5": _extract_section(lines, "4.5", stop_45),
     }
+
+def extract_rcp_sections_from_text(text: str) -> Dict[str, str]:
+    """
+    Même logique que extract_rcp_sections_from_html, mais à partir d'un texte déjà extrait (HTML ou PDF).
+    """
+    text = safe_text(text)
+    if not text:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    # On transforme en lignes, en gardant les retours
+    lines: List[str] = []
+    for ln in text.split("\n"):
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+
+    if not lines:
+        return {"4.1": "", "4.2": "", "4.5": ""}
+
+    stop_41 = re.compile(r"^\s*(?:4\.2(?:\b|[\.\-:])|5\.)")
+    stop_42 = re.compile(r"^\s*(?:4\.[3-9](?:\b|[\.\-:])|5\.)")
+    stop_45 = re.compile(r"^\s*(?:4\.[6-9](?:\b|[\.\-:])|5\.)")
+
+    return {
+        "4.1": _extract_section(lines, "4.1", stop_41),
+        "4.2": _extract_section(lines, "4.2", stop_42),
+        "4.5": _extract_section(lines, "4.5", stop_45),
+    }
+
 
 # ============================================================
 # ATC HELPERS (pour lecture fichiers)
@@ -874,6 +909,97 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
             time.sleep(1.0 * attempt)
     raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
 
+
+def fetch_bytes_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT), max_retries: int = 3) -> Tuple[bytes, str]:
+    """
+    Retourne (content_bytes, content_type). Gère 404/4xx de manière similaire à fetch_html_checked.
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS_WEB, timeout=timeout, allow_redirects=True)
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code == 404:
+                raise PageUnavailable(url, 404, "HTTP 404")
+            if r.status_code >= 400:
+                raise PageUnavailable(url, r.status_code, f"HTTP {r.status_code}")
+            content = r.content or b""
+            if len(content) < 200:
+                raise PageUnavailable(url, r.status_code, "Contenu vide/trop court")
+            return content, ct
+        except PageUnavailable:
+            raise
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0 * attempt)
+    raise PageUnavailable(url, None, f"Erreur réseau: {last_err}")
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    if not pdf_bytes:
+        return ""
+    if pdf_extract_text is None:
+        # pdfminer non dispo: on ne peut pas extraire
+        return ""
+    import io
+    try:
+        # pdfminer accepte un file-like via BytesIO
+        return safe_text(pdf_extract_text(io.BytesIO(pdf_bytes)))
+    except Exception:
+        return ""
+
+_PDF_HINT_RE = re.compile(r"\.pdf(?:$|\?)", re.IGNORECASE)
+
+def get_rcp_text(cis: str, rcp_url: str) -> Tuple[str, str]:
+    """
+    Retourne (texte, source_kind) où source_kind ∈ {"pdf","html","html_iframe_pdf","html_link_pdf","unknown"}.
+    - Si rcp_url renvoie un PDF -> extraction pdf
+    - Si rcp_url renvoie HTML contenant iframe/pdf -> extraction pdf depuis iframe
+    - Sinon -> extraction texte depuis HTML
+    """
+    # 1) Essai direct
+    content, ct = fetch_bytes_checked(rcp_url)
+    if "application/pdf" in ct or _PDF_HINT_RE.search(rcp_url):
+        txt = extract_text_from_pdf_bytes(content)
+        return txt, "pdf"
+
+    html = ""
+    try:
+        html = content.decode("utf-8", errors="ignore")
+    except Exception:
+        html = ""
+
+    # 2) Si HTML contient un iframe vers PDF
+    if html:
+        soup = BeautifulSoup(html, _bs_parser())
+        # iframe/src/object/data
+        for tag, attr in [("iframe","src"),("object","data"),("embed","src")]:
+            for el in soup.find_all(tag):
+                v = (el.get(attr) or "").strip()
+                if v and (_PDF_HINT_RE.search(v) or "application/pdf" in v.lower()):
+                    if v.startswith("/"):
+                        v = "https://base-donnees-publique.medicaments.gouv.fr" + v
+                    pdf_bytes, pdf_ct = fetch_bytes_checked(v, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
+                    if "application/pdf" in pdf_ct or _PDF_HINT_RE.search(v):
+                        txt = extract_text_from_pdf_bytes(pdf_bytes)
+                        return txt, "html_iframe_pdf"
+
+        # 3) liens <a href="...pdf">
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            if _PDF_HINT_RE.search(href):
+                if href.startswith("/"):
+                    href = "https://base-donnees-publique.medicaments.gouv.fr" + href
+                pdf_bytes, pdf_ct = fetch_bytes_checked(href, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
+                if "application/pdf" in pdf_ct or _PDF_HINT_RE.search(href):
+                    txt = extract_text_from_pdf_bytes(pdf_bytes)
+                    return txt, "html_link_pdf"
+
+        # 4) fallback: texte HTML
+        return safe_text(soup.get_text("\n", strip=True)), "html"
+
+    return "", "unknown"
 def detect_homeopathy_from_fiche_info(soup: BeautifulSoup) -> bool:
     text = soup.get_text("\n", strip=True)
     return bool(HOMEOPATHY_PAT.search(text) or HOMEOPATHY_CLASS_PAT.search(text))
@@ -1316,7 +1442,7 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-                                # ✅ RCP: extraction sections 4.1/4.2/4.5
+                                        # ✅ RCP: extraction sections 4.1/4.2/4.5 (HTML ou PDF)
         cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1331,29 +1457,33 @@ def main():
 
             try:
                 rcp_checks += 1
-                html_rcp = fetch_html_checked(rcp_url)
-                sections = extract_rcp_sections_from_html(html_rcp)
+                rcp_text, rcp_kind = get_rcp_text(cis, rcp_url)
 
-                sec41 = sections.get("4.1", "").strip()
-                sec42 = sections.get("4.2", "").strip()
-                sec45 = sections.get("4.5", "").strip()
-
-                if not sec41 and not sec42 and not sec45:
+                if not rcp_text or len(rcp_text) < 200:
                     rcp_sections_empty += 1
+                else:
+                    sections = extract_rcp_sections_from_text(rcp_text)
 
-                changed = False
-                if sec41 and sec41 != cur_41:
-                    upd_fields[FIELD_INDICATIONS_RCP] = sec41
-                    changed = True
-                if sec42 and sec42 != cur_42:
-                    upd_fields[FIELD_POSOLOGIE_RCP] = sec42
-                    changed = True
-                if sec45 and sec45 != cur_45:
-                    upd_fields[FIELD_INTERACTIONS_RCP] = sec45
-                    changed = True
+                    sec41 = sections.get("4.1", "").strip()
+                    sec42 = sections.get("4.2", "").strip()
+                    sec45 = sections.get("4.5", "").strip()
 
-                if changed:
-                    rcp_sections_updated += 1
+                    if not sec41 and not sec42 and not sec45:
+                        rcp_sections_empty += 1
+
+                    changed = False
+                    if sec41 and sec41 != cur_41:
+                        upd_fields[FIELD_INDICATIONS_RCP] = sec41
+                        changed = True
+                    if sec42 and sec42 != cur_42:
+                        upd_fields[FIELD_POSOLOGIE_RCP] = sec42
+                        changed = True
+                    if sec45 and sec45 != cur_45:
+                        upd_fields[FIELD_INTERACTIONS_RCP] = sec45
+                        changed = True
+
+                    if changed:
+                        rcp_sections_updated += 1
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
