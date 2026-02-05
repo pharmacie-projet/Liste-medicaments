@@ -27,17 +27,24 @@ except Exception:
 # CONFIG
 # ============================================================
 
+# BDPM (TXT)
 BDPM_CIS_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
 BDPM_CIS_CIP_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_CIP_bdpm.txt"
 BDPM_COMPO_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_COMPO_bdpm.txt"
 
+# BDPM "Médicaments d'intérêt thérapeutique majeur" (CIS -> ATC)
 BDPM_MITM_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_MITM.txt"
+
+# BDPM "Informations importantes" (génération en direct) (CIS -> URL info importante)
 BDPM_INFO_IMPORTANTES_URL = "https://base-donnees-publique.medicaments.gouv.fr/download/CIS_InfoImportantes.txt"
 
+# Page BDPM pour fiche-info (HTML)
 BDPM_DOC_EXTRACT_URL = "https://base-donnees-publique.medicaments.gouv.fr/medicament/{cis}/extrait"
 
+# ANSM rétrocession
 ANSM_RETRO_PAGE = "https://ansm.sante.fr/documents/reference/medicaments-en-retrocession"
 
+# Airtable
 AIRTABLE_API_BASE = "https://api.airtable.com/v0"
 AIRTABLE_MIN_DELAY_S = float(os.getenv("AIRTABLE_MIN_DELAY_S", "0.25"))
 AIRTABLE_BATCH_SIZE = 10
@@ -53,6 +60,7 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
+# Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
 HEADERS_WEB = {
@@ -62,7 +70,7 @@ HEADERS_WEB = {
 }
 
 # ============================================================
-# AIRTABLE FIELDS
+# AIRTABLE FIELDS (adapte ici si besoin)
 # ============================================================
 
 FIELD_CIS = "Code cis"
@@ -78,17 +86,21 @@ FIELD_ATC = "Code ATC"
 FIELD_ATC4 = "Code ATC (niveau 4)"      # computed -> lecture seulement
 FIELD_ATC_LABEL = "Libellé ATC"          # champ à écrire
 FIELD_COMPOSITION = "Composition"        # champ à écrire
-FIELD_COMPOSITION_DETAILS = "Composition détails"
-FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"
+FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire
+FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
-# Champs RCP à remplir (CONTENU)
+# ✅ RCP content fields
 FIELD_INTERACTIONS_RCP = "Interactions RCP"
 FIELD_INDICATIONS_RCP = "Indications RCP"
 FIELD_POSOLOGIE_RCP = "Posologie RCP"
 
-FIELD_DATE_REVUE = "Date revue ligne"
+# ✅ timestamp de revue
+FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
 
-DO_NOT_WRITE_FIELDS: Set[str] = {FIELD_ATC4}
+# règle absolue : ne jamais écrire ces champs (computed)
+DO_NOT_WRITE_FIELDS: Set[str] = {
+    FIELD_ATC4,
+}
 
 # ============================================================
 # LOG
@@ -121,6 +133,7 @@ def retry_sleep(attempt: int):
 # ============================================================
 
 def now_paris_iso_seconds() -> str:
+    # ISO 8601 avec timezone Europe/Paris (Airtable l'accepte très bien pour un champ Date/Date+Heure)
     return datetime.now(ZoneInfo("Europe/Paris")).isoformat(timespec="seconds")
 
 # ============================================================
@@ -170,7 +183,10 @@ def strip_accents(s: str) -> str:
     s = safe_text(s)
     if not s:
         return ""
-    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
 
 def normalize_ws_keep_lines(s: str) -> str:
     s = safe_text(s)
@@ -217,7 +233,9 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# EXTRACTION SECTIONS RCP (CONTENU)
+# EXTRACTION SECTIONS RCP (CONTENU ROBUSTE)
+# - Ne détecte les rubriques que si elles sont en début de ligne
+#   => évite les faux positifs "voir rubrique 4.2"
 # ============================================================
 
 _TITLE_ONLY_MIN_WORDS = 10
@@ -267,12 +285,15 @@ def _strip_leading_heading_lines(text: str, major: int, minor: int) -> str:
 
     for i, ln in enumerate(lines):
         ln_stripped = ln.strip()
-        if i < 4:
+        if i < 3:
             if head_pat.search(ln_stripped):
                 continue
-            if len(ln_stripped) <= 90 and sum(ln_stripped.count(x) for x in [".", ";", ":", "!", "?"]) == 0:
-                if not re.search(r"\b(?:chez|patients|traitement|posologie|dose|contre-indiqu|risque|surveillance)\b",
-                                 ln_stripped, flags=re.IGNORECASE):
+            if len(ln_stripped) <= 70 and not re.search(
+                r"\b(est|sont|doit|doivent|administr|prendre|utilis|trait|surveillance|risque|patients|posologie|dose)\b",
+                ln_stripped,
+                re.IGNORECASE
+            ):
+                if re.fullmatch(r"[\d\.\sA-Za-zÀ-ÿ'’\-()]+", ln_stripped):
                     continue
         cleaned.append(ln)
 
@@ -280,37 +301,42 @@ def _strip_leading_heading_lines(text: str, major: int, minor: int) -> str:
     return out if out else t
 
 def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tuple[int, int]]) -> str:
+    """
+    Extrait une rubrique RCP (ex 4.2) en ne reconnaissant les numéros
+    QUE s'ils apparaissent comme titres en début de ligne.
+    Évite les faux positifs du type: "voir rubrique 4.2".
+    """
     if not raw:
         return ""
 
     t = raw.replace("\xa0", " ")
     t = t.replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if not t:
+        return ""
 
-    start_pat = re.compile(rf"(?:^|\b){major}\s*\.\s*{minor}\s*(?:\.)?\s*", re.IGNORECASE)
+    # Titre en début de ligne (multiline)
+    start_re = re.compile(rf"(?m)^\s*{major}\s*\.\s*{minor}\s*(?:\.)?\s*(.*)$")
 
-    end_pats = [rf"(?:^|\b){emj}\s*\.\s*{emn}\s*(?:\.)?\s*" for emj, emn in end_markers]
-    end_pats += [r"(?:^|\b)5\s*\.\s*\d{1,2}\s*(?:\.)?\s*"]
-    end_re = re.compile(rf"(?:{'|'.join(end_pats)})", re.IGNORECASE)
+    # Fin = prochaine rubrique (titre en début de ligne)
+    end_nums = list(end_markers) + [(5, i) for i in range(1, 11)]
+    end_alt = "|".join([rf"{mj}\s*\.\s*{mn}\s*(?:\.)?\s*" for mj, mn in end_nums])
+    end_re = re.compile(rf"(?m)^\s*(?:{end_alt}).*$")
 
-    flat = re.sub(r"\s+", " ", t).strip()
-
-    starts = [m.start() for m in start_pat.finditer(flat)]
+    starts = list(start_re.finditer(t))
     if not starts:
         return ""
 
     best = ""
     best_len = 0
 
-    for s_pos in starts:
-        after = flat[s_pos:]
-        m_start = start_pat.search(after)
-        if not m_start:
-            continue
-        content_start = s_pos + m_start.end()
+    for m in starts:
+        line_end = t.find("\n", m.end())
+        content_start = (line_end + 1) if line_end != -1 else m.end()
 
-        tail = flat[content_start:]
+        tail = t[content_start:]
+
         m_end = end_re.search(tail)
         block = tail[:m_end.start()] if m_end else tail
         block = block.strip()
@@ -323,10 +349,9 @@ def _extract_section_best(raw: str, major: int, minor: int, end_markers: List[Tu
         if _looks_like_title_only(cleaned):
             continue
 
-        score = len(cleaned)
-        if score > best_len:
+        if len(cleaned) > best_len:
             best = cleaned
-            best_len = score
+            best_len = len(cleaned)
 
     return best.strip()
 
@@ -335,8 +360,8 @@ def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
         return {}
 
     soup = BeautifulSoup(html, _bs_parser())
-
     raw = soup.get_text("\n")
+
     raw = raw.replace("\r", "\n").replace("\xa0", " ")
     raw = re.sub(r"[ \t]+", " ", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
@@ -375,11 +400,11 @@ def format_interactions_field(sec44: str, sec45: str) -> str:
     return _clean_section_text("\n\n".join(blocks)).strip()
 
 # ============================================================
-# ATC HELPERS
+# ATC HELPERS (pour lecture fichiers)
 # ============================================================
 
-ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")
-ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")
+ATC7_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}\d{2}$")  # ex A11CA01
+ATC5_PAT = re.compile(r"^[A-Z]\d{2}[A-Z]{2}$")       # ex A11CA
 
 def canonical_atc7(raw: str) -> str:
     if not raw:
@@ -780,6 +805,12 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
 # ============================================================
 
 def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
+    """
+    Parse le fichier CIS_MITM.txt.
+    Robuste:
+    - récupère le premier CIS (8 chiffres)
+    - récupère le premier ATC7 valide
+    """
     cis_to_atc: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -804,6 +835,11 @@ def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
 _URL_PAT = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
 
 def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
+    """
+    Parse CIS_InfoImportantes.txt.
+    - trouve un CIS (8 chiffres)
+    - trouve une URL
+    """
     cis_to_url: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -829,6 +865,7 @@ def base_extrait_url_from_cis(cis: str) -> str:
     return BDPM_DOC_EXTRACT_URL.format(cis=cis)
 
 def set_tab(url: str, cis_fallback: str, tab: str) -> str:
+    """Force tab=... dans query ET fragment, compatible BDPM (#tab=...)."""
     if not url or not url.startswith("http"):
         url = base_extrait_url_from_cis(cis_fallback)
     parts = urllib.parse.urlsplit(url)
@@ -849,7 +886,7 @@ def rcp_link_default(cis: str) -> str:
     return f"{base_extrait_url_from_cis(cis)}#tab=rcp"
 
 # ============================================================
-# FICHE-INFO SCRAPING
+# FICHE-INFO SCRAPING (CPD/dispo)
 # ============================================================
 
 HOMEOPATHY_PAT = re.compile(r"hom[ée]opath(?:ie|ique)", flags=re.IGNORECASE)
@@ -1048,7 +1085,12 @@ class AirtableClient:
         raise RuntimeError(f"Airtable request failed: {method} {url} / {last_err}")
 
     def list_all_records(self, fields: Optional[List[str]] = None) -> List[dict]:
+        """
+        ⚠️ Airtable renvoie HTTP 422 si un nom de champ est inconnu dans fields[].
+        Ici: on tente avec fields, et si 422 UNKNOWN_FIELD_NAME, on retire ce champ et on réessaie.
+        """
         requested_fields = list(fields) if fields else None
+
         while True:
             out: List[dict] = []
             params = {}
@@ -1169,11 +1211,11 @@ def main():
         FIELD_FORME,
         FIELD_VOIE,
         FIELD_ATC,
-        FIELD_ATC4,
-        FIELD_ATC_LABEL,
-        FIELD_COMPOSITION,
-        FIELD_COMPOSITION_DETAILS,
-        FIELD_LIEN_INFO_IMPORTANTE,
+        FIELD_ATC4,        # lecture
+        FIELD_ATC_LABEL,   # écriture possible
+        FIELD_COMPOSITION, # écriture
+        FIELD_COMPOSITION_DETAILS, # écriture
+        FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
         FIELD_INTERACTIONS_RCP,
         FIELD_INDICATIONS_RCP,
         FIELD_POSOLOGIE_RCP,
@@ -1199,6 +1241,7 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
+    # ✅ timestamp unique de la “revue” (même valeur pour toutes les lignes revues dans ce run)
     review_ts = now_paris_iso_seconds()
 
     # CREATE
@@ -1222,12 +1265,17 @@ def main():
             if cip and cip.cip13:
                 fields[FIELD_CIP13] = cip.cip13
 
+            # Composition
             compo = compo_map.get(cis, "").strip()
             if compo:
-                fields[FIELD_COMPOSITION_DETAILS] = compo
+                fields[FIELD_COMPOSITION_DETAILS] = compo  # accents uniquement
                 compo_no_acc = strip_accents(compo)
-                fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}" if (compo_no_acc and compo_no_acc.lower() not in compo.lower()) else compo
+                if compo_no_acc and compo_no_acc.lower() not in compo.lower():
+                    fields[FIELD_COMPOSITION] = f"{compo}\n{compo_no_acc}"
+                else:
+                    fields[FIELD_COMPOSITION] = compo
 
+            # ATC depuis MITM (si dispo)
             atc = cis_to_atc.get(cis, "").strip()
             if atc:
                 fields[FIELD_ATC] = atc
@@ -1237,11 +1285,12 @@ def main():
                     if label:
                         fields[FIELD_ATC_LABEL] = label
 
+            # URL info importante (si dispo)
             iu = cis_to_info_url.get(cis, "").strip()
             if iu:
                 fields[FIELD_LIEN_INFO_IMPORTANTE] = iu
 
-            fields.pop(FIELD_ATC4, None)
+            fields.pop(FIELD_ATC4, None)  # sécurité
             new_recs.append({"fields": fields})
 
         at.create_records(new_recs)
@@ -1277,7 +1326,7 @@ def main():
         all_cis = all_cis[:max_cis]
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
-    info("Enrichissement: fiche-info (CPD/dispo) + ATC + composition + lien info importante + contenu RCP (4.1/4.2/4.4/4.5) ...")
+    info("Enrichissement: fiche-info (CPD/dispo) + ATC via MITM + composition + lien info importante + contenu RCP ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
@@ -1305,8 +1354,11 @@ def main():
 
         fields_cur = rec.get("fields", {}) or {}
         upd_fields: Dict[str, object] = {}
+
+        # ✅ on marque toute ligne revue
         upd_fields[FIELD_DATE_REVUE] = review_ts
 
+        # infos BDPM CIS
         row = cis_map.get(cis)
         if row:
             labo = normalize_lab_name(row.titulaire)
@@ -1319,16 +1371,19 @@ def main():
             if safe_text(row.voie_admin) and str(fields_cur.get(FIELD_VOIE, "")).strip() != safe_text(row.voie_admin):
                 upd_fields[FIELD_VOIE] = safe_text(row.voie_admin)
 
+        # CIP
         cip = cip_map.get(cis)
-        if cip and cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
-            upd_fields[FIELD_CIP13] = cip.cip13
+        if cip:
+            if cip.cip13 and str(fields_cur.get(FIELD_CIP13, "")).strip() != cip.cip13:
+                upd_fields[FIELD_CIP13] = cip.cip13
 
+        # Lien RCP (si vide)
         link_rcp = str(fields_cur.get(FIELD_RCP, "")).strip()
         if not link_rcp:
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # ✅ CONTENU RCP
+        # --- CONTENU RCP : 4.1 / 4.2 / 4.4+4.5
         cur_ind = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_poso = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_inter = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1371,12 +1426,15 @@ def main():
         if new_compo:
             if new_compo != cur_compo_details:
                 upd_fields[FIELD_COMPOSITION_DETAILS] = new_compo
+
             new_no_acc = strip_accents(new_compo).strip()
-            final_compo = f"{new_compo}\n{new_no_acc}" if (new_no_acc and new_no_acc.lower() not in new_compo.lower()) else new_compo
+            final_compo = new_compo
+            if new_no_acc and new_no_acc.lower() not in new_compo.lower():
+                final_compo = f"{new_compo}\n{new_no_acc}"
             if final_compo != cur_compo:
                 upd_fields[FIELD_COMPOSITION] = final_compo
 
-        # ATC
+        # ATC: uniquement via MITM si vide
         cur_atc_raw = str(fields_cur.get(FIELD_ATC, "")).strip()
         if not cur_atc_raw:
             atc = cis_to_atc.get(cis, "").strip()
@@ -1391,6 +1449,7 @@ def main():
                         if label != cur_label:
                             upd_fields[FIELD_ATC_LABEL] = label
 
+        # Libellé ATC via ATC4 computed
         cur_atc4 = str(fields_cur.get(FIELD_ATC4, "")).strip()
         cur_label = str(fields_cur.get(FIELD_ATC_LABEL, "")).strip()
         if cur_atc4:
@@ -1399,14 +1458,14 @@ def main():
             if label and label != cur_label:
                 upd_fields[FIELD_ATC_LABEL] = label
 
-        # Lien info importante
+        # Lien vers information importante
         cur_info_url = str(fields_cur.get(FIELD_LIEN_INFO_IMPORTANTE, "")).strip()
         new_info_url = cis_to_info_url.get(cis, "").strip()
         if new_info_url and new_info_url != cur_info_url:
             upd_fields[FIELD_LIEN_INFO_IMPORTANTE] = new_info_url
             info_added += 1
 
-        # Fiche-info
+        # CPD + dispo via fiche-info
         fiche_url = set_tab(link_rcp, cis, "fiche-info")
         cur_cpd = str(fields_cur.get(FIELD_CPD, "")).strip()
         cur_dispo = str(fields_cur.get(FIELD_DISPO, "")).strip()
@@ -1449,17 +1508,28 @@ def main():
                     failures += 1
                     warn(f"Suppression Airtable impossible CIS={cis}: {de} (on continue)")
                 continue
+
             except Exception as e:
                 failures += 1
                 warn(f"Enrich KO CIS={cis}: {e} (on continue)")
 
-        upd_fields.pop(FIELD_ATC4, None)
+        upd_fields.pop(FIELD_ATC4, None)  # sécurité
         updates.append({"id": rec["id"], "fields": upd_fields})
 
         if len(updates) >= UPDATE_FLUSH_THRESHOLD:
             at.update_records(updates)
             ok(f"Batch updates: {len(updates)}")
             updates = []
+
+        if idx % 1000 == 0:
+            elapsed = time.time() - start
+            rate = idx / elapsed if elapsed > 0 else 0
+            remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
+            info(
+                f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
+                f"| fiche checks={fiche_checks} | rcp checks={rcp_checks} | rcp added={rcp_added} | "
+                f"ATC added={atc_added} | info importante added={info_added} | reste ~{int(remaining)}s"
+            )
 
     if updates:
         at.update_records(updates)
