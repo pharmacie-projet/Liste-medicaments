@@ -89,12 +89,12 @@ FIELD_COMPOSITION = "Composition"        # champ à écrire
 FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans ligne "sans accents")
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
-# ✅ NOUVEAU : champs RCP à remplir
-FIELD_INTERACTIONS_RCP = "Interactions RCP"
+# ✅ Champs RCP à remplir
+FIELD_INTERACTIONS_RCP = "Interaction RCP"
 FIELD_INDICATIONS_RCP = "Indications RCP"
 FIELD_POSOLOGIE_RCP = "Posologie RCP"
 
-# ✅ timestamp de revue
+# ✅ Timestamp de revue
 FIELD_DATE_REVUE = "Date revue ligne"    # champ à écrire
 
 # règle absolue : ne jamais écrire ces champs (computed)
@@ -133,6 +133,7 @@ def retry_sleep(attempt: int):
 # ============================================================
 
 def now_paris_iso_seconds() -> str:
+    # ISO 8601 avec timezone Europe/Paris (Airtable l'accepte très bien pour un champ Date/Date+Heure)
     return datetime.now(ZoneInfo("Europe/Paris")).isoformat(timespec="seconds")
 
 # ============================================================
@@ -232,80 +233,66 @@ def _bs_parser():
         return "html.parser"
 
 # ============================================================
-# EXTRACTION SECTIONS RCP (4.1 / 4.2 / 4.4 / 4.5)
+# EXTRACTION SECTIONS RCP (4.1 / 4.2 / 4.4 / 4.5) - ROBUSTE
 # ============================================================
 
-_HEADING_ANY_RE = re.compile(r"^\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*[\.\-]?\s*(.*)\s*$")
-
-def _normalize_line_for_match(line: str) -> str:
-    return strip_accents(line).lower().strip()
-
-def _is_section_heading(line: str, major: int, minor: int) -> bool:
-    """
-    Reconnaît des variantes du style:
-    - "4.1. Indications thérapeutiques"
-    - "4.1 Indications thérapeutiques"
-    - "4 . 1 . Indications..."
-    """
-    s = _normalize_line_for_match(line)
-    # garde-fou: certaines lignes contiennent "4.1." au milieu => on exige début
+def _clean_section_text(s: str, max_chars: int = 15000) -> str:
+    s = normalize_ws_keep_lines(safe_text(s))
     if not s:
-        return False
-    if not (s.startswith(f"{major}.{minor}") or s.startswith(f"{major} . {minor}")):
-        return False
-    # Vérifie qu'on a bien une structure type heading (pas un exemple avec date etc.)
-    m = _HEADING_ANY_RE.match(line)
+        return ""
+    # supprime répétitions de lignes identiques (certains RCP ont des duplications)
+    lines = [ln.strip() for ln in s.split("\n")]
+    out: List[str] = []
+    last = None
+    for ln in lines:
+        if not ln:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if ln == last:
+            continue
+        out.append(ln)
+        last = ln
+    s2 = "\n".join(out).strip()
+    if len(s2) > max_chars:
+        s2 = s2[:max_chars].rstrip() + "\n\n[Texte tronqué]"
+    return s2
+
+def _extract_section_by_regex(raw: str, major: int, minor: int, end_markers: List[Tuple[int, int]]) -> str:
+    """
+    Extraction robuste : capture tout ce qui est entre le titre X.Y et le prochain titre.
+    end_markers: liste de (major, minor) possibles pour la fin.
+    """
+    if not raw:
+        return ""
+
+    # Titre de départ : "4.1 ..." avec espaces/points variables
+    start_re = rf"(?m)^\s*{major}\s*\.\s*{minor}\s*(?:[\.\-])?\s+.*$"
+
+    # Titre de fin : prochain titre plausible
+    end_parts = []
+    for emj, emn in end_markers:
+        end_parts.append(rf"{emj}\s*\.\s*{emn}\s*(?:[\.\-])?\s+")
+
+    # Arrêts si on passe au chapitre 5 (souvent après 4.x)
+    end_parts.append(r"5\s*\.\s*\d{1,2}\s*(?:[\.\-])?\s+")
+    end_parts.append(r"5\s*(?:[\.\-])\s+\S+")
+
+    end_re = rf"(?m)^\s*(?:{'|'.join(end_parts)})"
+
+    m = re.search(start_re, raw)
     if not m:
-        # fallback: si ça commence par "4.1" et contient un mot, on accepte
-        return True
-    try:
-        maj = int(m.group(1))
-        mino = int(m.group(2))
-    except Exception:
-        return False
-    return maj == major and mino == minor
-
-def _find_section_start(lines: List[str], major: int, minor: int) -> Optional[int]:
-    for i, ln in enumerate(lines):
-        if _is_section_heading(ln, major, minor):
-            return i
-    # fallback: parfois le heading est collé sur la ligne suivante (rare)
-    key = f"{major}.{minor}"
-    key2 = f"{major} . {minor}"
-    for i, ln in enumerate(lines):
-        s = _normalize_line_for_match(ln)
-        if s == key or s == key2 or s.startswith(key + ".") or s.startswith(key2 + "."):
-            return i
-    return None
-
-def _looks_like_any_heading(line: str) -> bool:
-    # Arrêt dès qu'on tombe sur un heading de section: "4.3", "4.6", "5.1", "5.", etc.
-    s = _normalize_line_for_match(line)
-    if not s:
-        return False
-    # 1) "X.Y ..." (1-2 chiffres)
-    if re.match(r"^\d{1,2}\s*\.\s*\d{1,2}(\s*[\.\-])?\s*\S+", s):
-        return True
-    # 2) "X. ..." (chapitres)
-    if re.match(r"^\d{1,2}\s*[\.\-]\s*\S+", s):
-        return True
-    return False
-
-def _extract_section_text(lines: List[str], start_idx: int, max_chars: int = 15000) -> str:
-    if start_idx is None:
         return ""
-    # contenu après la ligne de titre
-    collected: List[str] = []
-    for ln in lines[start_idx + 1:]:
-        if _looks_like_any_heading(ln):
-            break
-        collected.append(ln)
-    text = normalize_ws_keep_lines("\n".join(collected)).strip()
-    if not text:
-        return ""
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n\n[Texte tronqué]"
-    return text
+
+    start_pos = m.end()
+
+    m2 = re.search(end_re, raw[start_pos:])
+    if m2:
+        block = raw[start_pos:start_pos + m2.start()]
+    else:
+        block = raw[start_pos:]
+
+    return _clean_section_text(block)
 
 def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
     """
@@ -317,30 +304,32 @@ def extract_rcp_sections_from_rcp_html(html: str) -> Dict[str, str]:
     """
     if not html:
         return {}
+
     soup = BeautifulSoup(html, _bs_parser())
-    raw = soup.get_text("\n", strip=True)
-    raw = normalize_ws_keep_lines(raw)
-    if not raw:
+
+    # IMPORTANT : préserver les retours à la ligne
+    raw = soup.get_text("\n")
+    raw = raw.replace("\r", "\n")
+    raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+    if not raw or len(raw) < 50:
         return {}
 
-    lines = [ln.strip() for ln in raw.split("\n")]
-    # élimine les lignes ultra-courtes parasites
-    lines = [ln for ln in lines if ln is not None and ln.strip() != ""]
-
-    i41 = _find_section_start(lines, 4, 1)
-    i42 = _find_section_start(lines, 4, 2)
-    i44 = _find_section_start(lines, 4, 4)
-    i45 = _find_section_start(lines, 4, 5)
-
     out: Dict[str, str] = {}
-    if i41 is not None:
-        out["indications_4_1"] = _extract_section_text(lines, i41)
-    if i42 is not None:
-        out["posologie_4_2"] = _extract_section_text(lines, i42)
-    if i44 is not None:
-        out["mises_en_garde_4_4"] = _extract_section_text(lines, i44)
-    if i45 is not None:
-        out["interactions_4_5"] = _extract_section_text(lines, i45)
+
+    ind = _extract_section_by_regex(raw, 4, 1, end_markers=[(4, 2), (4, 3)])
+    poso = _extract_section_by_regex(raw, 4, 2, end_markers=[(4, 3), (4, 4)])
+    mg = _extract_section_by_regex(raw, 4, 4, end_markers=[(4, 5), (4, 6)])
+    inter = _extract_section_by_regex(raw, 4, 5, end_markers=[(4, 6), (4, 7)])
+
+    if ind:
+        out["indications_4_1"] = ind
+    if poso:
+        out["posologie_4_2"] = poso
+    if mg:
+        out["mises_en_garde_4_4"] = mg
+    if inter:
+        out["interactions_4_5"] = inter
 
     return out
 
@@ -352,7 +341,7 @@ def format_interactions_field(sec44: str, sec45: str) -> str:
         blocks.append("4.4. Mises en garde spéciales et précautions d'emploi\n" + sec44)
     if sec45:
         blocks.append("4.5. Interactions avec d'autres médicaments et autres formes d'interactions\n" + sec45)
-    return normalize_ws_keep_lines("\n\n".join(blocks)).strip()
+    return _clean_section_text("\n\n".join(blocks)).strip()
 
 # ============================================================
 # ATC HELPERS (pour lecture fichiers)
@@ -760,6 +749,12 @@ def parse_bdpm_compositions(txt: str) -> Dict[str, str]:
 # ============================================================
 
 def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
+    """
+    Parse le fichier CIS_MITM.txt.
+    Robuste :
+    - 1er CIS (8 chiffres) sur la ligne
+    - 1er ATC7 valide sur la ligne
+    """
     cis_to_atc: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -784,6 +779,12 @@ def parse_mitm_cis_to_atc(txt: str) -> Dict[str, str]:
 _URL_PAT = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
 
 def parse_info_importantes_cis_to_url(txt: str) -> Dict[str, str]:
+    """
+    Parse CIS_InfoImportantes.txt.
+    Robuste:
+    - trouve un CIS (8 chiffres)
+    - trouve une URL (http/https) quelque part dans la ligne
+    """
     cis_to_url: Dict[str, str] = {}
     for line in (txt or "").splitlines():
         if not line.strip():
@@ -1160,9 +1161,9 @@ def main():
         FIELD_COMPOSITION, # écriture
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
-        FIELD_INTERACTIONS_RCP,     # ✅ lecture/écriture
-        FIELD_INDICATIONS_RCP,      # ✅ lecture/écriture
-        FIELD_POSOLOGIE_RCP,        # ✅ lecture/écriture
+        FIELD_INTERACTIONS_RCP,     # lecture/écriture
+        FIELD_INDICATIONS_RCP,      # lecture/écriture
+        FIELD_POSOLOGIE_RCP,        # lecture/écriture
         FIELD_DATE_REVUE,           # lecture/écriture
     ]
 
@@ -1185,7 +1186,7 @@ def main():
 
     info(f"À créer: {len(to_create)} | À supprimer: {len(to_delete)} | Dans les 2: {len(bdpm_cis_set & airtable_cis_set)}")
 
-    # ✅ timestamp unique de la “revue”
+    # ✅ timestamp unique de la “revue” (même valeur pour toutes les lignes revues dans ce run)
     review_ts = now_paris_iso_seconds()
 
     # CREATE
