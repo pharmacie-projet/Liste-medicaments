@@ -90,7 +90,7 @@ FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans lig
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
 # ✅ Champs RCP à remplir
-FIELD_INTERACTIONS_RCP = "Interaction RCP"
+FIELD_INTERACTIONS_RCP = "Interactions RCP"
 FIELD_INDICATIONS_RCP = "Indications RCP"
 FIELD_POSOLOGIE_RCP = "Posologie RCP"
 
