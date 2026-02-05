@@ -90,7 +90,6 @@ FIELD_COMPOSITION_DETAILS = "Composition détails"  # champ à écrire (sans lig
 FIELD_LIEN_INFO_IMPORTANTE = "Lien vers information importante"  # champ à écrire (URL)
 
 # ✅ Moment de prise : on veut UNIQUEMENT les mots-clés présents (pas la phrase)
-FIELD_MOMENT_PRISE = "Moment de prise"  # champ à écrire
 
 # ✅ Champs RCP à extraire dans Airtable
 FIELD_INDICATIONS_RCP = "Indications RCP"      # 4.1
@@ -165,12 +164,6 @@ def init_moment_report_csv(path: str):
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["run_id", "cis", "rcp_url", "status", "keywords"])
-
-def append_moment_report(path: str, run_id: str, cis: str, rcp_url: str, status: str, keywords: str):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([run_id, cis, rcp_url, status, keywords])
-        f.flush()
 
 def try_git_commit_reports():
     """
@@ -254,108 +247,6 @@ def _bs_parser():
         return "lxml"
     except Exception:
         return "html.parser"
-
-# ============================================================
-# EXTRACTION "MOMENT DE PRISE" (RCP)
-# ============================================================
-
-# ✅ Mots-clés EXACTS à récupérer si présents dans le RCP
-# (on ne stocke PAS la phrase, uniquement les mots-clés trouvés)
-MOMENT_PRISE_KEYWORDS = [
-    # Formulations fréquentes des RCP
-    "avec un repas",
-    "avec les repas",
-    "au cours du repas",
-    "pendant le repas",
-    "avant le repas",
-    "apres le repas",
-    "après le repas",
-    "en dehors des repas",
-    "au moment des repas",
-
-    # Avec / sans nourriture
-    "avec nourriture",
-    "avec de la nourriture",
-    "avec des aliments",
-    "prendre avec nourriture",
-    "avec ou sans nourriture",
-    "avec ou sans aliments",
-    "sans nourriture",
-
-    # Interactions liées à la nourriture
-    "repas riche",
-    "repas riche en graisses",
-    "repas riche en graisse",
-    "repas gras",
-]
-
-def _norm(s: str) -> str:
-    return strip_accents(safe_text(s)).lower()
-
-# Trie par longueur décroissante : si plusieurs expressions coexistent, on privilégie les plus spécifiques
-_KW_NORM_SORTED = sorted([_norm(k) for k in MOMENT_PRISE_KEYWORDS if _norm(k)], key=len, reverse=True)
-
-def _build_kw_patterns(keywords_norm: List[str]) -> List[Tuple[str, re.Pattern]]:
-    """
-    Regex robustes sur texte normalisé (sans accents):
-    - espaces -> \\s+ (gère retours ligne et espaces multiples)
-    - bornes de mots \\b pour limiter les faux positifs
-    """
-    out: List[Tuple[str, re.Pattern]] = []
-    for kw in keywords_norm:
-        kw_esc = re.escape(kw)
-        kw_esc = re.sub(r"\\\s+", r"\\s+", kw_esc)
-        rgx = re.compile(rf"\b{kw_esc}\b", flags=re.IGNORECASE)
-        out.append((kw, rgx))
-    return out
-
-_KW_PATTERNS = _build_kw_patterns(_KW_NORM_SORTED)
-
-def extract_moment_keywords_from_rcp_html(html: str) -> str:
-    """
-    Retourne uniquement les mots-clés présents (distincts), séparés par '; '.
-    Si aucun mot-clé: retourne "" (et on n'écrit rien dans Airtable).
-    """
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, _bs_parser())
-    raw = soup.get_text(" ", strip=True)
-    if not raw:
-        return ""
-
-    t = _norm(raw)
-
-    found: List[str] = []
-    for kw_norm, rgx in _KW_PATTERNS:
-        if rgx.search(t):
-            found.append(kw_norm)
-
-    # Dé-doublonnage, conservation de l'ordre (déjà trié par spécificité)
-    seen = set()
-    uniq_norm: List[str] = []
-    for f in found:
-        if f in seen:
-            continue
-        uniq_norm.append(f)
-        seen.add(f)
-
-    if not uniq_norm:
-        return ""
-
-    # On renvoie les libellés originaux (ceux de MOMENT_PRISE_KEYWORDS) si possible.
-    # On mappe norm -> original (première occurrence).
-    norm_to_original: Dict[str, str] = {}
-    for orig in MOMENT_PRISE_KEYWORDS:
-        n = _norm(orig)
-        if n and n not in norm_to_original:
-            norm_to_original[n] = orig
-
-    rendered = [norm_to_original.get(n, n) for n in uniq_norm]
-    # sécurité anti-champs énormes
-    if len(rendered) > 30:
-        rendered = rendered[:30]
-    return "; ".join(rendered).strip()
 
 
 # ============================================================
@@ -1171,7 +1062,6 @@ def main():
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
     RUN_ID = run_id_paris()
-    MOMENT_REPORT_CSV = os.path.join(REPORT_DIR, f"moment_prise_keywords_{RUN_ID}.csv")
     SUMMARY_JSON = os.path.join(REPORT_DIR, f"run_summary_{RUN_ID}.json")
     init_moment_report_csv(MOMENT_REPORT_CSV)
 
@@ -1238,7 +1128,6 @@ def main():
         FIELD_COMPOSITION, # écriture
         FIELD_COMPOSITION_DETAILS, # écriture
         FIELD_LIEN_INFO_IMPORTANTE, # écriture (URL)
-        FIELD_MOMENT_PRISE, # lecture/écriture
         FIELD_INDICATIONS_RCP,
         FIELD_POSOLOGIE_RCP,
         FIELD_INTERACTIONS_RCP,
@@ -1357,15 +1246,12 @@ def main():
     fiche_checks = 0
     info_added = 0
     atc_added = 0
-    moment_checks = 0
-    moment_added = 0
-    moment_no_kw = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
             info(
                 f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"moment checks={moment_checks} | moment added={moment_added} | moment no_kw={moment_no_kw} | "
+                f"moment checks={moment_checks} |  moment no_kw={moment_no_kw} | "
                 f"ATC added={atc_added} | info importante added={info_added} | failures={failures}"
             )
 
@@ -1400,36 +1286,19 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-                # ✅ RCP: extraction keywords (moment de prise) + sections 4.1/4.2/4.5
-        cur_moment = str(fields_cur.get(FIELD_MOMENT_PRISE, "")).strip()
+                        # ✅ RCP: extraction sections 4.1/4.2/4.5
         cur_41 = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_42 = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_45 = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
 
-        need_fetch_rcp = force_refresh or (not cur_moment) or (not cur_41) or (not cur_42) or (not cur_45)
+        need_fetch_rcp = force_refresh or (not cur_41) or (not cur_42) or (not cur_45)
 
         if need_fetch_rcp and link_rcp:
             rcp_url = set_tab(link_rcp, cis, "rcp")
             try:
-                moment_checks += 1
                 html_rcp = fetch_html_checked(rcp_url)
 
-                # 1) Moment de prise = mots-clés uniquement
-                kw_txt = extract_moment_keywords_from_rcp_html(html_rcp)
-                if kw_txt:
-                    if kw_txt != cur_moment:
-                        upd_fields[FIELD_MOMENT_PRISE] = kw_txt
-                        moment_added += 1
-                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UPDATED", kw_txt)
-                    else:
-                        append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "UNCHANGED", kw_txt)
-                else:
-                    moment_no_kw += 1
-                    append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "NO_KEYWORD", "")
-
-                # 2) Sections 4.1 / 4.2 / 4.5
                 sections = extract_rcp_sections_from_html(html_rcp)
-
                 sec41 = sections.get("4.1", "").strip()
                 sec42 = sections.get("4.2", "").strip()
                 sec45 = sections.get("4.5", "").strip()
@@ -1443,10 +1312,8 @@ def main():
 
             except PageUnavailable as e:
                 warn(f"RCP KO CIS={cis}: {e.detail} ({e.url}) (on continue)")
-                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_KO", "")
             except Exception as e:
                 warn(f"RCP parse KO CIS={cis}: {e} (on continue)")
-                append_moment_report(MOMENT_REPORT_CSV, RUN_ID, cis, rcp_url, "RCP_PARSE_KO", "")
 
         # Composition
         cur_compo = str(fields_cur.get(FIELD_COMPOSITION, "")).strip()
@@ -1556,7 +1423,7 @@ def main():
             remaining = (len(all_cis) - idx) / rate if rate > 0 else 0
             info(
                 f"Progress {idx}/{len(all_cis)} | {rate:.2f} CIS/s | échecs={failures} | supprimés={deleted_count} "
-                f"| fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} "
+                f"| fiche checks={fiche_checks} |  no_kw={moment_no_kw} "
                 f"| reste ~{int(remaining)}s"
             )
 
@@ -1587,7 +1454,7 @@ def main():
 
     ok(
         f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"fiche checks={fiche_checks} | moment checks={moment_checks} | moment added={moment_added} | no_kw={moment_no_kw} | "
+        f"fiche checks={fiche_checks} |  no_kw={moment_no_kw} | "
         f"ATC added={atc_added} | info importante added={info_added} | "
         f"reports: {MOMENT_REPORT_CSV} ; {SUMMARY_JSON}"
     )
