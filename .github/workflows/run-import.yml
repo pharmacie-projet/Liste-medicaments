@@ -55,5 +55,8 @@ jobs:
           REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
           SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
 
+          # ✅ Dernier recours: bypass SSL uniquement si le serveur BDPM a une chaîne incomplète
+          ALLOW_INSECURE_SSL: "1"
+
         run: |
           python -u scripts/import_and_enrich_bdpm_to_airtable.py
