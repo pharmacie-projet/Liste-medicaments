@@ -18,10 +18,10 @@ import requests
 from requests.exceptions import SSLError
 from bs4 import BeautifulSoup
 
-# TLS/CA bundle (évite les erreurs "unable to get local issuer certificate" sur certains environnements)
+# TLS/CA bundle fallback
 try:
     import certifi  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     certifi = None  # type: ignore
 
 # Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
@@ -29,6 +29,11 @@ try:
     import pandas as pd  # type: ignore
 except Exception:
     pd = None  # noqa
+
+# ============================================================
+# BUILD MARKER (pour vérifier dans les logs que c'est bien cette version)
+# ============================================================
+BUILD_ID = "SSL-FIX-BDPM-v2_2026-03-02"
 
 # ============================================================
 # CONFIG
@@ -67,6 +72,9 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
+# Dernier recours : autoriser verify=False UNIQUEMENT pour BDPM
+ALLOW_INSECURE_SSL = os.getenv("ALLOW_INSECURE_SSL", "0").strip() == "1"
+
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
@@ -100,11 +108,23 @@ def _pick_ca_bundle() -> Optional[str]:
             return None
     return None
 
-
 CA_BUNDLE = _pick_ca_bundle()
 if CA_BUNDLE:
-    # Requests utilisera ce bundle pour *toutes* les requêtes de la session
     HTTP_SESSION.verify = CA_BUNDLE
+
+BDPM_HOSTS = {
+    "base-donnees-publique.medicaments.gouv.fr",
+    "www.base-donnees-publique.medicaments.gouv.fr",
+    "m.base-donnees-publique.medicaments.gouv.fr",
+}
+
+def _is_bdpm_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+        host = host.lower().strip()
+        return host in BDPM_HOSTS
+    except Exception:
+        return False
 
 # ============================================================
 # AIRTABLE FIELDS (adapte ici si besoin)
@@ -267,6 +287,57 @@ def _bs_parser():
         return "lxml"
     except Exception:
         return "html.parser"
+
+# ============================================================
+# HTTP GET robuste (fallback SSL BDPM uniquement)
+# ============================================================
+
+def _session_get(url: str, timeout: Tuple[float, float], allow_redirects: bool = True) -> requests.Response:
+    """
+    1) tentative normale (avec CA_BUNDLE éventuel)
+    2) fallback certifi.where() si SSLError
+    3) dernier recours verify=False UNIQUEMENT pour BDPM si ALLOW_INSECURE_SSL=1
+    """
+    try:
+        return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects)
+
+    except SSLError as e:
+        # 2) fallback certifi
+        if certifi is not None:
+            try:
+                return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects, verify=certifi.where())
+            except Exception:
+                pass
+
+        # 3) verify=False uniquement BDPM si explicitement autorisé
+        if ALLOW_INSECURE_SSL and _is_bdpm_url(url):
+            warn(f"SSL verify failed (BDPM) -> retry verify=False : {url}")
+            return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects, verify=False)
+
+        raise e
+
+def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.0)) -> requests.Response:
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return _session_get(url, timeout=timeout, allow_redirects=True)
+        except Exception as e:
+            last_err = e
+            retry_sleep(attempt)
+    raise RuntimeError(f"GET failed: {url} / {last_err}")
+
+def download_text(url: str, encoding: str = "latin-1") -> str:
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code} for {url}")
+    r.encoding = encoding
+    return r.text
+
+def download_bytes(url: str, timeout_s: float = 140.0) -> bytes:
+    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, timeout_s))
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code} for {url}")
+    return r.content
 
 # ============================================================
 # EXTRACTION SECTIONS RCP (CONTENU ROBUSTE)
@@ -493,56 +564,6 @@ def load_atc_equivalence_excel(path: str) -> Dict[str, str]:
 
     ok(f"Équivalence ATC chargée: {len(mapping)} entrées")
     return mapping
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.0)) -> requests.Response:
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True)
-            return r
-        except SSLError as e:
-            # 1) On tente une alternative de bundle CA si dispo
-            last_err = e
-            if certifi is not None:
-                try:
-                    r = HTTP_SESSION.get(
-                        url,
-                        timeout=timeout,
-                        allow_redirects=True,
-                        verify=certifi.where(),
-                    )
-                    return r
-                except Exception:
-                    pass
-
-            # 2) Dernier recours (déconseillé) : désactiver la vérification SSL
-            if os.getenv("ALLOW_INSECURE_SSL", "0").strip() == "1":
-                warn(f"SSL verify failed for {url} -> retry with verify=False (ALLOW_INSECURE_SSL=1)")
-                r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True, verify=False)
-                return r
-
-            retry_sleep(attempt)
-        except Exception as e:
-            last_err = e
-            retry_sleep(attempt)
-    raise RuntimeError(f"GET failed: {url} / {last_err}")
-
-def download_text(url: str, encoding: str = "latin-1") -> str:
-    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, 120.0))
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} for {url}")
-    r.encoding = encoding
-    return r.text
-
-def download_bytes(url: str, timeout_s: float = 140.0) -> bytes:
-    r = http_get(url, timeout=(HTTP_CONNECT_TIMEOUT, timeout_s))
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} for {url}")
-    return r.content
 
 # ============================================================
 # ANSM retrocession
@@ -972,7 +993,7 @@ def fetch_html_checked(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TI
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True)
+            r = _session_get(url, timeout=timeout, allow_redirects=True)
             if r.status_code == 404:
                 raise PageUnavailable(url, 404, "HTTP 404")
             if r.status_code >= 400:
@@ -1104,6 +1125,7 @@ class AirtableClient:
         self.base_id = base_id
         self.table_name = table_name
         self.session = requests.Session()
+        # IMPORTANT: on ne désactive PAS SSL pour Airtable
         if CA_BUNDLE:
             self.session.verify = CA_BUNDLE
         self.session.headers.update({
@@ -1165,7 +1187,6 @@ class AirtableClient:
                     continue
                 raise
 
-    # ✅ NOUVEAU: inventaire filtré (évite de traiter 15 000 lignes à chaque run)
     def list_records_filtered(self, fields: Optional[List[str]] = None, filter_by_formula: str = "") -> List[dict]:
         requested_fields = list(fields) if fields else None
 
@@ -1208,22 +1229,11 @@ class AirtableClient:
                 for f in DO_NOT_WRITE_FIELDS:
                     fields.pop(f, None)
 
-    def create_records(self, records: List[dict]) -> None:
-        self._strip_forbidden_fields(records)
-        for batch in chunked(records, AIRTABLE_BATCH_SIZE):
-            payload = {"records": batch, "typecast": True}
-            self._request("POST", self.table_url, data=json.dumps(payload))
-
     def update_records(self, records: List[dict]) -> None:
         self._strip_forbidden_fields(records)
         for batch in chunked(records, AIRTABLE_BATCH_SIZE):
             payload = {"records": batch, "typecast": True}
             self._request("PATCH", self.table_url, data=json.dumps(payload))
-
-    def delete_records(self, record_ids: List[str]) -> None:
-        for batch in chunked(record_ids, AIRTABLE_BATCH_SIZE):
-            params = [("records[]", rid) for rid in batch]
-            self._request("DELETE", self.table_url, params=params)
 
 # ============================================================
 # MAIN
@@ -1241,10 +1251,14 @@ def main():
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
 
+    info(f"{BUILD_ID}")
     if CA_BUNDLE:
         info(f"TLS: bundle CA utilisé par requests: {CA_BUNDLE}")
     else:
         warn("TLS: aucun bundle CA explicite détecté (requests utilisera son défaut)")
+
+    if ALLOW_INSECURE_SSL:
+        warn("ALLOW_INSECURE_SSL=1 -> verify=False autorisé UNIQUEMENT pour BDPM en cas d'échec SSL")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
@@ -1307,7 +1321,6 @@ def main():
         FIELD_DATE_REVUE,
     ]
 
-    # ✅ Inventaire filtré: on ne récupère que les lignes à compléter (sauf FORCE_REFRESH)
     if force_refresh:
         info("Inventaire Airtable (FORCE_REFRESH=1 => tout) ...")
         records = at.list_all_records(fields=needed_fields)
@@ -1337,27 +1350,16 @@ def main():
         warn(f"MAX_CIS_TO_PROCESS={max_cis} -> {len(all_cis)} CIS traités")
 
     review_ts = now_paris_iso_seconds()
-
     info("Enrichissement: contenu RCP + CPD/dispo + ATC + composition + lien info importante ...")
     info(f"Revue du jour (timestamp): {review_ts}")
 
     updates: List[dict] = []
-    failures = 0
-    deleted_count = 0
-    start = time.time()
-
-    fiche_checks = 0
-    info_added = 0
-    atc_added = 0
     rcp_checks = 0
     rcp_added = 0
 
     for idx, cis in enumerate(all_cis, start=1):
         if HEARTBEAT_EVERY > 0 and idx % HEARTBEAT_EVERY == 0:
-            info(
-                f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | fiche checks={fiche_checks} | "
-                f"rcp checks={rcp_checks} | rcp added={rcp_added} | ATC added={atc_added} | info importante added={info_added}"
-            )
+            info(f"Heartbeat: {idx}/{len(all_cis)} (CIS={cis}) | rcp checks={rcp_checks} | rcp added={rcp_added}")
 
         rec = airtable_by_cis.get(cis)
         if not rec:
@@ -1371,7 +1373,6 @@ def main():
             link_rcp = rcp_link_default(cis)
             upd_fields[FIELD_RCP] = link_rcp
 
-        # --- CONTENU RCP
         cur_ind = str(fields_cur.get(FIELD_INDICATIONS_RCP, "")).strip()
         cur_poso = str(fields_cur.get(FIELD_POSOLOGIE_RCP, "")).strip()
         cur_inter = str(fields_cur.get(FIELD_INTERACTIONS_RCP, "")).strip()
@@ -1417,12 +1418,7 @@ def main():
         at.update_records(updates)
         ok(f"Updates finaux: {len(updates)}")
 
-    try_git_commit_report()
-    ok(
-        f"Terminé. échecs={failures} | supprimés={deleted_count} | "
-        f"rcp checks={rcp_checks} | rcp added={rcp_added} | "
-        f"ATC added={atc_added} | info importante added={info_added}"
-    )
+    ok("Terminé.")
 
 if __name__ == "__main__":
     main()
