@@ -2,7 +2,6 @@ name: sync
 
 on:
   schedule:
-    # Tous les jours à 01:00 (heure UTC du runner)
     - cron: "0 1 * * *"
   workflow_dispatch:
 
@@ -35,51 +34,88 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # (Optionnel) si tu utilises Playwright dans le projet
+      # (Optionnel) si Playwright est utilisé
       - name: Install Playwright browsers
         timeout-minutes: 15
         run: |
           python -m playwright install --with-deps chromium
 
-      # ✅ TLS strict : on construit un bundle CA incluant l'intermédiaire BDPM (AIA)
+      # ✅ TLS strict : construit un bundle CA incluant tous les intermédiaires via AIA
       - name: Build BDPM CA bundle (TLS strict)
         run: |
           set -euo pipefail
           HOST=base-donnees-publique.medicaments.gouv.fr
+          WORKDIR=/tmp/bdpm_tls
+          mkdir -p "$WORKDIR"
 
-          # Récupère le certificat "leaf" (1er cert) juste pour lire l'AIA (pas de vérification ici)
+          echo ">>> Fetch leaf cert"
           echo | openssl s_client -connect ${HOST}:443 -servername ${HOST} -showcerts 2>/dev/null \
             | awk 'BEGIN{c=0} /BEGIN CERTIFICATE/{c++} c==1{print} /END CERTIFICATE/{if(c==1) exit}' \
-            > /tmp/bdpm_leaf.pem
+            > "$WORKDIR/leaf.pem"
 
-          # Extrait l'URL "CA Issuers" (certificat intermédiaire)
-          AIA_URL=$(openssl x509 -in /tmp/bdpm_leaf.pem -noout -text \
-            | awk -F'URI:' '/CA Issuers - URI:/{print $2; exit}' | tr -d '\r')
+          # On va télécharger les intermédiaires (parfois 1 seul, parfois plusieurs)
+          CHAIN_PEM="$WORKDIR/intermediates.pem"
+          : > "$CHAIN_PEM"
+          CUR="$WORKDIR/leaf.pem"
 
-          if [ -z "${AIA_URL}" ]; then
-            echo "Impossible d'extraire l'URL CA Issuers depuis le certificat BDPM" >&2
-            exit 1
-          fi
+          for i in 1 2 3 4 5; do
+            # URL CA Issuers (peut être vide si on est déjà au bout)
+            AIA_URL=$(openssl x509 -in "$CUR" -noout -text \
+              | awk -F'URI:' '/CA Issuers - URI:/{print $2; exit}' | tr -d '\r' || true)
 
-          echo "AIA (intermediate) URL: ${AIA_URL}"
+            if [ -z "${AIA_URL}" ]; then
+              echo ">>> No more AIA (stop at depth $i)"
+              break
+            fi
 
-          # Télécharge l'intermédiaire (souvent en DER), convertit en PEM
-          curl -fsSL "${AIA_URL}" -o /tmp/bdpm_intermediate.der
-          openssl x509 -inform der -in /tmp/bdpm_intermediate.der -out /tmp/bdpm_intermediate.pem
+            echo ">>> AIA URL (depth $i): ${AIA_URL}"
 
-          # Construit un bundle : intermédiaire + CA système
-          cat /tmp/bdpm_intermediate.pem /etc/ssl/certs/ca-certificates.crt > /tmp/bdpm_ca_bundle.pem
+            # Télécharge l'intermédiaire
+            curl -fsSL "${AIA_URL}" -o "$WORKDIR/int_${i}.crt"
 
-          # Exporte pour les steps suivants (requests respectera REQUESTS_CA_BUNDLE)
-          echo "REQUESTS_CA_BUNDLE=/tmp/bdpm_ca_bundle.pem" >> $GITHUB_ENV
-          echo "SSL_CERT_FILE=/tmp/bdpm_ca_bundle.pem" >> $GITHUB_ENV
+            # Détecte PEM vs DER, convertit en PEM si besoin
+            if grep -q "BEGIN CERTIFICATE" "$WORKDIR/int_${i}.crt"; then
+              cp "$WORKDIR/int_${i}.crt" "$WORKDIR/int_${i}.pem"
+            else
+              openssl x509 -inform der -in "$WORKDIR/int_${i}.crt" -out "$WORKDIR/int_${i}.pem"
+            fi
 
-          # Test strict (doit passer sans verify=False)
+            # Append au fichier des intermédiaires
+            cat "$WORKDIR/int_${i}.pem" >> "$CHAIN_PEM"
+            echo "" >> "$CHAIN_PEM"
+
+            # Si l'intermédiaire est auto-signé (rare ici), stop
+            SUBJ=$(openssl x509 -in "$WORKDIR/int_${i}.pem" -noout -subject || true)
+            ISSU=$(openssl x509 -in "$WORKDIR/int_${i}.pem" -noout -issuer  || true)
+            if [ "$SUBJ" = "$ISSU" ]; then
+              echo ">>> Reached self-signed cert at depth $i (stop)"
+              CUR="$WORKDIR/int_${i}.pem"
+              break
+            fi
+
+            CUR="$WORKDIR/int_${i}.pem"
+          done
+
+          # Bundle final : intermédiaires + CA système
+          BUNDLE="$WORKDIR/bdpm_ca_bundle.pem"
+          cat "$CHAIN_PEM" /etc/ssl/certs/ca-certificates.crt > "$BUNDLE"
+
+          echo ">>> Bundle created: $BUNDLE"
+          ls -l "$BUNDLE"
+
+          # IMPORTANT : pour ce step (export) + pour les steps suivants (GITHUB_ENV)
+          export REQUESTS_CA_BUNDLE="$BUNDLE"
+          export SSL_CERT_FILE="$BUNDLE"
+          echo "REQUESTS_CA_BUNDLE=$BUNDLE" >> $GITHUB_ENV
+          echo "SSL_CERT_FILE=$BUNDLE" >> $GITHUB_ENV
+
+          # Test TLS strict (doit passer)
           python - <<'PY'
           import os, requests
           url="https://base-donnees-publique.medicaments.gouv.fr/download/file/CIS_bdpm.txt"
-          print("bundle:", os.getenv("REQUESTS_CA_BUNDLE"))
-          r=requests.get(url, timeout=60)
+          bundle=os.environ["REQUESTS_CA_BUNDLE"]
+          print("Using bundle:", bundle)
+          r = requests.get(url, timeout=60, verify=bundle)  # explicite
           print("status:", r.status_code, "len:", len(r.content))
           r.raise_for_status()
           PY
