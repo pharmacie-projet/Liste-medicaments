@@ -33,7 +33,7 @@ except Exception:
 # ============================================================
 # BUILD MARKER (pour vérifier dans les logs que c'est bien cette version)
 # ============================================================
-BUILD_ID = "SSL-FIX-BDPM-v2_2026-03-02"
+BUILD_ID = "TLS-STRICT-BDPM-v3_2026-03-02"
 
 # ============================================================
 # CONFIG
@@ -72,9 +72,6 @@ REPORT_COMMIT = os.getenv("GITHUB_COMMIT_REPORT", "0").strip() == "1"
 
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "50"))
 
-# Dernier recours : autoriser verify=False UNIQUEMENT pour BDPM
-ALLOW_INSECURE_SSL = os.getenv("ALLOW_INSECURE_SSL", "0").strip() == "1"
-
 # Fichier Excel d'équivalence ATC (niveau 4 -> libellé)
 ATC_EQUIVALENCE_FILE = os.getenv("ATC_EQUIVALENCE_FILE", "data/equivalence atc.xlsx")
 
@@ -111,20 +108,6 @@ def _pick_ca_bundle() -> Optional[str]:
 CA_BUNDLE = _pick_ca_bundle()
 if CA_BUNDLE:
     HTTP_SESSION.verify = CA_BUNDLE
-
-BDPM_HOSTS = {
-    "base-donnees-publique.medicaments.gouv.fr",
-    "www.base-donnees-publique.medicaments.gouv.fr",
-    "m.base-donnees-publique.medicaments.gouv.fr",
-}
-
-def _is_bdpm_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlsplit(url).hostname or ""
-        host = host.lower().strip()
-        return host in BDPM_HOSTS
-    except Exception:
-        return False
 
 # ============================================================
 # AIRTABLE FIELDS (adapte ici si besoin)
@@ -294,27 +277,19 @@ def _bs_parser():
 
 def _session_get(url: str, timeout: Tuple[float, float], allow_redirects: bool = True) -> requests.Response:
     """
-    1) tentative normale (avec CA_BUNDLE éventuel)
-    2) fallback certifi.where() si SSLError
-    3) dernier recours verify=False UNIQUEMENT pour BDPM si ALLOW_INSECURE_SSL=1
+    Requête HTTPS en TLS strict.
+
+    - tentative normale (avec CA_BUNDLE si défini via REQUESTS_CA_BUNDLE/SSL_CERT_FILE)
+    - fallback certifi.where() en cas de SSLError
+
+    IMPORTANT: aucun verify=False (pas de faille de sécurité).
     """
     try:
         return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects)
-
-    except SSLError as e:
-        # 2) fallback certifi
+    except SSLError:
         if certifi is not None:
-            try:
-                return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects, verify=certifi.where())
-            except Exception:
-                pass
-
-        # 3) verify=False uniquement BDPM si explicitement autorisé
-        if ALLOW_INSECURE_SSL and _is_bdpm_url(url):
-            warn(f"SSL verify failed (BDPM) -> retry verify=False : {url}")
-            return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects, verify=False)
-
-        raise e
+            return HTTP_SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects, verify=certifi.where())
+        raise
 
 def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.0)) -> requests.Response:
     last_err = None
@@ -1256,9 +1231,6 @@ def main():
         info(f"TLS: bundle CA utilisé par requests: {CA_BUNDLE}")
     else:
         warn("TLS: aucun bundle CA explicite détecté (requests utilisera son défaut)")
-
-    if ALLOW_INSECURE_SSL:
-        warn("ALLOW_INSECURE_SSL=1 -> verify=False autorisé UNIQUEMENT pour BDPM en cas d'échec SSL")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
