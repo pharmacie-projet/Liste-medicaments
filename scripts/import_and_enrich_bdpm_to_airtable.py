@@ -15,7 +15,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.exceptions import SSLError
 from bs4 import BeautifulSoup
+
+# TLS/CA bundle (évite les erreurs "unable to get local issuer certificate" sur certains environnements)
+try:
+    import certifi  # type: ignore
+except Exception:  # pragma: no cover
+    certifi = None  # type: ignore
 
 # Excel equivalence ATC (optionnel si tu veux remplir "Libellé ATC")
 try:
@@ -72,6 +79,32 @@ HEADERS_WEB = {
 # ✅ Session HTTP réutilisable (gros gain perf sur GitHub Actions)
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS_WEB)
+
+def _pick_ca_bundle() -> Optional[str]:
+    """Choisit un bundle CA robuste (GitHub Actions -> bundle système)."""
+    for env_var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        p = (os.getenv(env_var) or "").strip()
+        if p and os.path.exists(p):
+            return p
+
+    # Linux (Ubuntu runners)
+    for p in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.exists(p):
+            return p
+
+    # Fallback: certifi
+    if certifi is not None:
+        try:
+            return certifi.where()
+        except Exception:
+            return None
+    return None
+
+
+CA_BUNDLE = _pick_ca_bundle()
+if CA_BUNDLE:
+    # Requests utilisera ce bundle pour *toutes* les requêtes de la session
+    HTTP_SESSION.verify = CA_BUNDLE
 
 # ============================================================
 # AIRTABLE FIELDS (adapte ici si besoin)
@@ -471,6 +504,28 @@ def http_get(url: str, timeout: Tuple[float, float] = (HTTP_CONNECT_TIMEOUT, 60.
         try:
             r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True)
             return r
+        except SSLError as e:
+            # 1) On tente une alternative de bundle CA si dispo
+            last_err = e
+            if certifi is not None:
+                try:
+                    r = HTTP_SESSION.get(
+                        url,
+                        timeout=timeout,
+                        allow_redirects=True,
+                        verify=certifi.where(),
+                    )
+                    return r
+                except Exception:
+                    pass
+
+            # 2) Dernier recours (déconseillé) : désactiver la vérification SSL
+            if os.getenv("ALLOW_INSECURE_SSL", "0").strip() == "1":
+                warn(f"SSL verify failed for {url} -> retry with verify=False (ALLOW_INSECURE_SSL=1)")
+                r = HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True, verify=False)
+                return r
+
+            retry_sleep(attempt)
         except Exception as e:
             last_err = e
             retry_sleep(attempt)
@@ -1049,6 +1104,8 @@ class AirtableClient:
         self.base_id = base_id
         self.table_name = table_name
         self.session = requests.Session()
+        if CA_BUNDLE:
+            self.session.verify = CA_BUNDLE
         self.session.headers.update({
             "Authorization": f"Bearer {self.api_token}",
             "Content-Type": "application/json",
@@ -1183,6 +1240,11 @@ def main():
 
     if not api_token or not base_id or not table_name:
         die("Variables manquantes: AIRTABLE_API_TOKEN / AIRTABLE_BASE_ID / AIRTABLE_CIS_TABLE_NAME")
+
+    if CA_BUNDLE:
+        info(f"TLS: bundle CA utilisé par requests: {CA_BUNDLE}")
+    else:
+        warn("TLS: aucun bundle CA explicite détecté (requests utilisera son défaut)")
 
     atc_labels = load_atc_equivalence_excel(ATC_EQUIVALENCE_FILE)
 
