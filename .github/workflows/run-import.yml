@@ -19,6 +19,13 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
+      # ✅ Important: garantit que le runner a bien un bundle CA à jour
+      - name: Ensure CA certificates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+
       - name: Install dependencies
         timeout-minutes: 15
         env:
@@ -43,5 +50,10 @@ jobs:
           AIRTABLE_MIN_DELAY_S: "0.25"
           UPDATE_FLUSH_THRESHOLD: "200"
           RCP_MAX_PER_RUN: "50"
+
+          # ✅ Force requests à utiliser le bundle CA système (évite CERTIFICATE_VERIFY_FAILED)
+          REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+
         run: |
           python -u scripts/import_and_enrich_bdpm_to_airtable.py
