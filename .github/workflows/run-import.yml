@@ -57,6 +57,10 @@ jobs:
 
           # ✅ Dernier recours: bypass SSL uniquement si le serveur BDPM a une chaîne incomplète
           ALLOW_INSECURE_SSL: "1"
-
-        run: |
+        - name: Debug TLS chain (BDPM)
+          run: |
+            echo | openssl s_client -connect base-donnees-publique.medicaments.gouv.fr:443 \
+              -servername base-donnees-publique.medicaments.gouv.fr -showcerts 2>/dev/null \
+              | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p'
+                run: |
           python -u scripts/import_and_enrich_bdpm_to_airtable.py
